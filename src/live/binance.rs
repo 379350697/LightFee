@@ -498,12 +498,16 @@ impl BinanceLiveAdapter {
             request
         };
 
-        request
+        let response = request
             .send()
             .await
-            .context("failed to send signed binance request")?
-            .error_for_status()
-            .context("binance private endpoint returned non-success status")
+            .context("failed to send signed binance request")?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(format_binance_http_error(status, &body));
+        }
+        Ok(response)
     }
 
     async fn server_timestamp_ms(&self) -> Result<i64> {
@@ -555,6 +559,31 @@ impl BinanceLiveAdapter {
             .expect("lock")
             .replace(mode.clone());
         Ok(mode)
+    }
+}
+
+fn format_binance_http_error(status: reqwest::StatusCode, body: &str) -> anyhow::Error {
+    let trimmed = body.trim();
+    if let Ok(payload) = serde_json::from_str::<BinanceApiErrorPayload>(trimmed) {
+        return anyhow!(
+            "binance private endpoint returned non-success status: status={} code={} msg={}",
+            status,
+            payload.code,
+            payload.msg
+        );
+    }
+
+    if trimmed.is_empty() {
+        anyhow!(
+            "binance private endpoint returned non-success status: status={}",
+            status
+        )
+    } else {
+        anyhow!(
+            "binance private endpoint returned non-success status: status={} body={}",
+            status,
+            trimmed
+        )
     }
 }
 
@@ -1225,8 +1254,8 @@ fn handle_binance_private_message(
 #[cfg(test)]
 mod tests {
     use super::{
-        binance_position_side, build_binance_subscribe_messages, BinancePositionMode,
-        BinancePremiumIndex, BINANCE_MAX_SUBSCRIBE_STREAMS_PER_MESSAGE,
+        binance_position_side, build_binance_subscribe_messages, format_binance_http_error,
+        BinancePositionMode, BinancePremiumIndex, BINANCE_MAX_SUBSCRIBE_STREAMS_PER_MESSAGE,
     };
     use crate::models::Side;
 
@@ -1275,6 +1304,27 @@ mod tests {
             assert!(params.len() <= BINANCE_MAX_SUBSCRIBE_STREAMS_PER_MESSAGE);
         }
     }
+
+    #[test]
+    fn private_http_error_includes_status_code_and_exchange_message() {
+        let error = format_binance_http_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"code":-1021,"msg":"Timestamp for this request is outside of the recvWindow."}"#,
+        );
+        let rendered = error.to_string();
+        assert!(rendered.contains("status=400 Bad Request"));
+        assert!(rendered.contains("code=-1021"));
+        assert!(rendered.contains("recvWindow"));
+    }
+
+    #[test]
+    fn private_http_error_falls_back_to_trimmed_body_when_json_decode_fails() {
+        let error =
+            format_binance_http_error(reqwest::StatusCode::TOO_MANY_REQUESTS, "  rate limited  ");
+        let rendered = error.to_string();
+        assert!(rendered.contains("status=429 Too Many Requests"));
+        assert!(rendered.contains("body=rate limited"));
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1298,4 +1348,10 @@ struct BinanceCapitalNetwork {
     deposit_enable: bool,
     #[serde(rename = "withdrawEnable")]
     withdraw_enable: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct BinanceApiErrorPayload {
+    code: i64,
+    msg: String,
 }

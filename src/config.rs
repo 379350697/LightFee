@@ -376,7 +376,7 @@ fn default_private_position_max_age_ms() -> i64 {
 }
 
 fn default_order_quote_age_ms() -> i64 {
-    3_000
+    6_000
 }
 
 fn default_uncertain_order_cooldown_ms() -> i64 {

@@ -2806,8 +2806,9 @@ mod tests {
     fn order_quote_expiry_blocks_only_non_reduce_orders() {
         let observed_at_ms = chrono::Utc::now().timestamp_millis() - 4_000;
         assert!(order_quote_expired_reason(3_000, Some(observed_at_ms), false).is_some());
-        assert!(order_quote_expired_reason(3_000, Some(observed_at_ms), true).is_none());
-        assert!(order_quote_expired_reason(3_000, None, false).is_none());
+        assert!(order_quote_expired_reason(6_000, Some(observed_at_ms), false).is_none());
+        assert!(order_quote_expired_reason(6_000, Some(observed_at_ms), true).is_none());
+        assert!(order_quote_expired_reason(6_000, None, false).is_none());
     }
 
     #[test]
@@ -2819,7 +2820,7 @@ mod tests {
             "hyperliquid-pending"
         )));
         assert!(!order_error_may_have_created_exposure(&anyhow!(
-            "quote_expired:4001>3000"
+            "quote_expired:4001>6000"
         )));
     }
 
