@@ -6,6 +6,7 @@ pub mod live;
 pub mod market;
 pub mod models;
 pub mod opportunity_source;
+pub mod resilience;
 pub mod simulator;
 pub mod store;
 pub mod strategy;

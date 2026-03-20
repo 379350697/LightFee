@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     env,
     path::PathBuf,
     sync::Arc,
@@ -9,15 +10,22 @@ use anyhow::{anyhow, Context, Result};
 use futures::future::join_all;
 use lightfee::{
     config::RuntimeMode, strategy::discover_candidates, AppConfig, BinanceLiveAdapter,
-    BybitLiveAdapter, ChillybotOpportunitySource, MarketView, OkxLiveAdapter,
-    OpportunityHintSource, OrderFill, OrderRequest, Side, TransferStatusSource, TransferStatusView,
-    Venue, VenueAdapter,
+    BybitLiveAdapter, CandidateOpportunity, ChillybotOpportunitySource, FundingOpportunityType,
+    MarketView, OkxLiveAdapter, OpportunityHintSource, OrderFill, OrderRequest, Side,
+    TransferStatusSource, TransferStatusView, Venue, VenueAdapter,
 };
 use tokio::time::{sleep, Duration};
 
 #[derive(Clone, Copy, Debug)]
 struct LatencySample {
     local_roundtrip_ms: u128,
+}
+
+#[derive(Clone, Debug)]
+enum PositionSelectionCheck {
+    Flat,
+    Open { long_size: f64, short_size: f64 },
+    Error(String),
 }
 
 #[tokio::main]
@@ -62,6 +70,7 @@ async fn main() -> Result<()> {
     println!("candidate_count={}", candidates.len());
 
     let mut selected = None;
+    let mut position_checks = BTreeMap::new();
     for candidate in candidates.iter().filter(|item| item.is_tradeable()) {
         let long_position = adapter(&adapters, candidate.long_venue)?
             .fetch_position(&candidate.symbol)
@@ -73,16 +82,28 @@ async fn main() -> Result<()> {
             (Ok(long_position), Ok(short_position))
                 if long_position.size.abs() <= 1e-9 && short_position.size.abs() <= 1e-9 =>
             {
+                position_checks.insert(candidate.pair_id.clone(), PositionSelectionCheck::Flat);
                 selected = Some(candidate.clone());
                 break;
             }
             (Ok(long_position), Ok(short_position)) => {
+                position_checks.insert(
+                    candidate.pair_id.clone(),
+                    PositionSelectionCheck::Open {
+                        long_size: long_position.size,
+                        short_size: short_position.size,
+                    },
+                );
                 println!(
                     "skip pair={} reason=open_position long_size={} short_size={}",
                     candidate.pair_id, long_position.size, short_position.size
                 );
             }
             (Err(error), _) | (_, Err(error)) => {
+                position_checks.insert(
+                    candidate.pair_id.clone(),
+                    PositionSelectionCheck::Error(error.to_string()),
+                );
                 println!(
                     "skip pair={} reason=position_check_failed error={error:#}",
                     candidate.pair_id
@@ -91,7 +112,13 @@ async fn main() -> Result<()> {
         }
     }
 
-    let candidate = selected.ok_or_else(|| anyhow!("no flat tradeable candidate found"))?;
+    let candidate = match selected {
+        Some(candidate) => candidate,
+        None => {
+            print_no_entry_diagnostics(&config, &market, &candidates, &position_checks);
+            return Err(anyhow!("no flat tradeable candidate found"));
+        }
+    };
     let executable_quantity = common_executable_quantity(
         &adapters,
         candidate.long_venue,
@@ -255,23 +282,23 @@ async fn build_live_adapters(config: &AppConfig) -> Result<Vec<Arc<dyn VenueAdap
         let adapter: Arc<dyn VenueAdapter> = match venue_config.venue {
             Venue::Binance => Arc::new(BinanceLiveAdapter::new(
                 venue_config,
-                config.runtime.chillybot_timeout_ms,
+                &config.runtime,
                 &config.symbols,
             )?),
             Venue::Okx => Arc::new(OkxLiveAdapter::new(
                 venue_config,
-                config.runtime.chillybot_timeout_ms,
+                &config.runtime,
                 &config.symbols,
             )?),
             Venue::Bybit => Arc::new(BybitLiveAdapter::new(
                 venue_config,
-                config.runtime.chillybot_timeout_ms,
+                &config.runtime,
                 &config.symbols,
             )?),
             Venue::Hyperliquid => Arc::new(
                 lightfee::HyperliquidLiveAdapter::new(
                     venue_config,
-                    config.runtime.chillybot_timeout_ms,
+                    &config.runtime,
                     &config.symbols,
                 )
                 .await?,
@@ -513,4 +540,229 @@ async fn flatten_open_positions(
 
     println!("flatten_completed order_count={flattened}");
     Ok(())
+}
+
+fn print_no_entry_diagnostics(
+    config: &AppConfig,
+    market: &MarketView,
+    candidates: &[CandidateOpportunity],
+    position_checks: &BTreeMap<String, PositionSelectionCheck>,
+) {
+    let tradeable_count = candidates
+        .iter()
+        .filter(|candidate| candidate.is_tradeable())
+        .count();
+    let blocked_reason_counts = count_strings(
+        candidates
+            .iter()
+            .flat_map(|candidate| candidate.blocked_reasons.iter().cloned()),
+    );
+    let advisory_counts = count_strings(
+        candidates
+            .iter()
+            .flat_map(|candidate| candidate.advisories.iter().cloned()),
+    );
+    println!(
+        "no_entry_diagnostics reason={} candidate_count={} tradeable_count={} blocked_reason_counts={:?} advisory_counts={:?}",
+        live_smoke_no_entry_reason(candidates, position_checks),
+        candidates.len(),
+        tradeable_count,
+        blocked_reason_counts,
+        advisory_counts,
+    );
+
+    for candidate in candidates {
+        print_candidate_checklist(
+            config,
+            market,
+            candidate,
+            position_checks.get(&candidate.pair_id),
+        );
+    }
+}
+
+fn live_smoke_no_entry_reason(
+    candidates: &[CandidateOpportunity],
+    position_checks: &BTreeMap<String, PositionSelectionCheck>,
+) -> &'static str {
+    if candidates.is_empty() {
+        return "no_candidates";
+    }
+    if candidates.iter().all(|candidate| !candidate.is_tradeable()) {
+        return "no_tradeable_candidates";
+    }
+    if position_checks
+        .values()
+        .any(|status| matches!(status, PositionSelectionCheck::Flat))
+    {
+        return "flat_candidate_not_selected";
+    }
+    if position_checks
+        .values()
+        .any(|status| matches!(status, PositionSelectionCheck::Open { .. }))
+    {
+        return "tradeable_candidates_blocked_by_open_positions";
+    }
+    if position_checks
+        .values()
+        .any(|status| matches!(status, PositionSelectionCheck::Error(_)))
+    {
+        return "tradeable_candidates_position_check_failed";
+    }
+    "tradeable_candidates_not_selected"
+}
+
+fn print_candidate_checklist(
+    config: &AppConfig,
+    market: &MarketView,
+    candidate: &CandidateOpportunity,
+    position_check: Option<&PositionSelectionCheck>,
+) {
+    let remaining_ms = candidate
+        .first_funding_timestamp_ms
+        .saturating_sub(market.now_ms());
+    let market_fresh_long = market.is_fresh(candidate.long_venue, config.runtime.max_market_age_ms);
+    let market_fresh_short =
+        market.is_fresh(candidate.short_venue, config.runtime.max_market_age_ms);
+    let funding_not_passed = remaining_ms > 0;
+    let inside_entry_window = funding_not_passed
+        && lightfee::strategy::is_within_funding_scan_window_ms(config, remaining_ms);
+    let stagger_gap_limit_ms = config
+        .strategy
+        .max_stagger_gap_minutes
+        .saturating_mul(60_000);
+    let stagger_gap_ok = candidate.opportunity_type != FundingOpportunityType::Staggered
+        || config.strategy.max_stagger_gap_minutes <= 0
+        || candidate.stagger_gap_ms <= stagger_gap_limit_ms;
+    let order_size_positive = candidate.quantity > 0.0;
+    let funding_edge_ok = candidate.funding_edge_bps >= config.strategy.min_funding_edge_bps;
+    let expected_edge_ok = candidate.expected_edge_bps >= config.strategy.min_expected_edge_bps;
+    let worst_case_edge_ok =
+        candidate.worst_case_edge_bps >= config.strategy.min_worst_case_edge_bps;
+    let (flat_position_clear, flat_position_detail) = match position_check {
+        Some(PositionSelectionCheck::Flat) => (true, "flat".to_string()),
+        Some(PositionSelectionCheck::Open {
+            long_size,
+            short_size,
+        }) => (
+            false,
+            format!("long_size={} short_size={}", long_size, short_size),
+        ),
+        Some(PositionSelectionCheck::Error(error)) => {
+            (false, format!("position_check_failed:{error}"))
+        }
+        None if candidate.is_tradeable() => (false, "position_not_checked".to_string()),
+        None => (true, "candidate_blocked_before_position_check".to_string()),
+    };
+
+    println!(
+        "candidate pair={} symbol={} long={} short={} type={:?} tradeable={} transfer_state={:?}",
+        candidate.pair_id,
+        candidate.symbol,
+        candidate.long_venue,
+        candidate.short_venue,
+        candidate.opportunity_type,
+        candidate.is_tradeable(),
+        candidate.transfer_state,
+    );
+    println!(
+        "  metrics quantity={:.8} entry_notional_quote={:.4} funding_edge_bps={:.4} first_stage_expected_edge_bps={:.4} expected_edge_bps={:.4} worst_case_edge_bps={:.4} ranking_edge_bps={:.4} entry_cross_bps={:.4} fee_bps={:.4} entry_slippage_bps={:.4}",
+        candidate.quantity,
+        candidate.entry_notional_quote,
+        candidate.funding_edge_bps,
+        candidate.first_stage_expected_edge_bps,
+        candidate.expected_edge_bps,
+        candidate.worst_case_edge_bps,
+        candidate.ranking_edge_bps,
+        candidate.entry_cross_bps,
+        candidate.fee_bps,
+        candidate.entry_slippage_bps,
+    );
+    for (label, ok, detail) in [
+        (
+            "market_fresh_long",
+            market_fresh_long,
+            format!(
+                "venue={} max_age_ms={}",
+                candidate.long_venue, config.runtime.max_market_age_ms
+            ),
+        ),
+        (
+            "market_fresh_short",
+            market_fresh_short,
+            format!(
+                "venue={} max_age_ms={}",
+                candidate.short_venue, config.runtime.max_market_age_ms
+            ),
+        ),
+        (
+            "funding_not_passed",
+            funding_not_passed,
+            format!("remaining_ms={remaining_ms}"),
+        ),
+        (
+            "inside_entry_window",
+            inside_entry_window,
+            format!(
+                "remaining_ms={remaining_ms} window={}..{}min",
+                config.strategy.min_scan_minutes_before_funding,
+                config.strategy.max_scan_minutes_before_funding
+            ),
+        ),
+        (
+            "stagger_gap_ok",
+            stagger_gap_ok,
+            format!(
+                "opportunity_type={:?} gap_ms={} max_gap_ms={}",
+                candidate.opportunity_type, candidate.stagger_gap_ms, stagger_gap_limit_ms
+            ),
+        ),
+        (
+            "order_size_positive",
+            order_size_positive,
+            format!("quantity={:.8}", candidate.quantity),
+        ),
+        (
+            "funding_edge_ok",
+            funding_edge_ok,
+            format!(
+                "{:.4}>={:.4}",
+                candidate.funding_edge_bps, config.strategy.min_funding_edge_bps
+            ),
+        ),
+        (
+            "expected_edge_ok",
+            expected_edge_ok,
+            format!(
+                "{:.4}>={:.4}",
+                candidate.expected_edge_bps, config.strategy.min_expected_edge_bps
+            ),
+        ),
+        (
+            "worst_case_edge_ok",
+            worst_case_edge_ok,
+            format!(
+                "{:.4}>={:.4}",
+                candidate.worst_case_edge_bps, config.strategy.min_worst_case_edge_bps
+            ),
+        ),
+        (
+            "flat_position_clear",
+            flat_position_clear,
+            flat_position_detail,
+        ),
+    ] {
+        let mark = if ok { "[x]" } else { "[ ]" };
+        println!("  {} {} {}", mark, label, detail);
+    }
+    println!("  blocked_reasons={:?}", candidate.blocked_reasons);
+    println!("  advisories={:?}", candidate.advisories);
+}
+
+fn count_strings(items: impl IntoIterator<Item = String>) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for item in items {
+        *counts.entry(item).or_insert(0) += 1;
+    }
+    counts
 }

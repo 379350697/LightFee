@@ -37,6 +37,11 @@ pub struct JournalOptimizationStats {
     pub first_leg_counts: BTreeMap<String, u64>,
     pub first_leg_dominant_factor_counts: BTreeMap<String, u64>,
     pub order_error_counts: BTreeMap<String, u64>,
+    pub no_entry_reason_counts: BTreeMap<String, u64>,
+    pub no_entry_blocked_reason_counts: BTreeMap<String, u64>,
+    pub no_entry_advisory_counts: BTreeMap<String, u64>,
+    pub no_entry_checklist_fail_counts: BTreeMap<String, u64>,
+    pub no_entry_selection_blocker_counts: BTreeMap<String, u64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
@@ -205,6 +210,50 @@ pub fn analyze_journal_records(records: &[JournalRecord]) -> JournalAnalysisRepo
                         .or_default() += 1;
                 }
             }
+            "scan.no_entry_diagnostics" => {
+                if let Some(reason) = payload_string(record, "reason") {
+                    *optimization_stats
+                        .no_entry_reason_counts
+                        .entry(reason.to_string())
+                        .or_default() += 1;
+                }
+                extend_counter_map(
+                    &mut optimization_stats.no_entry_blocked_reason_counts,
+                    record.payload.get("blocked_reason_counts"),
+                );
+                extend_counter_map(
+                    &mut optimization_stats.no_entry_advisory_counts,
+                    record.payload.get("advisory_counts"),
+                );
+                if let Some(candidates) =
+                    record.payload.get("candidates").and_then(|v| v.as_array())
+                {
+                    for candidate in candidates {
+                        if let Some(selection_blocker) =
+                            nested_string(candidate, "selection_blocker")
+                        {
+                            *optimization_stats
+                                .no_entry_selection_blocker_counts
+                                .entry(selection_blocker.to_string())
+                                .or_default() += 1;
+                        }
+                        if let Some(checklist) =
+                            candidate.get("checklist").and_then(|v| v.as_array())
+                        {
+                            for item in checklist {
+                                if item.get("ok").and_then(|v| v.as_bool()) == Some(false) {
+                                    if let Some(key) = nested_string(item, "key") {
+                                        *optimization_stats
+                                            .no_entry_checklist_fail_counts
+                                            .entry(key.to_string())
+                                            .or_default() += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             "execution.entry_order_plan" => {
                 if let Some(first) = record.payload.get("first") {
                     if let (Some(venue), Some(leg)) = (
@@ -311,6 +360,18 @@ fn nested_string<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str>
 
 fn nested_f64(value: &serde_json::Value, key: &str) -> Option<f64> {
     value.get(key).and_then(|item| item.as_f64())
+}
+
+fn extend_counter_map(target: &mut BTreeMap<String, u64>, value: Option<&serde_json::Value>) {
+    let Some(object) = value.and_then(|item| item.as_object()) else {
+        return;
+    };
+    for (key, count) in object {
+        let Some(count) = count.as_u64() else {
+            continue;
+        };
+        *target.entry(key.clone()).or_default() += count;
+    }
 }
 
 fn update_trade_replay(replay: &mut TradeReplayAccumulator, record: &JournalRecord) {
@@ -600,6 +661,55 @@ fn build_recommendations(
             title: "Runtime cooldown gates are actively suppressing entries".to_string(),
             summary: "Cooldown-based entry blocking is happening in live scans. That is good for safety, but it also means execution quality is poor enough to reduce opportunity capture; fix the underlying venue path before widening filters.".to_string(),
             evidence: vec![format!("cooldown_gate_blocks={count}")],
+        });
+    }
+
+    if let Some((reason, count)) = optimization_stats
+        .no_entry_reason_counts
+        .iter()
+        .max_by(|left, right| left.1.cmp(right.1).then_with(|| left.0.cmp(right.0)))
+        .filter(|(_, count)| **count > 0)
+    {
+        let mut evidence = vec![format!("no_entry_reason_count[{reason}]={count}")];
+        if let Some((blocked_reason, blocked_count)) = optimization_stats
+            .no_entry_blocked_reason_counts
+            .iter()
+            .max_by(|left, right| left.1.cmp(right.1).then_with(|| left.0.cmp(right.0)))
+        {
+            evidence.push(format!(
+                "top_blocked_reason[{blocked_reason}]={blocked_count}"
+            ));
+        }
+        if let Some((check_key, check_count)) = optimization_stats
+            .no_entry_checklist_fail_counts
+            .iter()
+            .max_by(|left, right| left.1.cmp(right.1).then_with(|| left.0.cmp(right.0)))
+        {
+            evidence.push(format!("top_checklist_fail[{check_key}]={check_count}"));
+        }
+        recommendations.push(OptimizationRecommendation {
+            priority: 2,
+            category: "opportunity_capture".to_string(),
+            title: "No-entry diagnostics are showing the dominant opportunity blocker".to_string(),
+            summary: format!(
+                "The journal now shows a repeated no-entry pattern led by `{reason}`. Use the blocked-reason and checklist-fail breakdown to decide whether to tune thresholds, widen symbol coverage, or accept that the market window simply did not offer a safe entry."
+            ),
+            evidence,
+        });
+    }
+
+    if let Some((check_key, count)) = optimization_stats
+        .no_entry_checklist_fail_counts
+        .iter()
+        .max_by(|left, right| left.1.cmp(right.1).then_with(|| left.0.cmp(right.0)))
+        .filter(|(_, count)| **count > 0)
+    {
+        recommendations.push(OptimizationRecommendation {
+            priority: 3,
+            category: "opportunity_checklist".to_string(),
+            title: format!("`{check_key}` is the most common failed opportunity check"),
+            summary: "Review the no-entry checklist section in the offline report before changing filters broadly. This pinpoints whether the real bottleneck is freshness, edge thresholds, stagger-gap policy, slot pressure, or symbol conflicts.".to_string(),
+            evidence: vec![format!("failed_check_count={count}")],
         });
     }
 

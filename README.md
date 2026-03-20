@@ -40,7 +40,7 @@ The bundled config runs in `paper` mode using scripted venue feeds from `config/
 - staggered funding opportunities are scored on first-stage realizable edge by default, with configurable continuation into a second stage
 - submit-time quote expiry checks, top-of-book size capping, and short venue cooldowns after uncertain order outcomes
 - fail-closed restart recovery with venue position reconciliation
-- async JSONL event journal with sync-flushed critical recovery markers
+- async JSONL event journal with bounded non-blocking telemetry and sync-flushed critical recovery markers
 - JSON snapshot store instead of a database
 - exchange-specific behavior isolated behind `VenueAdapter`
 
@@ -49,6 +49,7 @@ The bundled config runs in `paper` mode using scripted venue feeds from `config/
 The journal is designed for unattended operation:
 
 - hot-path telemetry is appended asynchronously on a background writer thread
+- non-critical telemetry uses a bounded queue and is dropped with counters instead of growing memory without bound
 - critical state transitions such as `entry.opened`, `exit.closed`, and `recovery.*` are flushed synchronously
 - each record carries `seq`, `run_id`, `ts_ms`, `kind`, and `payload`
 - execution logs include common executable quantity normalization, per-leg order submissions, fills, failures, and local round-trip latency
@@ -89,6 +90,13 @@ LightFee now uses three recovery layers for live mode:
 - immediate snapshot save after `entry.opened` and `exit.closed`
 - JSONL journal replay when the snapshot is missing but the event log still exists
 - live position discovery when local state is gone but the exchanges still show a single balanced hedge
+
+Additional unattended guards keep long-running deployments calmer:
+
+- private position caches expire and fall back to exchange truth instead of being trusted forever
+- the main tick loop backs off after consecutive full-cycle failures instead of hammering dependencies
+- market/private WebSocket reconnects use exponential backoff and mark the stream unhealthy after repeated failures
+- the bundled shell/systemd supervisors now rate-limit crash loops instead of restarting at a fixed cadence forever
 
 If live exposure is unbalanced or ambiguous on restart, the engine goes `fail_closed` instead of guessing.
 

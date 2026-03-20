@@ -12,6 +12,7 @@ use lightfee::{
 };
 use serde_json::Value;
 use tempfile::TempDir;
+use tokio::time::{sleep, Duration};
 
 #[tokio::test]
 async fn ranks_the_best_four_venue_candidate() {
@@ -222,6 +223,45 @@ async fn hint_source_failure_falls_back_to_exchange_scan() {
         .expect("best candidate");
     assert_eq!(best.long_venue, Venue::Binance);
     assert_eq!(best.short_venue, Venue::Okx);
+}
+
+#[tokio::test]
+async fn no_entry_window_emits_candidate_checklist_diagnostics() {
+    let temp = TempDir::new().expect("tempdir");
+    let mut config = test_config(&temp, true);
+    config.strategy.min_funding_edge_bps = 50.0;
+    config.strategy.min_expected_edge_bps = 50.0;
+    config.strategy.min_worst_case_edge_bps = 50.0;
+    let mut engine = Engine::new(config.clone(), to_dyn(adapters_for_ranking()))
+        .await
+        .expect("engine");
+
+    engine.tick().await.expect("tick");
+    sleep(Duration::from_millis(300)).await;
+
+    let records = read_event_records(&config.persistence.event_log_path);
+    let diagnostic = records
+        .iter()
+        .find(|record| record_kind(record) == Some("scan.no_entry_diagnostics"))
+        .expect("diagnostic event");
+    assert_eq!(
+        diagnostic["payload"]["reason"].as_str(),
+        Some("no_tradeable_candidates")
+    );
+    assert_eq!(diagnostic["payload"]["tradeable_count"].as_u64(), Some(0));
+    let first_candidate = diagnostic["payload"]["candidates"]
+        .as_array()
+        .and_then(|items| items.first())
+        .expect("candidate checklist");
+    let checklist = first_candidate["checklist"]
+        .as_array()
+        .expect("candidate factors");
+    assert!(checklist.iter().any(|item| {
+        item["key"].as_str() == Some("funding_edge_ok") && item["ok"].as_bool() == Some(false)
+    }));
+    assert!(checklist.iter().any(|item| {
+        item["key"].as_str() == Some("market_fresh_long") && item["ok"].as_bool() == Some(true)
+    }));
 }
 
 #[test]
@@ -546,8 +586,15 @@ async fn uncertain_first_leg_is_flattened_before_engine_continues() {
             chillybot_timeout_ms: 2_000,
             poll_interval_ms: 10,
             max_market_age_ms: 10_000,
+            private_position_max_age_ms: 15_000,
             max_order_quote_age_ms: 3_000,
             uncertain_order_cooldown_ms: 60_000,
+            tick_failure_backoff_initial_ms: 1_000,
+            tick_failure_backoff_max_ms: 30_000,
+            ws_reconnect_initial_ms: 1_000,
+            ws_reconnect_max_ms: 30_000,
+            ws_unhealthy_after_failures: 5,
+            journal_async_queue_capacity: 4_096,
             auto_trade_enabled: true,
         },
         strategy: StrategyConfig {
@@ -645,8 +692,15 @@ async fn uncertain_venue_is_cooled_down_before_next_entry_attempt() {
             chillybot_timeout_ms: 2_000,
             poll_interval_ms: 10,
             max_market_age_ms: 10_000,
+            private_position_max_age_ms: 15_000,
             max_order_quote_age_ms: 3_000,
             uncertain_order_cooldown_ms: 60_000,
+            tick_failure_backoff_initial_ms: 1_000,
+            tick_failure_backoff_max_ms: 30_000,
+            ws_reconnect_initial_ms: 1_000,
+            ws_reconnect_max_ms: 30_000,
+            ws_unhealthy_after_failures: 5,
+            journal_async_queue_capacity: 4_096,
             auto_trade_enabled: true,
         },
         strategy: StrategyConfig {
@@ -1055,8 +1109,15 @@ fn test_config(temp: &TempDir, auto_trade_enabled: bool) -> AppConfig {
             chillybot_timeout_ms: 2_000,
             poll_interval_ms: 10,
             max_market_age_ms: 10_000,
+            private_position_max_age_ms: 15_000,
             max_order_quote_age_ms: 3_000,
             uncertain_order_cooldown_ms: 30_000,
+            tick_failure_backoff_initial_ms: 1_000,
+            tick_failure_backoff_max_ms: 30_000,
+            ws_reconnect_initial_ms: 1_000,
+            ws_reconnect_max_ms: 30_000,
+            ws_unhealthy_after_failures: 5,
+            journal_async_queue_capacity: 4_096,
             auto_trade_enabled,
         },
         strategy: StrategyConfig {

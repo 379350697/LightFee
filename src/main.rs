@@ -3,6 +3,7 @@ use std::{env, path::PathBuf, sync::Arc, time::Duration};
 use anyhow::{Context, Result};
 use lightfee::{
     config::{OpportunitySourceMode, RuntimeMode},
+    resilience::FailureBackoff,
     AppConfig, BinanceLiveAdapter, BybitLiveAdapter, ChillybotOpportunitySource, Engine,
     HyperliquidLiveAdapter, OkxLiveAdapter, OpportunityHintSource, ScriptedVenueAdapter,
     TransferStatusSource, Venue, VenueAdapter,
@@ -46,11 +47,27 @@ async fn main() -> Result<()> {
 
     let mut interval = time::interval(Duration::from_millis(config.runtime.poll_interval_ms));
     interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let mut tick_backoff = FailureBackoff::new(
+        config.runtime.tick_failure_backoff_initial_ms,
+        config.runtime.tick_failure_backoff_max_ms,
+        0x1F7A_11FE,
+    );
+    let mut backoff_until = None;
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                if let Err(error) = engine.tick().await {
-                    error!(?error, "engine tick failed");
+                let now = time::Instant::now();
+                if backoff_until.is_some_and(|until| now < until) {
+                    continue;
+                }
+                backoff_until = None;
+                match engine.tick().await {
+                    Ok(()) => tick_backoff.on_success(),
+                    Err(error) => {
+                        let delay_ms = tick_backoff.on_failure_with_jitter();
+                        backoff_until = Some(time::Instant::now() + Duration::from_millis(delay_ms));
+                        error!(?error, backoff_ms = delay_ms, "engine tick failed");
+                    }
                 }
             }
             _ = tokio::signal::ctrl_c() => {
@@ -114,26 +131,21 @@ async fn build_live_adapters(config: &AppConfig) -> Result<Vec<Arc<dyn VenueAdap
         let adapter: Arc<dyn VenueAdapter> = match venue_config.venue {
             Venue::Binance => Arc::new(BinanceLiveAdapter::new(
                 venue_config,
-                config.runtime.chillybot_timeout_ms,
+                &config.runtime,
                 &config.symbols,
             )?),
             Venue::Okx => Arc::new(OkxLiveAdapter::new(
                 venue_config,
-                config.runtime.chillybot_timeout_ms,
+                &config.runtime,
                 &config.symbols,
             )?),
             Venue::Bybit => Arc::new(BybitLiveAdapter::new(
                 venue_config,
-                config.runtime.chillybot_timeout_ms,
+                &config.runtime,
                 &config.symbols,
             )?),
             Venue::Hyperliquid => Arc::new(
-                HyperliquidLiveAdapter::new(
-                    venue_config,
-                    config.runtime.chillybot_timeout_ms,
-                    &config.symbols,
-                )
-                .await?,
+                HyperliquidLiveAdapter::new(venue_config, &config.runtime, &config.symbols).await?,
             ),
         };
         adapters.push(adapter);

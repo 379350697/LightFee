@@ -4,7 +4,8 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
-        mpsc, Arc, Mutex,
+        mpsc::{self, TrySendError},
+        Arc, Mutex,
     },
     thread::{self, JoinHandle},
     time::Duration,
@@ -17,7 +18,7 @@ pub struct JsonlJournal {
     path: PathBuf,
     run_id: String,
     next_seq: AtomicU64,
-    sender: mpsc::Sender<WriterCommand>,
+    sender: mpsc::SyncSender<WriterCommand>,
     worker: Mutex<Option<JoinHandle<Result<()>>>>,
     sync_lock: Mutex<()>,
     metrics: Arc<JournalRuntimeMetrics>,
@@ -46,6 +47,7 @@ struct JournalRuntimeMetrics {
     async_appends: AtomicU64,
     critical_appends: AtomicU64,
     sync_fallback_appends: AtomicU64,
+    dropped_async_appends: AtomicU64,
     flush_requests: AtomicU64,
     writer_flushes: AtomicU64,
     writer_failures: AtomicU64,
@@ -57,6 +59,7 @@ pub struct JournalRuntimeMetricsSnapshot {
     pub async_appends: u64,
     pub critical_appends: u64,
     pub sync_fallback_appends: u64,
+    pub dropped_async_appends: u64,
     pub flush_requests: u64,
     pub writer_flushes: u64,
     pub writer_failures: u64,
@@ -65,8 +68,12 @@ pub struct JournalRuntimeMetricsSnapshot {
 
 impl JsonlJournal {
     pub fn new(path: impl AsRef<Path>) -> Self {
+        Self::with_capacity(path, 4_096)
+    }
+
+    pub fn with_capacity(path: impl AsRef<Path>, async_queue_capacity: usize) -> Self {
         let path = path.as_ref().to_path_buf();
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::sync_channel(async_queue_capacity.max(1));
         let worker_path = path.clone();
         let metrics = Arc::new(JournalRuntimeMetrics::default());
         let worker_metrics = Arc::clone(&metrics);
@@ -150,6 +157,7 @@ impl JsonlJournal {
             async_appends: self.metrics.async_appends.load(Ordering::Relaxed),
             critical_appends: self.metrics.critical_appends.load(Ordering::Relaxed),
             sync_fallback_appends: self.metrics.sync_fallback_appends.load(Ordering::Relaxed),
+            dropped_async_appends: self.metrics.dropped_async_appends.load(Ordering::Relaxed),
             flush_requests: self.metrics.flush_requests.load(Ordering::Relaxed),
             writer_flushes: self.metrics.writer_flushes.load(Ordering::Relaxed),
             writer_failures: self.metrics.writer_failures.load(Ordering::Relaxed),
@@ -195,17 +203,25 @@ impl JsonlJournal {
         }
 
         self.metrics.async_appends.fetch_add(1, Ordering::Relaxed);
-        if self
-            .sender
-            .send(WriterCommand::Append(line.clone()))
-            .is_err()
-        {
-            self.metrics
-                .queue_disconnects
-                .fetch_add(1, Ordering::Relaxed);
-            return self.append_sync_line(&line, false, true);
+        match self.sender.try_send(WriterCommand::Append(line)) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => {
+                self.metrics
+                    .dropped_async_appends
+                    .fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(TrySendError::Disconnected(command)) => {
+                self.metrics
+                    .queue_disconnects
+                    .fetch_add(1, Ordering::Relaxed);
+                let line = match command {
+                    WriterCommand::Append(line) => line,
+                    _ => Vec::new(),
+                };
+                self.append_sync_line(&line, false, true)
+            }
         }
-        Ok(())
     }
 
     fn append_sync_line(&self, line: &[u8], flush: bool, fallback: bool) -> Result<()> {

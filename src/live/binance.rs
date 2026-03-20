@@ -16,11 +16,12 @@ use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tracing::{debug, warn};
 
 use crate::{
-    config::VenueConfig,
+    config::{RuntimeConfig, VenueConfig},
     models::{
         AssetTransferStatus, OrderFill, OrderRequest, PositionSnapshot, Side, SymbolMarketSnapshot,
         Venue, VenueMarketSnapshot,
     },
+    resilience::FailureBackoff,
     venue::VenueAdapter,
 };
 
@@ -33,6 +34,7 @@ use super::{
 
 pub struct BinanceLiveAdapter {
     config: VenueConfig,
+    runtime: RuntimeConfig,
     client: Client,
     base_url: String,
     wallet_base_url: String,
@@ -44,7 +46,7 @@ pub struct BinanceLiveAdapter {
 }
 
 impl BinanceLiveAdapter {
-    pub fn new(config: &VenueConfig, timeout_ms: u64, symbols: &[String]) -> Result<Self> {
+    pub fn new(config: &VenueConfig, runtime: &RuntimeConfig, symbols: &[String]) -> Result<Self> {
         if config.venue != Venue::Binance {
             return Err(anyhow!("binance live adapter requires binance config"));
         }
@@ -63,7 +65,8 @@ impl BinanceLiveAdapter {
         let market_ws = WsMarketState::new();
         let adapter = Self {
             config: config.clone(),
-            client: build_http_client(timeout_ms)?,
+            runtime: runtime.clone(),
+            client: build_http_client(runtime.chillybot_timeout_ms)?,
             base_url,
             wallet_base_url,
             metadata: Mutex::new(HashMap::new()),
@@ -102,68 +105,77 @@ impl BinanceLiveAdapter {
             stream_names.join("/")
         );
         let state = self.market_ws.clone();
-        spawn_ws_loop("binance", url, Vec::new(), state, move |cache, raw| {
-            let payload = parse_text_message(raw)?;
-            let data = payload.get("data").unwrap_or(&payload);
-            let event = data
-                .get("e")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default();
-            let venue_symbol = data
-                .get("s")
-                .and_then(|value| value.as_str())
-                .ok_or_else(|| anyhow!("binance ws payload missing symbol"))?;
-            let Some(symbol) = symbol_map.get(venue_symbol) else {
-                return Ok(());
-            };
+        spawn_ws_loop(
+            "binance",
+            url,
+            Vec::new(),
+            state,
+            self.runtime.ws_reconnect_initial_ms,
+            self.runtime.ws_reconnect_max_ms,
+            self.runtime.ws_unhealthy_after_failures,
+            move |cache, raw| {
+                let payload = parse_text_message(raw)?;
+                let data = payload.get("data").unwrap_or(&payload);
+                let event = data
+                    .get("e")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default();
+                let venue_symbol = data
+                    .get("s")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| anyhow!("binance ws payload missing symbol"))?;
+                let Some(symbol) = symbol_map.get(venue_symbol) else {
+                    return Ok(());
+                };
 
-            match event {
-                "bookTicker" => {
-                    cache.update_quote(
-                        symbol,
-                        parse_f64(
-                            data.get("b")
-                                .and_then(|value| value.as_str())
-                                .ok_or_else(|| anyhow!("binance ws missing bid price"))?,
-                        )?,
-                        parse_f64(
-                            data.get("a")
-                                .and_then(|value| value.as_str())
-                                .ok_or_else(|| anyhow!("binance ws missing ask price"))?,
-                        )?,
-                        parse_f64(
-                            data.get("B")
-                                .and_then(|value| value.as_str())
-                                .ok_or_else(|| anyhow!("binance ws missing bid size"))?,
-                        )?,
-                        parse_f64(
-                            data.get("A")
-                                .and_then(|value| value.as_str())
-                                .ok_or_else(|| anyhow!("binance ws missing ask size"))?,
-                        )?,
-                        data.get("E")
-                            .and_then(|value| value.as_i64())
-                            .unwrap_or_else(now_ms),
-                    );
+                match event {
+                    "bookTicker" => {
+                        cache.update_quote(
+                            symbol,
+                            parse_f64(
+                                data.get("b")
+                                    .and_then(|value| value.as_str())
+                                    .ok_or_else(|| anyhow!("binance ws missing bid price"))?,
+                            )?,
+                            parse_f64(
+                                data.get("a")
+                                    .and_then(|value| value.as_str())
+                                    .ok_or_else(|| anyhow!("binance ws missing ask price"))?,
+                            )?,
+                            parse_f64(
+                                data.get("B")
+                                    .and_then(|value| value.as_str())
+                                    .ok_or_else(|| anyhow!("binance ws missing bid size"))?,
+                            )?,
+                            parse_f64(
+                                data.get("A")
+                                    .and_then(|value| value.as_str())
+                                    .ok_or_else(|| anyhow!("binance ws missing ask size"))?,
+                            )?,
+                            data.get("E")
+                                .and_then(|value| value.as_i64())
+                                .unwrap_or_else(now_ms),
+                        );
+                    }
+                    "markPriceUpdate" => {
+                        cache.update_funding(
+                            symbol,
+                            parse_f64(
+                                data.get("r")
+                                    .and_then(|value| value.as_str())
+                                    .ok_or_else(|| anyhow!("binance ws missing funding rate"))?,
+                            )?,
+                            data.get("T")
+                                .and_then(|value| value.as_i64())
+                                .ok_or_else(|| anyhow!("binance ws missing next funding time"))?,
+                        );
+                    }
+                    _ => {}
                 }
-                "markPriceUpdate" => {
-                    cache.update_funding(
-                        symbol,
-                        parse_f64(
-                            data.get("r")
-                                .and_then(|value| value.as_str())
-                                .ok_or_else(|| anyhow!("binance ws missing funding rate"))?,
-                        )?,
-                        data.get("T")
-                            .and_then(|value| value.as_i64())
-                            .ok_or_else(|| anyhow!("binance ws missing next funding time"))?,
-                    );
-                }
-                _ => {}
-            }
 
-            Ok(())
-        });
+                Ok(())
+            },
+        );
     }
 
     fn cached_snapshot(&self, symbol: &str) -> Option<SymbolMarketSnapshot> {
@@ -182,18 +194,34 @@ impl BinanceLiveAdapter {
         let base_url = self.base_url.clone();
         let ws_base_url = binance_ws_base_url(&self.base_url).to_string();
         let private_state = self.private_ws.clone();
+        let reconnect_initial_ms = self.runtime.ws_reconnect_initial_ms;
+        let reconnect_max_ms = self.runtime.ws_reconnect_max_ms;
+        let unhealthy_after_failures = self.runtime.ws_unhealthy_after_failures;
         let symbol_map = symbols
             .iter()
             .map(|symbol| (venue_symbol(&self.config, symbol), symbol.clone()))
             .collect::<HashMap<_, _>>();
         let task = tokio::spawn(async move {
+            let mut reconnect_backoff = FailureBackoff::new(
+                reconnect_initial_ms,
+                reconnect_max_ms,
+                Venue::Binance as u64,
+            );
             loop {
                 let listen_key =
                     match start_binance_listen_key(&client, &base_url, api_key.as_str()).await {
                         Ok(listen_key) => listen_key,
                         Err(error) => {
+                            private_state.record_connection_failure(
+                                now_ms(),
+                                unhealthy_after_failures,
+                                error.to_string(),
+                            );
                             warn!(?error, "binance private listenKey start failed");
-                            sleep(Duration::from_secs(5)).await;
+                            sleep(Duration::from_millis(
+                                reconnect_backoff.on_failure_with_jitter(),
+                            ))
+                            .await;
                             continue;
                         }
                     };
@@ -221,6 +249,8 @@ impl BinanceLiveAdapter {
                 let url = format!("{ws_base_url}/ws/{listen_key}");
                 match connect_async(url.as_str()).await {
                     Ok((mut socket, _)) => {
+                        reconnect_backoff.on_success();
+                        private_state.record_connection_success(now_ms());
                         debug!("binance private websocket connected");
                         while let Some(message) = socket.next().await {
                             match message {
@@ -235,16 +265,31 @@ impl BinanceLiveAdapter {
                                 }
                                 Ok(Message::Ping(payload)) => {
                                     if let Err(error) = socket.send(Message::Pong(payload)).await {
+                                        private_state.record_connection_failure(
+                                            now_ms(),
+                                            unhealthy_after_failures,
+                                            error.to_string(),
+                                        );
                                         warn!(?error, "binance private websocket pong failed");
                                         break;
                                     }
                                 }
                                 Ok(Message::Close(frame)) => {
+                                    private_state.record_connection_failure(
+                                        now_ms(),
+                                        unhealthy_after_failures,
+                                        format!("closed:{frame:?}"),
+                                    );
                                     debug!(?frame, "binance private websocket closed");
                                     break;
                                 }
                                 Ok(_) => {}
                                 Err(error) => {
+                                    private_state.record_connection_failure(
+                                        now_ms(),
+                                        unhealthy_after_failures,
+                                        error.to_string(),
+                                    );
                                     warn!(?error, "binance private websocket receive failed");
                                     break;
                                 }
@@ -252,6 +297,11 @@ impl BinanceLiveAdapter {
                         }
                     }
                     Err(error) => {
+                        private_state.record_connection_failure(
+                            now_ms(),
+                            unhealthy_after_failures,
+                            error.to_string(),
+                        );
                         warn!(?error, "binance private websocket connect failed");
                     }
                 }
@@ -259,7 +309,10 @@ impl BinanceLiveAdapter {
                 keepalive.abort();
                 let _ = close_binance_listen_key(&client, &base_url, api_key.as_str(), &listen_key)
                     .await;
-                sleep(Duration::from_secs(1)).await;
+                sleep(Duration::from_millis(
+                    reconnect_backoff.on_failure_with_jitter(),
+                ))
+                .await;
             }
         });
         self.private_ws.push_worker(task);
@@ -577,7 +630,7 @@ impl VenueAdapter for BinanceLiveAdapter {
 
     fn cached_position(&self, symbol: &str) -> Option<PositionSnapshot> {
         self.private_ws
-            .position(symbol)
+            .position_if_fresh(symbol, self.runtime.private_position_max_age_ms, now_ms())
             .map(|position| PositionSnapshot {
                 venue: Venue::Binance,
                 symbol: symbol.to_string(),
@@ -587,7 +640,11 @@ impl VenueAdapter for BinanceLiveAdapter {
     }
 
     async fn fetch_position(&self, symbol: &str) -> Result<PositionSnapshot> {
-        if let Some(position) = self.private_ws.position(symbol) {
+        if let Some(position) = self.private_ws.position_if_fresh(
+            symbol,
+            self.runtime.private_position_max_age_ms,
+            now_ms(),
+        ) {
             return Ok(PositionSnapshot {
                 venue: Venue::Binance,
                 symbol: symbol.to_string(),

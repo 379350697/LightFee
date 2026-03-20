@@ -16,11 +16,12 @@ use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tracing::{debug, warn};
 
 use crate::{
-    config::VenueConfig,
+    config::{RuntimeConfig, VenueConfig},
     models::{
         AssetTransferStatus, OrderFill, OrderRequest, PositionSnapshot, Side, SymbolMarketSnapshot,
         Venue, VenueMarketSnapshot,
     },
+    resilience::FailureBackoff,
     venue::VenueAdapter,
 };
 
@@ -33,6 +34,7 @@ use super::{
 
 pub struct BybitLiveAdapter {
     config: VenueConfig,
+    runtime: RuntimeConfig,
     client: Client,
     base_url: String,
     metadata: Mutex<HashMap<String, BybitInstrumentMeta>>,
@@ -42,7 +44,7 @@ pub struct BybitLiveAdapter {
 }
 
 impl BybitLiveAdapter {
-    pub fn new(config: &VenueConfig, timeout_ms: u64, symbols: &[String]) -> Result<Self> {
+    pub fn new(config: &VenueConfig, runtime: &RuntimeConfig, symbols: &[String]) -> Result<Self> {
         if config.venue != Venue::Bybit {
             return Err(anyhow!("bybit live adapter requires bybit config"));
         }
@@ -50,7 +52,8 @@ impl BybitLiveAdapter {
         let market_ws = WsMarketState::new();
         let adapter = Self {
             config: config.clone(),
-            client: build_http_client(timeout_ms)?,
+            runtime: runtime.clone(),
+            client: build_http_client(runtime.chillybot_timeout_ms)?,
             base_url: config
                 .live
                 .base_url
@@ -90,6 +93,9 @@ impl BybitLiveAdapter {
             bybit_public_ws_url(&self.base_url).to_string(),
             vec![subscribe],
             state,
+            self.runtime.ws_reconnect_initial_ms,
+            self.runtime.ws_reconnect_max_ms,
+            self.runtime.ws_unhealthy_after_failures,
             move |cache, raw| {
                 let payload = parse_text_message(raw)?;
                 let topic = payload
@@ -169,15 +175,22 @@ impl BybitLiveAdapter {
         }
 
         let private_state = self.private_ws.clone();
+        let reconnect_initial_ms = self.runtime.ws_reconnect_initial_ms;
+        let reconnect_max_ms = self.runtime.ws_reconnect_max_ms;
+        let unhealthy_after_failures = self.runtime.ws_unhealthy_after_failures;
         let symbol_map = symbols
             .iter()
             .map(|symbol| (venue_symbol(&self.config, symbol), symbol.clone()))
             .collect::<HashMap<_, _>>();
         let url = bybit_private_ws_url(&self.base_url).to_string();
         let task = tokio::spawn(async move {
+            let mut reconnect_backoff =
+                FailureBackoff::new(reconnect_initial_ms, reconnect_max_ms, Venue::Bybit as u64);
             loop {
                 match connect_async(url.as_str()).await {
                     Ok((mut socket, _)) => {
+                        reconnect_backoff.on_success();
+                        private_state.record_connection_success(now_ms());
                         let expires = now_ms() + 10_000;
                         let signature = match hmac_sha256_hex(
                             api_secret.as_str(),
@@ -185,8 +198,16 @@ impl BybitLiveAdapter {
                         ) {
                             Ok(signature) => signature,
                             Err(error) => {
+                                private_state.record_connection_failure(
+                                    now_ms(),
+                                    unhealthy_after_failures,
+                                    error.to_string(),
+                                );
                                 warn!(?error, "bybit private websocket auth sign failed");
-                                sleep(Duration::from_secs(5)).await;
+                                sleep(Duration::from_millis(
+                                    reconnect_backoff.on_failure_with_jitter(),
+                                ))
+                                .await;
                                 continue;
                             }
                         };
@@ -196,8 +217,16 @@ impl BybitLiveAdapter {
                         })
                         .to_string();
                         if let Err(error) = socket.send(Message::Text(auth.into())).await {
+                            private_state.record_connection_failure(
+                                now_ms(),
+                                unhealthy_after_failures,
+                                error.to_string(),
+                            );
                             warn!(?error, "bybit private websocket auth send failed");
-                            sleep(Duration::from_secs(1)).await;
+                            sleep(Duration::from_millis(
+                                reconnect_backoff.on_failure_with_jitter(),
+                            ))
+                            .await;
                             continue;
                         }
 
@@ -207,11 +236,15 @@ impl BybitLiveAdapter {
                         loop {
                             tokio::select! {
                                 _ = ping_interval.tick() => {
-                                    if socket
+                                    if let Err(error) = socket
                                         .send(Message::Text(serde_json::json!({ "op": "ping" }).to_string().into()))
                                         .await
-                                        .is_err()
                                     {
+                                        private_state.record_connection_failure(
+                                            now_ms(),
+                                            unhealthy_after_failures,
+                                            error.to_string(),
+                                        );
                                         break;
                                     }
                                 }
@@ -226,6 +259,11 @@ impl BybitLiveAdapter {
                                             ) {
                                                 Ok(Some(subscribe_payload)) => {
                                                     if let Err(error) = socket.send(Message::Text(subscribe_payload.into())).await {
+                                                        private_state.record_connection_failure(
+                                                            now_ms(),
+                                                            unhealthy_after_failures,
+                                                            error.to_string(),
+                                                        );
                                                         warn!(?error, "bybit private websocket subscribe send failed");
                                                         break;
                                                     }
@@ -237,16 +275,31 @@ impl BybitLiveAdapter {
                                             }
                                         }
                                         Some(Ok(Message::Ping(payload))) => {
-                                            if socket.send(Message::Pong(payload)).await.is_err() {
+                                            if let Err(error) = socket.send(Message::Pong(payload)).await {
+                                                private_state.record_connection_failure(
+                                                    now_ms(),
+                                                    unhealthy_after_failures,
+                                                    error.to_string(),
+                                                );
                                                 break;
                                             }
                                         }
                                         Some(Ok(Message::Close(frame))) => {
+                                            private_state.record_connection_failure(
+                                                now_ms(),
+                                                unhealthy_after_failures,
+                                                format!("closed:{frame:?}"),
+                                            );
                                             debug!(?frame, "bybit private websocket closed");
                                             break;
                                         }
                                         Some(Ok(_)) => {}
                                         Some(Err(error)) => {
+                                            private_state.record_connection_failure(
+                                                now_ms(),
+                                                unhealthy_after_failures,
+                                                error.to_string(),
+                                            );
                                             warn!(?error, "bybit private websocket receive failed");
                                             break;
                                         }
@@ -257,11 +310,19 @@ impl BybitLiveAdapter {
                         }
                     }
                     Err(error) => {
+                        private_state.record_connection_failure(
+                            now_ms(),
+                            unhealthy_after_failures,
+                            error.to_string(),
+                        );
                         warn!(?error, "bybit private websocket connect failed");
                     }
                 }
 
-                sleep(Duration::from_secs(1)).await;
+                sleep(Duration::from_millis(
+                    reconnect_backoff.on_failure_with_jitter(),
+                ))
+                .await;
             }
         });
         self.private_ws.push_worker(task);
@@ -523,7 +584,7 @@ impl VenueAdapter for BybitLiveAdapter {
 
     fn cached_position(&self, symbol: &str) -> Option<PositionSnapshot> {
         self.private_ws
-            .position(symbol)
+            .position_if_fresh(symbol, self.runtime.private_position_max_age_ms, now_ms())
             .map(|position| PositionSnapshot {
                 venue: Venue::Bybit,
                 symbol: symbol.to_string(),
@@ -533,7 +594,11 @@ impl VenueAdapter for BybitLiveAdapter {
     }
 
     async fn fetch_position(&self, symbol: &str) -> Result<PositionSnapshot> {
-        if let Some(position) = self.private_ws.position(symbol) {
+        if let Some(position) = self.private_ws.position_if_fresh(
+            symbol,
+            self.runtime.private_position_max_age_ms,
+            now_ms(),
+        ) {
             return Ok(PositionSnapshot {
                 venue: Venue::Bybit,
                 symbol: symbol.to_string(),
@@ -546,12 +611,37 @@ impl VenueAdapter for BybitLiveAdapter {
             ("category", "linear".to_string()),
             ("symbol", venue_symbol(&self.config, symbol)),
         ]);
-        let response = self
-            .signed_request(reqwest::Method::GET, "/v5/position/list", Some(query), None)
-            .await?
-            .json::<BybitApiResponse<BybitPositionList>>()
-            .await
-            .context("failed to decode bybit positions")?;
+        let mut last_error = None;
+        let mut response = None;
+        for attempt in 0..3 {
+            match self
+                .signed_request(
+                    reqwest::Method::GET,
+                    "/v5/position/list",
+                    Some(query.clone()),
+                    None,
+                )
+                .await
+            {
+                Ok(result) => {
+                    response = Some(
+                        result
+                            .json::<BybitApiResponse<BybitPositionList>>()
+                            .await
+                            .context("failed to decode bybit positions")?,
+                    );
+                    break;
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                    if attempt < 2 {
+                        sleep(Duration::from_millis(150 * (attempt + 1) as u64)).await;
+                    }
+                }
+            }
+        }
+        let response = response
+            .ok_or_else(|| last_error.unwrap_or_else(|| anyhow!("bybit position query failed")))?;
         if response.ret_code != 0 {
             return Err(anyhow!("bybit position query failed: {}", response.ret_msg));
         }

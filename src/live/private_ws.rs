@@ -7,7 +7,7 @@ use std::{
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, Instant};
 
-use crate::models::OrderFill;
+use crate::{models::OrderFill, resilience::ConnectionHealth};
 
 const DEFAULT_MAX_ORDER_ENTRIES: usize = 512;
 const PRIVATE_ORDER_POLL_INTERVAL_MS: u64 = 5;
@@ -41,6 +41,7 @@ struct PrivateOrderCache {
 pub(crate) struct WsPrivateState {
     orders: RwLock<PrivateOrderCache>,
     positions: RwLock<HashMap<String, PrivatePositionUpdate>>,
+    health: RwLock<ConnectionHealth>,
     workers: Mutex<Vec<JoinHandle<()>>>,
     max_order_entries: usize,
 }
@@ -50,6 +51,7 @@ impl Default for WsPrivateState {
         Self {
             orders: RwLock::new(PrivateOrderCache::default()),
             positions: RwLock::new(HashMap::new()),
+            health: RwLock::new(ConnectionHealth::default()),
             workers: Mutex::new(Vec::new()),
             max_order_entries: DEFAULT_MAX_ORDER_ENTRIES,
         }
@@ -167,6 +169,40 @@ impl WsPrivateState {
         self.positions.read().expect("lock").get(symbol).cloned()
     }
 
+    pub(crate) fn position_if_fresh(
+        &self,
+        symbol: &str,
+        max_age_ms: i64,
+        wall_clock_now_ms: i64,
+    ) -> Option<PrivatePositionUpdate> {
+        let position = self.position(symbol)?;
+        if max_age_ms <= 0 {
+            return Some(position);
+        }
+        let age_ms = wall_clock_now_ms.saturating_sub(position.updated_at_ms);
+        if age_ms > max_age_ms {
+            None
+        } else {
+            Some(position)
+        }
+    }
+
+    pub(crate) fn record_connection_success(&self, now_ms: i64) {
+        self.health.write().expect("lock").record_success(now_ms);
+    }
+
+    pub(crate) fn record_connection_failure(
+        &self,
+        now_ms: i64,
+        unhealthy_after_failures: usize,
+        error: String,
+    ) {
+        self.health
+            .write()
+            .expect("lock")
+            .record_failure(now_ms, unhealthy_after_failures, error);
+    }
+
     pub(crate) fn push_worker(&self, worker: JoinHandle<()>) {
         self.workers.lock().expect("lock").push(worker);
     }
@@ -262,7 +298,8 @@ mod tests {
     use tokio::time::{sleep, Instant};
 
     use super::{
-        enrich_fill_from_private, lookup_or_wait_private_order, PrivateOrderUpdate, WsPrivateState,
+        enrich_fill_from_private, lookup_or_wait_private_order, PrivateOrderUpdate,
+        PrivatePositionUpdate, WsPrivateState,
     };
 
     #[test]
@@ -324,6 +361,25 @@ mod tests {
         assert_eq!(position.symbol, "ETHUSDT");
         assert_eq!(position.size, 0.02);
         assert_eq!(position.updated_at_ms, 20);
+    }
+
+    #[test]
+    fn private_state_rejects_stale_positions_when_freshness_ttl_expires() {
+        let state = WsPrivateState::new();
+        state.update_position("ETHUSDT", 0.75, 1_000);
+
+        let fresh = state.position_if_fresh("ETHUSDT", 5_000, 5_999);
+        let stale = state.position_if_fresh("ETHUSDT", 5_000, 6_001);
+
+        assert_eq!(
+            fresh,
+            Some(PrivatePositionUpdate {
+                symbol: "ETHUSDT".to_string(),
+                size: 0.75,
+                updated_at_ms: 1_000,
+            })
+        );
+        assert!(stale.is_none());
     }
 
     #[test]

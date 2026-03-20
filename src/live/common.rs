@@ -17,8 +17,14 @@ use crate::{
 type HmacSha256 = Hmac<Sha256>;
 
 pub fn build_http_client(timeout_ms: u64) -> Result<Client> {
+    let timeout = Duration::from_millis(timeout_ms.max(250));
+    let connect_timeout = Duration::from_millis((timeout_ms / 2).clamp(250, 3_000));
     Client::builder()
-        .timeout(Duration::from_millis(timeout_ms))
+        .timeout(timeout)
+        .connect_timeout(connect_timeout)
+        .tcp_keepalive(Duration::from_secs(30))
+        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_max_idle_per_host(4)
         .build()
         .context("failed to build live http client")
 }

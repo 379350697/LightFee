@@ -86,10 +86,24 @@ pub struct RuntimeConfig {
     pub poll_interval_ms: u64,
     #[serde(default = "default_market_age_ms")]
     pub max_market_age_ms: i64,
+    #[serde(default = "default_private_position_max_age_ms")]
+    pub private_position_max_age_ms: i64,
     #[serde(default = "default_order_quote_age_ms")]
     pub max_order_quote_age_ms: i64,
     #[serde(default = "default_uncertain_order_cooldown_ms")]
     pub uncertain_order_cooldown_ms: i64,
+    #[serde(default = "default_tick_failure_backoff_initial_ms")]
+    pub tick_failure_backoff_initial_ms: u64,
+    #[serde(default = "default_tick_failure_backoff_max_ms")]
+    pub tick_failure_backoff_max_ms: u64,
+    #[serde(default = "default_ws_reconnect_initial_ms")]
+    pub ws_reconnect_initial_ms: u64,
+    #[serde(default = "default_ws_reconnect_max_ms")]
+    pub ws_reconnect_max_ms: u64,
+    #[serde(default = "default_ws_unhealthy_after_failures")]
+    pub ws_unhealthy_after_failures: usize,
+    #[serde(default = "default_journal_async_queue_capacity")]
+    pub journal_async_queue_capacity: usize,
     #[serde(default = "default_true")]
     pub auto_trade_enabled: bool,
 }
@@ -103,8 +117,15 @@ impl Default for RuntimeConfig {
             chillybot_timeout_ms: default_chillybot_timeout_ms(),
             poll_interval_ms: default_poll_interval_ms(),
             max_market_age_ms: default_market_age_ms(),
+            private_position_max_age_ms: default_private_position_max_age_ms(),
             max_order_quote_age_ms: default_order_quote_age_ms(),
             uncertain_order_cooldown_ms: default_uncertain_order_cooldown_ms(),
+            tick_failure_backoff_initial_ms: default_tick_failure_backoff_initial_ms(),
+            tick_failure_backoff_max_ms: default_tick_failure_backoff_max_ms(),
+            ws_reconnect_initial_ms: default_ws_reconnect_initial_ms(),
+            ws_reconnect_max_ms: default_ws_reconnect_max_ms(),
+            ws_unhealthy_after_failures: default_ws_unhealthy_after_failures(),
+            journal_async_queue_capacity: default_journal_async_queue_capacity(),
             auto_trade_enabled: default_true(),
         }
     }
@@ -339,12 +360,40 @@ fn default_market_age_ms() -> i64 {
     5_000
 }
 
+fn default_private_position_max_age_ms() -> i64 {
+    15_000
+}
+
 fn default_order_quote_age_ms() -> i64 {
     3_000
 }
 
 fn default_uncertain_order_cooldown_ms() -> i64 {
     30_000
+}
+
+fn default_tick_failure_backoff_initial_ms() -> u64 {
+    1_000
+}
+
+fn default_tick_failure_backoff_max_ms() -> u64 {
+    30_000
+}
+
+fn default_ws_reconnect_initial_ms() -> u64 {
+    1_000
+}
+
+fn default_ws_reconnect_max_ms() -> u64 {
+    30_000
+}
+
+fn default_ws_unhealthy_after_failures() -> usize {
+    5
+}
+
+fn default_journal_async_queue_capacity() -> usize {
+    4_096
 }
 
 fn default_entry_window_secs() -> i64 {

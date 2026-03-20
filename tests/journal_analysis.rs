@@ -186,11 +186,46 @@ fn journal_analysis_reports_latency_failure_and_recovery_breakdown() {
                 "reason": "uncertain_order_status",
             }),
         ),
+        record(
+            14,
+            "run-a",
+            1_013,
+            "scan.no_entry_diagnostics",
+            json!({
+                "reason": "no_tradeable_candidates",
+                "blocked_reason_counts": {
+                    "stagger_gap_too_wide": 2,
+                    "expected_edge_below_floor": 1
+                },
+                "advisory_counts": {
+                    "transfer_status_unknown:hyperliquid": 1
+                },
+                "candidates": [
+                    {
+                        "pair_id": "ethusdt:hyperliquid->okx",
+                        "selection_blocker": "candidate_blocked",
+                        "checklist": [
+                            { "key": "market_fresh_long", "ok": true, "detail": "ok" },
+                            { "key": "stagger_gap_ok", "ok": false, "detail": "too_wide" },
+                            { "key": "expected_edge_ok", "ok": false, "detail": "below_floor" }
+                        ]
+                    },
+                    {
+                        "pair_id": "btcusdt:hyperliquid->okx",
+                        "selection_blocker": "candidate_blocked",
+                        "checklist": [
+                            { "key": "stagger_gap_ok", "ok": false, "detail": "too_wide" },
+                            { "key": "active_symbol_clear", "ok": true, "detail": "clear" }
+                        ]
+                    }
+                ]
+            }),
+        ),
     ];
 
     let report = analyze_journal_records(&records);
 
-    assert_eq!(report.total_records, 14);
+    assert_eq!(report.total_records, 15);
     assert_eq!(report.run_count, 1);
     assert_eq!(
         report
@@ -300,6 +335,51 @@ fn journal_analysis_reports_latency_failure_and_recovery_breakdown() {
             .unwrap_or_default(),
         1
     );
+    assert_eq!(
+        report
+            .optimization_stats
+            .no_entry_reason_counts
+            .get("no_tradeable_candidates")
+            .copied()
+            .unwrap_or_default(),
+        1
+    );
+    assert_eq!(
+        report
+            .optimization_stats
+            .no_entry_blocked_reason_counts
+            .get("stagger_gap_too_wide")
+            .copied()
+            .unwrap_or_default(),
+        2
+    );
+    assert_eq!(
+        report
+            .optimization_stats
+            .no_entry_advisory_counts
+            .get("transfer_status_unknown:hyperliquid")
+            .copied()
+            .unwrap_or_default(),
+        1
+    );
+    assert_eq!(
+        report
+            .optimization_stats
+            .no_entry_checklist_fail_counts
+            .get("stagger_gap_ok")
+            .copied()
+            .unwrap_or_default(),
+        2
+    );
+    assert_eq!(
+        report
+            .optimization_stats
+            .no_entry_selection_blocker_counts
+            .get("candidate_blocked")
+            .copied()
+            .unwrap_or_default(),
+        2
+    );
     let replay = report
         .trade_replays
         .iter()
@@ -322,6 +402,14 @@ fn journal_analysis_reports_latency_failure_and_recovery_breakdown() {
         .recommendations
         .iter()
         .any(|item| item.category == "timeouts"));
+    assert!(report
+        .recommendations
+        .iter()
+        .any(|item| item.category == "opportunity_capture"));
+    assert!(report
+        .recommendations
+        .iter()
+        .any(|item| item.category == "opportunity_checklist"));
 }
 
 #[test]
@@ -345,6 +433,7 @@ fn journal_runtime_metrics_snapshot_tracks_lightweight_write_path_counters() {
             async_appends: 1,
             critical_appends: 1,
             sync_fallback_appends: 0,
+            dropped_async_appends: 0,
             flush_requests: 1,
             writer_flushes: 2,
             writer_failures: 0,

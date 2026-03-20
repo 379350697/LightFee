@@ -205,6 +205,59 @@ struct EntryLegRisk {
     depth_score: f64,
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct OpportunityChecklistItem {
+    key: &'static str,
+    ok: bool,
+    detail: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct OpportunityCandidateMetrics {
+    quantity: f64,
+    entry_notional_quote: f64,
+    funding_edge_bps: f64,
+    expected_edge_bps: f64,
+    worst_case_edge_bps: f64,
+    ranking_edge_bps: f64,
+    entry_cross_bps: f64,
+    fee_bps: f64,
+    entry_slippage_bps: f64,
+    first_stage_expected_edge_bps: f64,
+    second_stage_incremental_funding_edge_bps: f64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct OpportunityCandidateChecklist {
+    pair_id: String,
+    symbol: String,
+    long_venue: Venue,
+    short_venue: Venue,
+    tradeable: bool,
+    selected_for_entry: bool,
+    selection_score: f64,
+    selection_blocker: Option<String>,
+    long_leg_risk: EntryLegRisk,
+    short_leg_risk: EntryLegRisk,
+    metrics: OpportunityCandidateMetrics,
+    blocked_reasons: Vec<String>,
+    advisories: Vec<String>,
+    checklist: Vec<OpportunityChecklistItem>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct NoEntryDiagnostics {
+    reason: String,
+    candidate_count: usize,
+    tradeable_count: usize,
+    selected_candidate_count: usize,
+    active_position_count: usize,
+    remaining_slots: usize,
+    blocked_reason_counts: BTreeMap<String, usize>,
+    advisory_counts: BTreeMap<String, usize>,
+    candidates: Vec<OpportunityCandidateChecklist>,
+}
+
 const FLAT_RECOVERY_PROBE_INTERVAL_MS: i64 = 30_000;
 const ORDER_HEALTH_WINDOW_SIZE: usize = 20;
 
@@ -238,7 +291,10 @@ impl Engine {
         let store = FileStateStore::new(&config.persistence.snapshot_path);
         let loaded_state = store.load::<EngineState>()?;
         let mut state = loaded_state.clone().unwrap_or_default();
-        let journal = JsonlJournal::new(&config.persistence.event_log_path);
+        let journal = JsonlJournal::with_capacity(
+            &config.persistence.event_log_path,
+            config.runtime.journal_async_queue_capacity,
+        );
         normalize_engine_state_positions(&mut state);
         if state.open_positions.is_empty() {
             state.open_positions = recover_open_positions_from_journal(&journal)?;
@@ -322,7 +378,27 @@ impl Engine {
 
     pub async fn tick(&mut self) -> Result<()> {
         self.state.cycle += 1;
-        let market = self.fetch_market_view().await?;
+        let market = match self.fetch_market_view().await {
+            Ok(market) => market,
+            Err(error) => {
+                if !self.active_positions().is_empty() {
+                    self.state.mode = EngineMode::FailClosed;
+                    self.state.last_error = Some(format!(
+                        "market fetch failed with open positions: {error:#}"
+                    ));
+                    self.log_critical_event(
+                        "execution.guard_failed",
+                        &json!({
+                            "reason": "market_fetch_failed_with_open_positions",
+                            "error": error.to_string(),
+                            "open_position_count": self.active_position_count(),
+                        }),
+                    )?;
+                    self.persist_state()?;
+                }
+                return Err(error);
+            }
+        };
         let now_ms = market.now_ms();
         if now_ms > 0 {
             self.state.last_market_ts_ms = Some(now_ms);
@@ -372,11 +448,10 @@ impl Engine {
         }
 
         let should_scan = self.should_scan_entries(&market);
-        let mut candidates = Vec::new();
-        if should_scan {
+        let selected_candidates = if should_scan {
             let hints = self.fetch_hints().await;
             let transfer_statuses = self.fetch_transfer_status_view().await;
-            candidates = discover_candidates(
+            let mut candidates = discover_candidates(
                 &self.config,
                 &market,
                 hints.as_deref(),
@@ -398,12 +473,27 @@ impl Engine {
                 "scan.completed",
                 self.state.last_scan.as_ref().unwrap(),
             );
+            let selected_candidates = if self.state.mode == EngineMode::Running {
+                let selected = if self.config.runtime.auto_trade_enabled {
+                    self.select_entry_candidates(&market, &candidates)
+                } else {
+                    Vec::new()
+                };
+                if selected.is_empty() {
+                    self.log_no_entry_diagnostics(&market, &candidates, &selected);
+                }
+                selected
+            } else {
+                Vec::new()
+            };
+            selected_candidates
         } else {
             self.state.last_scan = None;
-        }
+            Vec::new()
+        };
 
         if self.state.mode == EngineMode::Running && self.config.runtime.auto_trade_enabled {
-            for candidate in self.select_entry_candidates(&market, &candidates) {
+            for candidate in selected_candidates {
                 if self.active_position_count()
                     >= self.config.strategy.max_concurrent_positions.max(1)
                 {
@@ -485,6 +575,9 @@ impl Engine {
                     );
                 }
             }
+        }
+        if snapshots.is_empty() {
+            return Err(anyhow!("market fetch failed on all venues"));
         }
         Ok(MarketView::from_snapshots(snapshots))
     }
@@ -652,6 +745,294 @@ impl Engine {
             }
         }
         selected
+    }
+
+    fn log_no_entry_diagnostics(
+        &self,
+        market: &MarketView,
+        candidates: &[CandidateOpportunity],
+        selected_candidates: &[CandidateOpportunity],
+    ) {
+        let capacity = self.config.strategy.max_concurrent_positions.max(1);
+        let remaining_slots = capacity.saturating_sub(self.active_position_count());
+        let tradeable_count = candidates
+            .iter()
+            .filter(|candidate| candidate.is_tradeable())
+            .count();
+        let selected_ids = selected_candidates
+            .iter()
+            .map(|candidate| candidate.pair_id.as_str())
+            .collect::<Vec<_>>();
+        let blocked_reason_counts = count_strings(
+            candidates
+                .iter()
+                .flat_map(|candidate| candidate.blocked_reasons.iter().cloned()),
+        );
+        let advisory_counts = count_strings(
+            candidates
+                .iter()
+                .flat_map(|candidate| candidate.advisories.iter().cloned()),
+        );
+        let diagnostics = NoEntryDiagnostics {
+            reason: self.no_entry_reason(candidates, selected_candidates, remaining_slots),
+            candidate_count: candidates.len(),
+            tradeable_count,
+            selected_candidate_count: selected_candidates.len(),
+            active_position_count: self.active_position_count(),
+            remaining_slots,
+            blocked_reason_counts,
+            advisory_counts,
+            candidates: candidates
+                .iter()
+                .map(|candidate| {
+                    self.build_candidate_checklist(
+                        market,
+                        candidate,
+                        remaining_slots,
+                        &selected_ids,
+                    )
+                })
+                .collect(),
+        };
+        self.log_event("scan.no_entry_diagnostics", &diagnostics);
+    }
+
+    fn no_entry_reason(
+        &self,
+        candidates: &[CandidateOpportunity],
+        selected_candidates: &[CandidateOpportunity],
+        remaining_slots: usize,
+    ) -> String {
+        if !self.config.runtime.auto_trade_enabled {
+            return "auto_trade_disabled".to_string();
+        }
+        if remaining_slots == 0 {
+            return "no_remaining_slots".to_string();
+        }
+        if candidates.is_empty() {
+            return "no_candidates".to_string();
+        }
+        if !selected_candidates.is_empty() {
+            return "candidates_selected".to_string();
+        }
+        let tradeable_count = candidates
+            .iter()
+            .filter(|candidate| candidate.is_tradeable())
+            .count();
+        if tradeable_count == 0 {
+            return "no_tradeable_candidates".to_string();
+        }
+        if candidates
+            .iter()
+            .any(|candidate| candidate.is_tradeable() && self.has_active_symbol(&candidate.symbol))
+        {
+            return "tradeable_candidates_conflict_with_open_symbols".to_string();
+        }
+        "tradeable_candidates_not_selected".to_string()
+    }
+
+    fn build_candidate_checklist(
+        &self,
+        market: &MarketView,
+        candidate: &CandidateOpportunity,
+        remaining_slots: usize,
+        selected_ids: &[&str],
+    ) -> OpportunityCandidateChecklist {
+        let remaining_ms = candidate
+            .first_funding_timestamp_ms
+            .saturating_sub(market.now_ms());
+        let market_fresh_long =
+            market.is_fresh(candidate.long_venue, self.config.runtime.max_market_age_ms);
+        let market_fresh_short =
+            market.is_fresh(candidate.short_venue, self.config.runtime.max_market_age_ms);
+        let funding_not_passed = remaining_ms > 0;
+        let inside_entry_window =
+            funding_not_passed && is_within_funding_scan_window_ms(&self.config, remaining_ms);
+        let stagger_gap_limit_ms = self
+            .config
+            .strategy
+            .max_stagger_gap_minutes
+            .saturating_mul(60_000);
+        let stagger_gap_ok = candidate.opportunity_type != FundingOpportunityType::Staggered
+            || self.config.strategy.max_stagger_gap_minutes <= 0
+            || candidate.stagger_gap_ms <= stagger_gap_limit_ms;
+        let order_size_positive = candidate.quantity > 0.0;
+        let funding_edge_ok =
+            candidate.funding_edge_bps >= self.config.strategy.min_funding_edge_bps;
+        let expected_edge_ok =
+            candidate.expected_edge_bps >= self.config.strategy.min_expected_edge_bps;
+        let worst_case_edge_ok =
+            candidate.worst_case_edge_bps >= self.config.strategy.min_worst_case_edge_bps;
+        let hyperliquid_gate_reason = if candidate.long_venue == Venue::Hyperliquid
+            || candidate.short_venue == Venue::Hyperliquid
+        {
+            self.recent_submit_ack_ms
+                .get(&Venue::Hyperliquid)
+                .and_then(|samples| hyperliquid_entry_gate_reason(&self.config.strategy, samples))
+        } else {
+            None
+        };
+        let long_cooldown_reason = self.venue_entry_cooldown_reason(candidate.long_venue);
+        let short_cooldown_reason = self.venue_entry_cooldown_reason(candidate.short_venue);
+        let cached_balance_reason = self.cached_entry_balance_reason(candidate);
+        let active_symbol_clear = !self.has_active_symbol(&candidate.symbol);
+        let slot_available = remaining_slots > 0;
+        let selected_for_entry = selected_ids
+            .iter()
+            .any(|pair_id| *pair_id == candidate.pair_id);
+        let selection_blocker = if selected_for_entry {
+            None
+        } else if !self.config.runtime.auto_trade_enabled {
+            Some("auto_trade_disabled".to_string())
+        } else if remaining_slots == 0 {
+            Some("no_remaining_slots".to_string())
+        } else if !candidate.is_tradeable() {
+            Some("candidate_blocked".to_string())
+        } else if !active_symbol_clear {
+            Some("symbol_already_active".to_string())
+        } else {
+            Some("not_selected_by_ranking".to_string())
+        };
+
+        let long_leg_risk = self.build_entry_leg_risk(
+            market,
+            HedgeLeg::Long,
+            candidate.long_venue,
+            &candidate.symbol,
+            Side::Buy,
+            candidate.quantity,
+        );
+        let short_leg_risk = self.build_entry_leg_risk(
+            market,
+            HedgeLeg::Short,
+            candidate.short_venue,
+            &candidate.symbol,
+            Side::Sell,
+            candidate.quantity,
+        );
+        let selection_score = self.runtime_candidate_selection_score(market, candidate);
+
+        OpportunityCandidateChecklist {
+            pair_id: candidate.pair_id.clone(),
+            symbol: candidate.symbol.clone(),
+            long_venue: candidate.long_venue,
+            short_venue: candidate.short_venue,
+            tradeable: candidate.is_tradeable(),
+            selected_for_entry,
+            selection_score,
+            selection_blocker,
+            long_leg_risk,
+            short_leg_risk,
+            metrics: OpportunityCandidateMetrics {
+                quantity: candidate.quantity,
+                entry_notional_quote: candidate.entry_notional_quote,
+                funding_edge_bps: candidate.funding_edge_bps,
+                expected_edge_bps: candidate.expected_edge_bps,
+                worst_case_edge_bps: candidate.worst_case_edge_bps,
+                ranking_edge_bps: candidate.ranking_edge_bps,
+                entry_cross_bps: candidate.entry_cross_bps,
+                fee_bps: candidate.fee_bps,
+                entry_slippage_bps: candidate.entry_slippage_bps,
+                first_stage_expected_edge_bps: candidate.first_stage_expected_edge_bps,
+                second_stage_incremental_funding_edge_bps: candidate
+                    .second_stage_incremental_funding_edge_bps,
+            },
+            blocked_reasons: candidate.blocked_reasons.clone(),
+            advisories: candidate.advisories.clone(),
+            checklist: vec![
+                checklist_item(
+                    "market_fresh_long",
+                    market_fresh_long,
+                    format!("{} age_ok={market_fresh_long}", candidate.long_venue),
+                ),
+                checklist_item(
+                    "market_fresh_short",
+                    market_fresh_short,
+                    format!("{} age_ok={market_fresh_short}", candidate.short_venue),
+                ),
+                checklist_item(
+                    "funding_not_passed",
+                    funding_not_passed,
+                    format!("remaining_ms={remaining_ms}"),
+                ),
+                checklist_item(
+                    "inside_entry_window",
+                    inside_entry_window,
+                    format!(
+                        "remaining_ms={remaining_ms} window={}..{}min",
+                        self.config.strategy.min_scan_minutes_before_funding,
+                        self.config.strategy.max_scan_minutes_before_funding
+                    ),
+                ),
+                checklist_item(
+                    "stagger_gap_ok",
+                    stagger_gap_ok,
+                    format!(
+                        "gap_ms={} max_gap_ms={stagger_gap_limit_ms}",
+                        candidate.stagger_gap_ms
+                    ),
+                ),
+                checklist_item(
+                    "order_size_positive",
+                    order_size_positive,
+                    format!("quantity={:.8}", candidate.quantity),
+                ),
+                checklist_item(
+                    "funding_edge_ok",
+                    funding_edge_ok,
+                    format!(
+                        "{:.4}>={:.4}",
+                        candidate.funding_edge_bps, self.config.strategy.min_funding_edge_bps
+                    ),
+                ),
+                checklist_item(
+                    "expected_edge_ok",
+                    expected_edge_ok,
+                    format!(
+                        "{:.4}>={:.4}",
+                        candidate.expected_edge_bps, self.config.strategy.min_expected_edge_bps
+                    ),
+                ),
+                checklist_item(
+                    "worst_case_edge_ok",
+                    worst_case_edge_ok,
+                    format!(
+                        "{:.4}>={:.4}",
+                        candidate.worst_case_edge_bps, self.config.strategy.min_worst_case_edge_bps
+                    ),
+                ),
+                checklist_item(
+                    "hyperliquid_latency_gate_ok",
+                    hyperliquid_gate_reason.is_none(),
+                    hyperliquid_gate_reason.unwrap_or_else(|| "clear".to_string()),
+                ),
+                checklist_item(
+                    "long_venue_cooldown_clear",
+                    long_cooldown_reason.is_none(),
+                    long_cooldown_reason.unwrap_or_else(|| "clear".to_string()),
+                ),
+                checklist_item(
+                    "short_venue_cooldown_clear",
+                    short_cooldown_reason.is_none(),
+                    short_cooldown_reason.unwrap_or_else(|| "clear".to_string()),
+                ),
+                checklist_item(
+                    "cached_entry_balance_clear",
+                    cached_balance_reason.is_none(),
+                    cached_balance_reason.unwrap_or_else(|| "clear".to_string()),
+                ),
+                checklist_item(
+                    "active_symbol_clear",
+                    active_symbol_clear,
+                    format!("active_symbol_conflict={}", !active_symbol_clear),
+                ),
+                checklist_item(
+                    "slot_available",
+                    slot_available,
+                    format!("remaining_slots={remaining_slots}"),
+                ),
+            ],
+        }
     }
 
     fn runtime_candidate_selection_score(
@@ -2156,6 +2537,18 @@ fn recover_open_positions_from_journal(journal: &JsonlJournal) -> Result<Vec<Ope
         }
     }
     Ok(open_positions.into_values().collect())
+}
+
+fn count_strings(items: impl IntoIterator<Item = String>) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for item in items {
+        *counts.entry(item).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn checklist_item(key: &'static str, ok: bool, detail: String) -> OpportunityChecklistItem {
+    OpportunityChecklistItem { key, ok, detail }
 }
 
 #[cfg(test)]

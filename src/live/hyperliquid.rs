@@ -38,7 +38,7 @@ use tokio_tungstenite::{
 };
 
 use crate::{
-    config::VenueConfig,
+    config::{RuntimeConfig, VenueConfig},
     models::{
         OrderExecutionTiming, OrderFill, OrderRequest, PositionSnapshot, Side,
         SymbolMarketSnapshot, Venue, VenueMarketSnapshot,
@@ -53,6 +53,7 @@ use super::{
 
 pub struct HyperliquidLiveAdapter {
     config: VenueConfig,
+    runtime: RuntimeConfig,
     info_client: InfoClient,
     exchange_client: ExchangeClient,
     account_address: H160,
@@ -63,7 +64,11 @@ pub struct HyperliquidLiveAdapter {
 }
 
 impl HyperliquidLiveAdapter {
-    pub async fn new(config: &VenueConfig, _timeout_ms: u64, symbols: &[String]) -> Result<Self> {
+    pub async fn new(
+        config: &VenueConfig,
+        runtime: &RuntimeConfig,
+        symbols: &[String],
+    ) -> Result<Self> {
         if config.venue != Venue::Hyperliquid {
             return Err(anyhow!(
                 "hyperliquid live adapter requires hyperliquid config"
@@ -98,6 +103,7 @@ impl HyperliquidLiveAdapter {
         let market_ws = WsMarketState::new();
         let adapter = Self {
             config: config.clone(),
+            runtime: runtime.clone(),
             info_client,
             exchange_client,
             account_address,
@@ -634,7 +640,7 @@ impl VenueAdapter for HyperliquidLiveAdapter {
 
     fn cached_position(&self, symbol: &str) -> Option<PositionSnapshot> {
         self.private_ws
-            .position(symbol)
+            .position_if_fresh(symbol, self.runtime.private_position_max_age_ms, now_ms())
             .map(|position| PositionSnapshot {
                 venue: Venue::Hyperliquid,
                 symbol: symbol.to_string(),
@@ -644,7 +650,11 @@ impl VenueAdapter for HyperliquidLiveAdapter {
     }
 
     async fn fetch_position(&self, symbol: &str) -> Result<PositionSnapshot> {
-        if let Some(position) = self.private_ws.position(symbol) {
+        if let Some(position) = self.private_ws.position_if_fresh(
+            symbol,
+            self.runtime.private_position_max_age_ms,
+            now_ms(),
+        ) {
             return Ok(PositionSnapshot {
                 venue: Venue::Hyperliquid,
                 symbol: symbol.to_string(),

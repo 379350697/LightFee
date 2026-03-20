@@ -10,7 +10,10 @@ use tokio::{task::JoinHandle, time::sleep};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tracing::{debug, warn};
 
-use crate::models::SymbolMarketSnapshot;
+use crate::{
+    models::SymbolMarketSnapshot,
+    resilience::{ConnectionHealth, FailureBackoff},
+};
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct WsBookQuote {
@@ -31,6 +34,7 @@ struct WsSymbolState {
 #[derive(Debug, Default)]
 pub(crate) struct WsMarketState {
     symbols: RwLock<HashMap<String, WsSymbolState>>,
+    health: RwLock<ConnectionHealth>,
     worker: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -108,6 +112,22 @@ impl WsMarketState {
         self.worker.lock().expect("lock").replace(worker);
     }
 
+    pub(crate) fn record_connection_success(&self, now_ms: i64) {
+        self.health.write().expect("lock").record_success(now_ms);
+    }
+
+    pub(crate) fn record_connection_failure(
+        &self,
+        now_ms: i64,
+        unhealthy_after_failures: usize,
+        error: String,
+    ) {
+        self.health
+            .write()
+            .expect("lock")
+            .record_failure(now_ms, unhealthy_after_failures, error);
+    }
+
     pub(crate) fn abort_worker(&self) {
         if let Some(worker) = self.worker.lock().expect("lock").take() {
             worker.abort();
@@ -120,6 +140,9 @@ pub(crate) fn spawn_ws_loop<F>(
     url: String,
     subscribe_messages: Vec<String>,
     state: Arc<WsMarketState>,
+    reconnect_initial_ms: u64,
+    reconnect_max_ms: u64,
+    unhealthy_after_failures: usize,
     handler: F,
 ) where
     F: Fn(&Arc<WsMarketState>, &str) -> Result<()> + Send + Sync + 'static,
@@ -127,14 +150,23 @@ pub(crate) fn spawn_ws_loop<F>(
     let handler = Arc::new(handler);
     let state_for_task = state.clone();
     let task = tokio::spawn(async move {
+        let mut reconnect_backoff =
+            FailureBackoff::new(reconnect_initial_ms, reconnect_max_ms, url.len() as u64);
         loop {
             match connect_async(url.as_str()).await {
                 Ok((mut socket, _)) => {
+                    reconnect_backoff.on_success();
+                    state_for_task.record_connection_success(chrono::Utc::now().timestamp_millis());
                     debug!(venue = venue_name, "market websocket connected");
                     let mut failed = false;
                     for message in &subscribe_messages {
                         if let Err(error) = socket.send(Message::Text(message.clone().into())).await
                         {
+                            state_for_task.record_connection_failure(
+                                chrono::Utc::now().timestamp_millis(),
+                                unhealthy_after_failures,
+                                error.to_string(),
+                            );
                             warn!(
                                 venue = venue_name,
                                 ?error,
@@ -145,7 +177,10 @@ pub(crate) fn spawn_ws_loop<F>(
                         }
                     }
                     if failed {
-                        sleep(Duration::from_secs(1)).await;
+                        sleep(Duration::from_millis(
+                            reconnect_backoff.on_failure_with_jitter(),
+                        ))
+                        .await;
                         continue;
                     }
 
@@ -162,6 +197,11 @@ pub(crate) fn spawn_ws_loop<F>(
                             }
                             Ok(Message::Ping(payload)) => {
                                 if let Err(error) = socket.send(Message::Pong(payload)).await {
+                                    state_for_task.record_connection_failure(
+                                        chrono::Utc::now().timestamp_millis(),
+                                        unhealthy_after_failures,
+                                        error.to_string(),
+                                    );
                                     warn!(
                                         venue = venue_name,
                                         ?error,
@@ -171,11 +211,21 @@ pub(crate) fn spawn_ws_loop<F>(
                                 }
                             }
                             Ok(Message::Close(frame)) => {
+                                state_for_task.record_connection_failure(
+                                    chrono::Utc::now().timestamp_millis(),
+                                    unhealthy_after_failures,
+                                    format!("closed:{frame:?}"),
+                                );
                                 debug!(venue = venue_name, ?frame, "market websocket closed");
                                 break;
                             }
                             Ok(_) => {}
                             Err(error) => {
+                                state_for_task.record_connection_failure(
+                                    chrono::Utc::now().timestamp_millis(),
+                                    unhealthy_after_failures,
+                                    error.to_string(),
+                                );
                                 warn!(
                                     venue = venue_name,
                                     ?error,
@@ -187,6 +237,11 @@ pub(crate) fn spawn_ws_loop<F>(
                     }
                 }
                 Err(error) => {
+                    state_for_task.record_connection_failure(
+                        chrono::Utc::now().timestamp_millis(),
+                        unhealthy_after_failures,
+                        error.to_string(),
+                    );
                     warn!(
                         venue = venue_name,
                         ?error,
@@ -195,7 +250,10 @@ pub(crate) fn spawn_ws_loop<F>(
                 }
             }
 
-            sleep(Duration::from_secs(1)).await;
+            sleep(Duration::from_millis(
+                reconnect_backoff.on_failure_with_jitter(),
+            ))
+            .await;
         }
     });
     state.set_worker(task);

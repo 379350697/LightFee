@@ -16,11 +16,12 @@ use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tracing::{debug, warn};
 
 use crate::{
-    config::VenueConfig,
+    config::{RuntimeConfig, VenueConfig},
     models::{
         AssetTransferStatus, OrderFill, OrderRequest, PositionSnapshot, Side, SymbolMarketSnapshot,
         Venue, VenueMarketSnapshot,
     },
+    resilience::FailureBackoff,
     venue::VenueAdapter,
 };
 
@@ -34,6 +35,7 @@ use super::{
 
 pub struct OkxLiveAdapter {
     config: VenueConfig,
+    runtime: RuntimeConfig,
     client: Client,
     base_url: String,
     metadata: Mutex<HashMap<String, OkxInstrumentMeta>>,
@@ -44,7 +46,7 @@ pub struct OkxLiveAdapter {
 }
 
 impl OkxLiveAdapter {
-    pub fn new(config: &VenueConfig, timeout_ms: u64, symbols: &[String]) -> Result<Self> {
+    pub fn new(config: &VenueConfig, runtime: &RuntimeConfig, symbols: &[String]) -> Result<Self> {
         if config.venue != Venue::Okx {
             return Err(anyhow!("okx live adapter requires okx config"));
         }
@@ -52,7 +54,8 @@ impl OkxLiveAdapter {
         let market_ws = WsMarketState::new();
         let adapter = Self {
             config: config.clone(),
-            client: build_http_client(timeout_ms)?,
+            runtime: runtime.clone(),
+            client: build_http_client(runtime.chillybot_timeout_ms)?,
             base_url: config
                 .live
                 .base_url
@@ -101,6 +104,9 @@ impl OkxLiveAdapter {
             okx_public_ws_url(&self.base_url).to_string(),
             vec![subscribe],
             state,
+            self.runtime.ws_reconnect_initial_ms,
+            self.runtime.ws_reconnect_max_ms,
+            self.runtime.ws_unhealthy_after_failures,
             move |cache, raw| {
                 let payload = parse_text_message(raw)?;
                 let arg = match payload.get("arg") {
@@ -218,12 +224,17 @@ impl OkxLiveAdapter {
         let client = self.client.clone();
         let base_url = self.base_url.clone();
         let private_state = self.private_ws.clone();
+        let reconnect_initial_ms = self.runtime.ws_reconnect_initial_ms;
+        let reconnect_max_ms = self.runtime.ws_reconnect_max_ms;
+        let unhealthy_after_failures = self.runtime.ws_unhealthy_after_failures;
         let symbol_map = symbols
             .iter()
             .map(|symbol| (venue_symbol(&self.config, symbol), symbol.clone()))
             .collect::<HashMap<_, _>>();
         let url = okx_private_ws_url(&self.base_url).to_string();
         let task = tokio::spawn(async move {
+            let mut reconnect_backoff =
+                FailureBackoff::new(reconnect_initial_ms, reconnect_max_ms, Venue::Okx as u64);
             let ct_val_map = match fetch_okx_ct_val_map(&client, &base_url, &symbol_map).await {
                 Ok(map) => map,
                 Err(error) => {
@@ -234,14 +245,24 @@ impl OkxLiveAdapter {
             loop {
                 match connect_async(url.as_str()).await {
                     Ok((mut socket, _)) => {
+                        reconnect_backoff.on_success();
+                        private_state.record_connection_success(now_ms());
                         let timestamp =
                             match fetch_okx_server_timestamp_ms(&client, &base_url).await {
                                 Ok(server_timestamp_ms) => {
                                     format!("{:.3}", server_timestamp_ms as f64 / 1_000.0)
                                 }
                                 Err(error) => {
+                                    private_state.record_connection_failure(
+                                        now_ms(),
+                                        unhealthy_after_failures,
+                                        error.to_string(),
+                                    );
                                     warn!(?error, "okx private websocket server time fetch failed");
-                                    sleep(Duration::from_secs(5)).await;
+                                    sleep(Duration::from_millis(
+                                        reconnect_backoff.on_failure_with_jitter(),
+                                    ))
+                                    .await;
                                     continue;
                                 }
                             };
@@ -251,8 +272,16 @@ impl OkxLiveAdapter {
                         ) {
                             Ok(signature) => signature,
                             Err(error) => {
+                                private_state.record_connection_failure(
+                                    now_ms(),
+                                    unhealthy_after_failures,
+                                    error.to_string(),
+                                );
                                 warn!(?error, "okx private websocket auth sign failed");
-                                sleep(Duration::from_secs(5)).await;
+                                sleep(Duration::from_millis(
+                                    reconnect_backoff.on_failure_with_jitter(),
+                                ))
+                                .await;
                                 continue;
                             }
                         };
@@ -267,8 +296,16 @@ impl OkxLiveAdapter {
                         })
                         .to_string();
                         if let Err(error) = socket.send(Message::Text(login.into())).await {
+                            private_state.record_connection_failure(
+                                now_ms(),
+                                unhealthy_after_failures,
+                                error.to_string(),
+                            );
                             warn!(?error, "okx private websocket login send failed");
-                            sleep(Duration::from_secs(1)).await;
+                            sleep(Duration::from_millis(
+                                reconnect_backoff.on_failure_with_jitter(),
+                            ))
+                            .await;
                             continue;
                         }
 
@@ -278,7 +315,12 @@ impl OkxLiveAdapter {
                         loop {
                             tokio::select! {
                                 _ = ping_interval.tick() => {
-                                    if socket.send(Message::Text("ping".to_string().into())).await.is_err() {
+                                    if let Err(error) = socket.send(Message::Text("ping".to_string().into())).await {
+                                        private_state.record_connection_failure(
+                                            now_ms(),
+                                            unhealthy_after_failures,
+                                            error.to_string(),
+                                        );
                                         break;
                                     }
                                 }
@@ -294,6 +336,11 @@ impl OkxLiveAdapter {
                                             ) {
                                                 Ok(Some(subscribe_payload)) => {
                                                     if let Err(error) = socket.send(Message::Text(subscribe_payload.into())).await {
+                                                        private_state.record_connection_failure(
+                                                            now_ms(),
+                                                            unhealthy_after_failures,
+                                                            error.to_string(),
+                                                        );
                                                         warn!(?error, "okx private websocket subscribe send failed");
                                                         break;
                                                     }
@@ -305,16 +352,31 @@ impl OkxLiveAdapter {
                                             }
                                         }
                                         Some(Ok(Message::Ping(payload))) => {
-                                            if socket.send(Message::Pong(payload)).await.is_err() {
+                                            if let Err(error) = socket.send(Message::Pong(payload)).await {
+                                                private_state.record_connection_failure(
+                                                    now_ms(),
+                                                    unhealthy_after_failures,
+                                                    error.to_string(),
+                                                );
                                                 break;
                                             }
                                         }
                                         Some(Ok(Message::Close(frame))) => {
+                                            private_state.record_connection_failure(
+                                                now_ms(),
+                                                unhealthy_after_failures,
+                                                format!("closed:{frame:?}"),
+                                            );
                                             debug!(?frame, "okx private websocket closed");
                                             break;
                                         }
                                         Some(Ok(_)) => {}
                                         Some(Err(error)) => {
+                                            private_state.record_connection_failure(
+                                                now_ms(),
+                                                unhealthy_after_failures,
+                                                error.to_string(),
+                                            );
                                             warn!(?error, "okx private websocket receive failed");
                                             break;
                                         }
@@ -325,11 +387,19 @@ impl OkxLiveAdapter {
                         }
                     }
                     Err(error) => {
+                        private_state.record_connection_failure(
+                            now_ms(),
+                            unhealthy_after_failures,
+                            error.to_string(),
+                        );
                         warn!(?error, "okx private websocket connect failed");
                     }
                 }
 
-                sleep(Duration::from_secs(1)).await;
+                sleep(Duration::from_millis(
+                    reconnect_backoff.on_failure_with_jitter(),
+                ))
+                .await;
             }
         });
         self.private_ws.push_worker(task);
@@ -643,7 +713,7 @@ impl VenueAdapter for OkxLiveAdapter {
 
     fn cached_position(&self, symbol: &str) -> Option<PositionSnapshot> {
         self.private_ws
-            .position(symbol)
+            .position_if_fresh(symbol, self.runtime.private_position_max_age_ms, now_ms())
             .map(|position| PositionSnapshot {
                 venue: Venue::Okx,
                 symbol: symbol.to_string(),
@@ -653,7 +723,11 @@ impl VenueAdapter for OkxLiveAdapter {
     }
 
     async fn fetch_position(&self, symbol: &str) -> Result<PositionSnapshot> {
-        if let Some(position) = self.private_ws.position(symbol) {
+        if let Some(position) = self.private_ws.position_if_fresh(
+            symbol,
+            self.runtime.private_position_max_age_ms,
+            now_ms(),
+        ) {
             return Ok(PositionSnapshot {
                 venue: Venue::Okx,
                 symbol: symbol.to_string(),

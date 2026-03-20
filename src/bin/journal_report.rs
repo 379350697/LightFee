@@ -80,6 +80,29 @@ fn main() -> Result<()> {
         println!("order_error category={} count={}", error, count);
     }
 
+    for (reason, count) in &report.optimization_stats.no_entry_reason_counts {
+        println!("no_entry reason={} count={}", reason, count);
+    }
+
+    for (reason, count) in &report.optimization_stats.no_entry_blocked_reason_counts {
+        println!("no_entry_blocked reason={} count={}", reason, count);
+    }
+
+    for (advisory, count) in &report.optimization_stats.no_entry_advisory_counts {
+        println!("no_entry_advisory advisory={} count={}", advisory, count);
+    }
+
+    for (key, count) in &report.optimization_stats.no_entry_checklist_fail_counts {
+        println!("no_entry_checklist_failed key={} count={}", key, count);
+    }
+
+    for (blocker, count) in &report.optimization_stats.no_entry_selection_blocker_counts {
+        println!(
+            "no_entry_selection_blocker blocker={} count={}",
+            blocker, count
+        );
+    }
+
     for recommendation in &report.recommendations {
         println!(
             "recommendation priority={} category={} title={} summary={} evidence={:?}",
