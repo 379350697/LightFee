@@ -26,8 +26,19 @@ impl MarketView {
         view
     }
 
+    pub fn empty(now_ms: i64) -> Self {
+        Self {
+            now_ms,
+            ..Self::default()
+        }
+    }
+
     pub fn now_ms(&self) -> i64 {
         self.now_ms
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.symbols.is_empty()
     }
 
     pub fn symbol(&self, venue: Venue, symbol: &str) -> Option<&SymbolMarketSnapshot> {

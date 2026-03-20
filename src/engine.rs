@@ -569,10 +569,15 @@ impl Engine {
         });
 
         let mut snapshots = Vec::new();
+        let mut saw_hard_failure = false;
         for (venue, result) in join_all(futures).await {
             match result {
                 Ok(snapshot) => snapshots.push(snapshot),
                 Err(error) => {
+                    let soft_failure = is_soft_market_fetch_failure(&error);
+                    if !soft_failure {
+                        saw_hard_failure = true;
+                    }
                     self.state.last_error =
                         Some(format!("market fetch failed on {venue}: {error:#}"));
                     self.log_event(
@@ -580,13 +585,17 @@ impl Engine {
                         &json!({
                             "venue": venue,
                             "error": error.to_string(),
+                            "soft": soft_failure,
                         }),
                     );
                 }
             }
         }
         if snapshots.is_empty() {
-            return Err(anyhow!("market fetch failed on all venues"));
+            if saw_hard_failure {
+                return Err(anyhow!("market fetch failed on all venues"));
+            }
+            return Ok(MarketView::empty(now_ms()));
         }
         Ok(MarketView::from_snapshots(snapshots))
     }
@@ -731,6 +740,9 @@ impl Engine {
     }
 
     fn should_scan_entries(&self, market: &MarketView) -> bool {
+        if market.is_empty() {
+            return true;
+        }
         if self.config.strategy.max_scan_minutes_before_funding <= 0 {
             return true;
         }
@@ -2422,6 +2434,16 @@ impl Engine {
         self.persist_state()?;
         Ok(())
     }
+}
+
+fn is_soft_market_fetch_failure(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let message = cause.to_string();
+        message.contains("market snapshot unavailable for requested symbols")
+            || message.contains("symbol not supported")
+            || message.contains("instrument metadata missing")
+            || message.contains("ticker missing")
+    })
 }
 
 fn approx_zero(value: f64) -> bool {

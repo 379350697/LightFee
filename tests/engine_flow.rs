@@ -951,6 +951,80 @@ async fn outside_funding_scan_window_skips_entry_discovery() {
     assert!(!has_event(&records, "scan.completed"));
 }
 
+#[tokio::test]
+async fn soft_market_failures_on_all_venues_still_record_empty_scan() {
+    let temp = TempDir::new().expect("tempdir");
+    let mut config = test_config(&temp, false);
+    config.runtime.auto_trade_enabled = true;
+    config.strategy.max_scan_minutes_before_funding = 15;
+
+    let adapters: Vec<Arc<dyn VenueAdapter>> = vec![
+        Arc::new(SoftFailingMarketAdapter::new(
+            Venue::Binance,
+            "binance market snapshot unavailable for requested symbols",
+        )),
+        Arc::new(SoftFailingMarketAdapter::new(
+            Venue::Okx,
+            "okx instrument metadata missing for FET-USDT-SWAP",
+        )),
+        Arc::new(SoftFailingMarketAdapter::new(
+            Venue::Bybit,
+            "bybit ticker missing for FETUSDT",
+        )),
+        Arc::new(SoftFailingMarketAdapter::new(
+            Venue::Hyperliquid,
+            "hyperliquid symbol not supported for FETUSDT",
+        )),
+    ];
+
+    let mut engine = Engine::new(config.clone(), adapters).await.expect("engine");
+    engine.tick().await.expect("tick");
+
+    let scan = engine.state().last_scan.as_ref().expect("last scan");
+    assert_eq!(scan.candidate_count, 0);
+    assert_eq!(scan.tradeable_count, 0);
+
+    sleep(Duration::from_millis(250)).await;
+    let records = read_event_records(&config.persistence.event_log_path);
+    assert!(has_event(&records, "scan.completed"));
+    assert!(has_event(&records, "scan.no_entry_diagnostics"));
+    assert!(has_event(&records, "market.fetch_failed"));
+}
+
+#[tokio::test]
+async fn hard_market_failures_on_all_venues_still_fail_tick() {
+    let temp = TempDir::new().expect("tempdir");
+    let config = test_config(&temp, false);
+
+    let adapters: Vec<Arc<dyn VenueAdapter>> = vec![
+        Arc::new(SoftFailingMarketAdapter::new(
+            Venue::Binance,
+            "failed to request binance book ticker",
+        )),
+        Arc::new(SoftFailingMarketAdapter::new(
+            Venue::Okx,
+            "failed to request okx order book",
+        )),
+        Arc::new(SoftFailingMarketAdapter::new(
+            Venue::Bybit,
+            "failed to request bybit tickers",
+        )),
+        Arc::new(SoftFailingMarketAdapter::new(
+            Venue::Hyperliquid,
+            "failed to request hyperliquid l2 book",
+        )),
+    ];
+
+    let mut engine = Engine::new(config.clone(), adapters).await.expect("engine");
+    let error = engine.tick().await.expect_err("hard failure");
+    assert!(error
+        .to_string()
+        .contains("market fetch failed on all venues"));
+
+    let records = read_event_records(&config.persistence.event_log_path);
+    assert!(!has_event(&records, "scan.completed"));
+}
+
 #[test]
 fn live_candidate_sizing_is_capped_to_30_quote_per_leg() {
     let temp = TempDir::new().expect("tempdir");
@@ -1774,6 +1848,12 @@ struct CountingTransferAdapter {
     transfer_calls: Arc<Mutex<usize>>,
 }
 
+#[derive(Debug)]
+struct SoftFailingMarketAdapter {
+    venue: Venue,
+    error: String,
+}
+
 impl CountingTransferAdapter {
     fn new(
         venue: Venue,
@@ -1786,6 +1866,15 @@ impl CountingTransferAdapter {
             snapshot,
             transfer_status,
             transfer_calls,
+        }
+    }
+}
+
+impl SoftFailingMarketAdapter {
+    fn new(venue: Venue, error: impl Into<String>) -> Self {
+        Self {
+            venue,
+            error: error.into(),
         }
     }
 }
@@ -1912,6 +2001,34 @@ impl VenueAdapter for CountingTransferAdapter {
     ) -> Result<Vec<AssetTransferStatus>> {
         *self.transfer_calls.lock().expect("lock") += 1;
         Ok(vec![self.transfer_status.clone()])
+    }
+}
+
+#[async_trait]
+impl VenueAdapter for SoftFailingMarketAdapter {
+    fn venue(&self) -> Venue {
+        self.venue
+    }
+
+    async fn fetch_market_snapshot(&self, _symbols: &[String]) -> Result<VenueMarketSnapshot> {
+        Err(anyhow!("{}", self.error))
+    }
+
+    async fn place_order(&self, request: lightfee::OrderRequest) -> Result<lightfee::OrderFill> {
+        Err(anyhow!(
+            "{} should not place order for {}",
+            self.venue,
+            request.symbol
+        ))
+    }
+
+    async fn fetch_position(&self, symbol: &str) -> Result<lightfee::PositionSnapshot> {
+        Ok(lightfee::PositionSnapshot {
+            venue: self.venue,
+            symbol: symbol.to_string(),
+            size: 0.0,
+            updated_at_ms: 0,
+        })
     }
 }
 

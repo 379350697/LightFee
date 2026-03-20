@@ -60,7 +60,7 @@ pub struct HyperliquidLiveAdapter {
     exchange_client: ExchangeClient,
     account_address: H160,
     meta_cache: Mutex<HashMap<String, HyperliquidAssetMeta>>,
-    supported_symbols: HashSet<String>,
+    supported_symbols: Mutex<HashSet<String>>,
     market_ws: Arc<WsMarketState>,
     private_ws: Arc<WsPrivateState>,
     order_ws: HyperliquidWsPostClient,
@@ -118,20 +118,20 @@ impl HyperliquidLiveAdapter {
         }
 
         let market_ws = WsMarketState::new();
-        let mut adapter = Self {
+        let adapter = Self {
             config: config.clone(),
             runtime: runtime.clone(),
             info_client,
             exchange_client,
             account_address,
             meta_cache: Mutex::new(meta_cache),
-            supported_symbols,
+            supported_symbols: Mutex::new(supported_symbols),
             market_ws,
             private_ws: WsPrivateState::new(),
             order_ws: HyperliquidWsPostClient::new(hyperliquid_ws_url(base_url)),
         };
         if let Err(error) = adapter.refresh_symbol_catalog().await {
-            if adapter.supported_symbols.is_empty() {
+            if adapter.supported_symbols.lock().expect("lock").is_empty() {
                 return Err(error);
             }
             tracing::warn!(
@@ -150,6 +150,8 @@ impl HyperliquidLiveAdapter {
             .iter()
             .filter(|symbol| {
                 self.supported_symbols
+                    .lock()
+                    .expect("lock")
                     .contains(venue_symbol(&self.config, symbol).as_str())
             })
             .cloned()
@@ -158,10 +160,28 @@ impl HyperliquidLiveAdapter {
 
     fn supports_symbol(&self, symbol: &str) -> bool {
         self.supported_symbols
+            .lock()
+            .expect("lock")
             .contains(venue_symbol(&self.config, symbol).as_str())
     }
 
-    async fn refresh_symbol_catalog(&mut self) -> Result<()> {
+    fn prune_supported_symbol(&self, symbol: &str, reason: &str) {
+        let removed = prune_hyperliquid_symbol_catalog_entry(
+            &mut self.meta_cache.lock().expect("lock"),
+            &mut self.supported_symbols.lock().expect("lock"),
+            &venue_symbol(&self.config, symbol),
+        );
+        if removed {
+            warn!(
+                symbol,
+                venue_symbol = %venue_symbol(&self.config, symbol),
+                reason,
+                "hyperliquid pruned stale symbol from local catalog"
+            );
+        }
+    }
+
+    async fn refresh_symbol_catalog(&self) -> Result<()> {
         let meta = self
             .info_client
             .meta()
@@ -187,7 +207,7 @@ impl HyperliquidLiveAdapter {
             },
         );
         *self.meta_cache.lock().expect("lock") = metadata;
-        self.supported_symbols = supported_symbols;
+        *self.supported_symbols.lock().expect("lock") = supported_symbols;
         Ok(())
     }
 
@@ -458,11 +478,25 @@ impl HyperliquidLiveAdapter {
             return Err(anyhow!("hyperliquid symbol not supported for {}", symbol));
         }
         let asset = venue_symbol(&self.config, symbol);
-        let book = self
-            .info_client
-            .l2_snapshot(asset.clone())
-            .await
-            .context("failed to request hyperliquid l2 book")?;
+        let book = match self.info_client.l2_snapshot(asset.clone()).await {
+            Ok(book) => book,
+            Err(error) => {
+                let refresh_error = self.refresh_symbol_catalog().await.err();
+                if !self.supports_symbol(symbol) {
+                    if let Some(refresh_error) = refresh_error {
+                        warn!(
+                            symbol,
+                            venue_symbol = %asset,
+                            ?refresh_error,
+                            "hyperliquid symbol refresh failed before marking symbol unsupported"
+                        );
+                    }
+                    self.prune_supported_symbol(symbol, "l2_snapshot_failed_symbol_missing");
+                    return Err(anyhow!("hyperliquid symbol not supported for {}", symbol));
+                }
+                return Err(error).context("failed to request hyperliquid l2 book");
+            }
+        };
         let funding_history = self
             .info_client
             .funding_history(
@@ -535,6 +569,10 @@ impl HyperliquidLiveAdapter {
     }
 
     async fn asset_meta(&self, asset: &str) -> Result<HyperliquidAssetMeta> {
+        if let Some(meta) = self.meta_cache.lock().expect("lock").get(asset).cloned() {
+            return Ok(meta);
+        }
+        self.refresh_symbol_catalog().await?;
         self.meta_cache
             .lock()
             .expect("lock")
@@ -821,6 +859,16 @@ struct HyperliquidSymbolCatalogCache {
     updated_at_ms: i64,
     supported_symbols: Vec<String>,
     metadata: HashMap<String, HyperliquidAssetMeta>,
+}
+
+fn prune_hyperliquid_symbol_catalog_entry(
+    metadata: &mut HashMap<String, HyperliquidAssetMeta>,
+    supported_symbols: &mut HashSet<String>,
+    asset: &str,
+) -> bool {
+    let removed_meta = metadata.remove(asset).is_some();
+    let removed_supported = supported_symbols.remove(asset);
+    removed_meta || removed_supported
 }
 
 enum HyperliquidOrderOutcome {
@@ -1303,6 +1351,7 @@ fn ioc_order_params_from_reference_price(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{HashMap, HashSet};
     use std::str::FromStr;
 
     use ethers::types::H256;
@@ -1314,7 +1363,7 @@ mod tests {
     use super::{
         decode_ws_post_action_response, encode_ws_post_order_request,
         hyperliquid_cloid_for_client_order, ioc_order_params_from_reference_price,
-        sign_hyperliquid_l1_action,
+        prune_hyperliquid_symbol_catalog_entry, sign_hyperliquid_l1_action, HyperliquidAssetMeta,
     };
 
     #[test]
@@ -1456,5 +1505,20 @@ mod tests {
             cloid,
             hyperliquid_cloid_for_client_order("pos-1-entry-long")
         );
+    }
+
+    #[test]
+    fn pruning_missing_symbol_removes_cached_metadata_and_support() {
+        let mut metadata =
+            HashMap::from([("FET".to_string(), HyperliquidAssetMeta { sz_decimals: 3 })]);
+        let mut supported_symbols = HashSet::from(["FET".to_string(), "BTC".to_string()]);
+
+        let removed =
+            prune_hyperliquid_symbol_catalog_entry(&mut metadata, &mut supported_symbols, "FET");
+
+        assert!(removed);
+        assert!(!metadata.contains_key("FET"));
+        assert!(!supported_symbols.contains("FET"));
+        assert!(supported_symbols.contains("BTC"));
     }
 }

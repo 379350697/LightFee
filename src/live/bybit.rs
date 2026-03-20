@@ -132,6 +132,22 @@ impl BybitLiveAdapter {
             .contains(symbol)
     }
 
+    fn prune_supported_symbol(&self, symbol: &str, reason: &str) {
+        let removed = prune_bybit_symbol_catalog_entry(
+            &mut self.metadata.lock().expect("lock"),
+            &mut self.supported_symbols.lock().expect("lock"),
+            symbol,
+        );
+        if removed {
+            warn!(
+                symbol,
+                venue_symbol = %venue_symbol(&self.config, symbol),
+                reason,
+                "bybit pruned stale symbol from local catalog"
+            );
+        }
+    }
+
     fn start_market_ws(&self, symbols: &[String]) {
         if symbols.is_empty() {
             return;
@@ -408,18 +424,30 @@ impl BybitLiveAdapter {
         if let Some(meta) = self.metadata.lock().expect("lock").get(symbol).cloned() {
             return Ok(meta);
         }
-        self.refresh_symbol_catalog().await?;
-        self.metadata
-            .lock()
-            .expect("lock")
-            .get(symbol)
-            .cloned()
-            .with_context(|| {
-                format!(
-                    "bybit instrument metadata missing for {}",
-                    venue_symbol(&self.config, symbol)
-                )
-            })
+        let refresh_error = self.refresh_symbol_catalog().await.err();
+        if let Some(meta) = self.metadata.lock().expect("lock").get(symbol).cloned() {
+            return Ok(meta);
+        }
+        self.prune_supported_symbol(
+            symbol,
+            if refresh_error.is_some() {
+                "metadata_missing_after_refresh_failure"
+            } else {
+                "metadata_missing_after_refresh"
+            },
+        );
+        if let Some(error) = refresh_error {
+            warn!(
+                symbol,
+                venue_symbol = %venue_symbol(&self.config, symbol),
+                ?error,
+                "bybit symbol metadata refresh failed before pruning symbol"
+            );
+        }
+        Err(anyhow!(
+            "bybit instrument metadata missing for {}",
+            venue_symbol(&self.config, symbol)
+        ))
     }
 
     async fn refresh_symbol_catalog(&self) -> Result<()> {
@@ -502,10 +530,24 @@ impl BybitLiveAdapter {
         if response.ret_code != 0 {
             return Err(anyhow!("bybit tickers failed: {}", response.ret_msg));
         }
-        let ticker = response
+        let Some(ticker) = response
             .result
             .and_then(|result| result.list.into_iter().next())
-            .with_context(|| format!("bybit ticker missing for {venue_symbol}"))?;
+        else {
+            let refresh_error = self.refresh_symbol_catalog().await.err();
+            if !self.supports_symbol(symbol) {
+                if let Some(error) = refresh_error {
+                    warn!(
+                        symbol,
+                        venue_symbol = %venue_symbol,
+                        ?error,
+                        "bybit symbol refresh failed before marking symbol unsupported"
+                    );
+                }
+                return Err(anyhow!("bybit symbol not supported for {}", symbol));
+            }
+            return Err(anyhow!("bybit ticker missing for {venue_symbol}"));
+        };
 
         Ok(SymbolMarketSnapshot {
             symbol: symbol.to_string(),
@@ -601,6 +643,16 @@ impl BybitLiveAdapter {
         self.time_offset_ms.lock().expect("lock").replace(offset_ms);
         Ok(now_ms() + offset_ms)
     }
+}
+
+fn prune_bybit_symbol_catalog_entry(
+    metadata: &mut HashMap<String, BybitInstrumentMeta>,
+    supported_symbols: &mut HashSet<String>,
+    symbol: &str,
+) -> bool {
+    let removed_meta = metadata.remove(symbol).is_some();
+    let removed_supported = supported_symbols.remove(symbol);
+    removed_meta || removed_supported
 }
 
 #[async_trait]
@@ -1252,13 +1304,14 @@ fn bybit_transfer_status_cache_is_fresh(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeSet, HashMap, HashSet};
 
     use crate::models::Venue;
 
     use super::{
         build_bybit_transfer_status_cache, bybit_transfer_status_cache_is_fresh,
-        filter_bybit_transfer_statuses, BybitCoinChain, BybitCoinInfo,
+        filter_bybit_transfer_statuses, prune_bybit_symbol_catalog_entry, BybitCoinChain,
+        BybitCoinInfo, BybitInstrumentMeta,
     };
 
     #[test]
@@ -1307,5 +1360,20 @@ mod tests {
 
         assert!(bybit_transfer_status_cache_is_fresh(&cache, 10_250, 500));
         assert!(!bybit_transfer_status_cache_is_fresh(&cache, 10_501, 500));
+    }
+
+    #[test]
+    fn pruning_missing_symbol_removes_cached_metadata_and_support() {
+        let mut metadata =
+            HashMap::from([("FETUSDT".to_string(), BybitInstrumentMeta { qty_step: 0.1 })]);
+        let mut supported_symbols = HashSet::from(["FETUSDT".to_string(), "BTCUSDT".to_string()]);
+
+        let removed =
+            prune_bybit_symbol_catalog_entry(&mut metadata, &mut supported_symbols, "FETUSDT");
+
+        assert!(removed);
+        assert!(!metadata.contains_key("FETUSDT"));
+        assert!(!supported_symbols.contains("FETUSDT"));
+        assert!(supported_symbols.contains("BTCUSDT"));
     }
 }
