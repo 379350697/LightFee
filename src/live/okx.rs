@@ -28,10 +28,9 @@ use crate::{
 use super::{
     base_asset, build_http_client, build_query, cache_is_fresh, enrich_fill_from_private,
     estimate_fee_quote, floor_to_step, format_decimal, hinted_fill, hmac_sha256_base64,
-    iso8601_from_ms, load_json_cache, lookup_or_wait_private_order, merged_quote_snapshot,
-    now_ms, parse_f64, parse_i64, parse_text_message, quote_fill, spawn_ws_loop,
-    store_json_cache, venue_symbol, PrivateOrderUpdate, WsMarketState, WsPrivateState,
-    SYMBOL_CACHE_TTL_MS,
+    iso8601_from_ms, load_json_cache, lookup_or_wait_private_order, merged_quote_snapshot, now_ms,
+    parse_f64, parse_i64, parse_text_message, quote_fill, spawn_ws_loop, store_json_cache,
+    venue_symbol, PrivateOrderUpdate, WsMarketState, WsPrivateState, SYMBOL_CACHE_TTL_MS,
 };
 
 const OKX_MAX_SUBSCRIBE_ARGS_PER_MESSAGE: usize = 100;
@@ -90,7 +89,10 @@ impl OkxLiveAdapter {
             if adapter.supported_symbols.lock().expect("lock").is_empty() {
                 return Err(error);
             }
-            warn!(?error, "okx symbol catalog refresh failed; using persisted cache");
+            warn!(
+                ?error,
+                "okx symbol catalog refresh failed; using persisted cache"
+            );
         }
         let tracked_symbols = adapter.tracked_symbols(symbols);
         adapter.start_market_ws(&tracked_symbols);
@@ -112,7 +114,27 @@ impl OkxLiveAdapter {
     }
 
     fn supports_symbol(&self, symbol: &str) -> bool {
-        self.supported_symbols.lock().expect("lock").contains(symbol)
+        self.supported_symbols
+            .lock()
+            .expect("lock")
+            .contains(symbol)
+    }
+
+    fn prune_supported_symbol(&self, symbol: &str, reason: &str) {
+        let removed = prune_okx_symbol_catalog_entry(
+            &mut self.metadata.lock().expect("lock"),
+            &mut self.supported_symbols.lock().expect("lock"),
+            symbol,
+        );
+        if !removed {
+            return;
+        }
+        warn!(
+            symbol,
+            venue_symbol = %venue_symbol(&self.config, symbol),
+            reason,
+            "okx symbol removed from supported set"
+        );
     }
 
     fn start_market_ws(&self, symbols: &[String]) {
@@ -276,10 +298,8 @@ impl OkxLiveAdapter {
             .collect::<HashMap<_, _>>();
         let subscribe_messages = build_okx_private_subscribe_messages(&symbol_map);
         let url = okx_private_ws_url(&self.base_url).to_string();
-        let ct_val_map = okx_ct_val_map_from_cached_metadata(
-            &self.metadata.lock().expect("lock"),
-            &symbol_map,
-        );
+        let ct_val_map =
+            okx_ct_val_map_from_cached_metadata(&self.metadata.lock().expect("lock"), &symbol_map);
         let task = tokio::spawn(async move {
             let mut reconnect_backoff =
                 FailureBackoff::new(reconnect_initial_ms, reconnect_max_ms, Venue::Okx as u64);
@@ -453,13 +473,30 @@ impl OkxLiveAdapter {
         if let Some(meta) = self.metadata.lock().expect("lock").get(symbol).cloned() {
             return Ok(meta);
         }
-        self.refresh_symbol_catalog().await?;
-        self.metadata
-            .lock()
-            .expect("lock")
-            .get(symbol)
-            .cloned()
-            .with_context(|| format!("okx instrument metadata missing for {}", venue_symbol(&self.config, symbol)))
+        let refresh_error = self.refresh_symbol_catalog().await.err();
+        if let Some(meta) = self.metadata.lock().expect("lock").get(symbol).cloned() {
+            return Ok(meta);
+        }
+        self.prune_supported_symbol(
+            symbol,
+            if refresh_error.is_some() {
+                "metadata_missing_after_refresh_failure"
+            } else {
+                "metadata_missing_after_refresh"
+            },
+        );
+        if let Some(error) = refresh_error {
+            warn!(
+                symbol,
+                venue_symbol = %venue_symbol(&self.config, symbol),
+                ?error,
+                "okx symbol metadata refresh failed before pruning symbol"
+            );
+        }
+        Err(anyhow!(
+            "okx instrument metadata missing for {}",
+            venue_symbol(&self.config, symbol)
+        ))
     }
 
     async fn refresh_symbol_catalog(&self) -> Result<()> {
@@ -651,9 +688,21 @@ impl OkxLiveAdapter {
 }
 
 fn is_missing_okx_instrument_meta(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .any(|cause| cause.to_string().contains("okx instrument metadata missing"))
+    error.chain().any(|cause| {
+        cause
+            .to_string()
+            .contains("okx instrument metadata missing")
+    })
+}
+
+fn prune_okx_symbol_catalog_entry(
+    metadata: &mut HashMap<String, OkxInstrumentMeta>,
+    supported_symbols: &mut HashSet<String>,
+    symbol: &str,
+) -> bool {
+    let removed_meta = metadata.remove(symbol).is_some();
+    let removed_supported = supported_symbols.remove(symbol);
+    removed_meta || removed_supported
 }
 
 #[async_trait]
@@ -829,7 +878,12 @@ impl VenueAdapter for OkxLiveAdapter {
 
     async fn fetch_all_positions(&self) -> Result<Option<Vec<PositionSnapshot>>> {
         let response = self
-            .signed_request(reqwest::Method::GET, "/api/v5/account/positions", None, None)
+            .signed_request(
+                reqwest::Method::GET,
+                "/api/v5/account/positions",
+                None,
+                None,
+            )
             .await?
             .json::<OkxApiResponse<OkxPosition>>()
             .await
@@ -1100,7 +1154,10 @@ async fn fetch_okx_instrument_meta_map(
 }
 
 fn okx_symbol_key(inst_id: &str) -> String {
-    inst_id.replace('-', "").trim_end_matches("SWAP").to_string()
+    inst_id
+        .replace('-', "")
+        .trim_end_matches("SWAP")
+        .to_string()
 }
 
 fn handle_okx_private_message(
@@ -1287,11 +1344,12 @@ struct OkxCurrency {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     use super::{
         build_okx_private_subscribe_messages, build_okx_subscribe_messages, okx_pos_side,
-        OkxPositionMode, OKX_MAX_SUBSCRIBE_ARGS_PER_MESSAGE,
+        prune_okx_symbol_catalog_entry, OkxInstrumentMeta, OkxPositionMode,
+        OKX_MAX_SUBSCRIBE_ARGS_PER_MESSAGE,
     };
     use crate::models::Side;
 
@@ -1343,5 +1401,25 @@ mod tests {
             .collect::<HashMap<_, _>>();
         let messages = build_okx_private_subscribe_messages(&symbol_map);
         assert!(messages.len() > 1);
+    }
+
+    #[test]
+    fn pruning_missing_symbol_removes_cached_metadata_and_support() {
+        let mut metadata = HashMap::from([(
+            "ARCUSDT".to_string(),
+            OkxInstrumentMeta {
+                ct_val: 1.0,
+                lot_sz: 0.1,
+            },
+        )]);
+        let mut supported_symbols = HashSet::from(["ARCUSDT".to_string(), "BTCUSDT".to_string()]);
+
+        let removed =
+            prune_okx_symbol_catalog_entry(&mut metadata, &mut supported_symbols, "ARCUSDT");
+
+        assert!(removed);
+        assert!(!metadata.contains_key("ARCUSDT"));
+        assert!(!supported_symbols.contains("ARCUSDT"));
+        assert!(supported_symbols.contains("BTCUSDT"));
     }
 }

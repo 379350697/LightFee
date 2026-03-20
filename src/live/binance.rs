@@ -71,7 +71,8 @@ impl BinanceLiveAdapter {
             .unwrap_or_else(|| "https://api.binance.com".to_string());
 
         let market_ws = WsMarketState::new();
-        let persisted_catalog = load_json_cache::<BinanceSymbolCatalogCache>("binance-symbols.json");
+        let persisted_catalog =
+            load_json_cache::<BinanceSymbolCatalogCache>("binance-symbols.json");
         let mut metadata = HashMap::new();
         let mut supported_symbols = HashSet::new();
         if let Some(cache) = persisted_catalog {
@@ -99,7 +100,10 @@ impl BinanceLiveAdapter {
             if adapter.supported_symbols.lock().expect("lock").is_empty() {
                 return Err(error);
             }
-            warn!(?error, "binance symbol catalog refresh failed; using persisted cache");
+            warn!(
+                ?error,
+                "binance symbol catalog refresh failed; using persisted cache"
+            );
         }
         let tracked_symbols = adapter.tracked_symbols(symbols);
         adapter.start_market_ws(&tracked_symbols);
@@ -121,7 +125,10 @@ impl BinanceLiveAdapter {
     }
 
     fn supports_symbol(&self, symbol: &str) -> bool {
-        self.supported_symbols.lock().expect("lock").contains(symbol)
+        self.supported_symbols
+            .lock()
+            .expect("lock")
+            .contains(symbol)
     }
 
     fn start_market_ws(&self, symbols: &[String]) {
@@ -410,7 +417,12 @@ impl BinanceLiveAdapter {
             .expect("lock")
             .get(symbol)
             .cloned()
-            .with_context(|| format!("binance exchange info missing symbol {}", venue_symbol(&self.config, symbol)))
+            .with_context(|| {
+                format!(
+                    "binance exchange info missing symbol {}",
+                    venue_symbol(&self.config, symbol)
+                )
+            })
     }
 
     async fn refresh_symbol_catalog(&self) -> Result<()> {

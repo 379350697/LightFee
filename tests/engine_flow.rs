@@ -285,7 +285,16 @@ async fn transfer_status_fetch_is_cached_between_ticks() {
     let adapters: Vec<Arc<dyn VenueAdapter>> = vec![
         Arc::new(CountingTransferAdapter::new(
             Venue::Binance,
-            snapshot(Venue::Binance, 1_000, 100.0, 100.2, 10.0, 10.0, 0.0005, 60_000),
+            snapshot(
+                Venue::Binance,
+                1_000,
+                100.0,
+                100.2,
+                10.0,
+                10.0,
+                0.0005,
+                60_000,
+            ),
             transfer_status(Venue::Binance, "BTC", true, true),
             binance_calls.clone(),
         )),
@@ -1897,7 +1906,10 @@ impl VenueAdapter for CountingTransferAdapter {
         })
     }
 
-    async fn fetch_transfer_statuses(&self, _assets: &[String]) -> Result<Vec<AssetTransferStatus>> {
+    async fn fetch_transfer_statuses(
+        &self,
+        _assets: &[String],
+    ) -> Result<Vec<AssetTransferStatus>> {
         *self.transfer_calls.lock().expect("lock") += 1;
         Ok(vec![self.transfer_status.clone()])
     }

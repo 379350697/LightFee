@@ -715,7 +715,11 @@ impl Engine {
     }
 
     fn cached_transfer_status_view(&self, now_ms: i64) -> Option<(TransferStatusView, i64)> {
-        let ttl_ms = self.config.runtime.transfer_status_cache_ms.min(i64::MAX as u64) as i64;
+        let ttl_ms = self
+            .config
+            .runtime
+            .transfer_status_cache_ms
+            .min(i64::MAX as u64) as i64;
         if ttl_ms <= 0 {
             return None;
         }

@@ -36,6 +36,7 @@ use tokio::{net::TcpStream, sync::Mutex as AsyncMutex, time::Instant as TokioIns
 use tokio_tungstenite::{
     connect_async, tungstenite::protocol::Message, MaybeTlsStream, WebSocketStream,
 };
+use tracing::warn;
 
 use crate::{
     config::{RuntimeConfig, VenueConfig},
@@ -108,7 +109,9 @@ impl HyperliquidLiveAdapter {
         let mut supported_symbols = HashSet::new();
         if let Some(cache) = persisted_catalog {
             if !cache_is_fresh(cache.updated_at_ms, now_ms(), SYMBOL_CACHE_TTL_MS) {
-                tracing::debug!("hyperliquid symbol catalog cache is stale; using as fallback seed");
+                tracing::debug!(
+                    "hyperliquid symbol catalog cache is stale; using as fallback seed"
+                );
             }
             meta_cache.extend(cache.metadata);
             supported_symbols.extend(cache.supported_symbols);
@@ -131,7 +134,10 @@ impl HyperliquidLiveAdapter {
             if adapter.supported_symbols.is_empty() {
                 return Err(error);
             }
-            tracing::warn!(?error, "hyperliquid symbol catalog refresh failed; using persisted cache");
+            tracing::warn!(
+                ?error,
+                "hyperliquid symbol catalog refresh failed; using persisted cache"
+            );
         }
         let tracked_symbols = adapter.tracked_symbols(symbols);
         adapter.start_market_ws(&tracked_symbols, base_url).await?;
@@ -195,7 +201,7 @@ impl HyperliquidLiveAdapter {
             .map(|symbol| (venue_symbol(&self.config, symbol), symbol.clone()))
             .collect::<HashMap<_, _>>();
         let (sender, mut receiver) = unbounded_channel();
-        let mut info_client = InfoClient::new(None, Some(base_url))
+        let mut info_client = InfoClient::with_reconnect(None, Some(base_url))
             .await
             .context("failed to build hyperliquid market websocket client")?;
         for symbol in symbols {
@@ -223,11 +229,13 @@ impl HyperliquidLiveAdapter {
         }
 
         let cache = self.market_ws.clone();
+        let unhealthy_after_failures = self.runtime.ws_unhealthy_after_failures;
         let task = tokio::spawn(async move {
             let _info_client = info_client;
             while let Some(message) = receiver.recv().await {
                 match message {
                     HyperliquidMessage::L2Book(book) => {
+                        cache.record_connection_success(now_ms());
                         let Some(symbol) = symbol_map.get(&book.data.coin) else {
                             continue;
                         };
@@ -259,6 +267,7 @@ impl HyperliquidLiveAdapter {
                         }
                     }
                     HyperliquidMessage::ActiveAssetCtx(ctx) => {
+                        cache.record_connection_success(now_ms());
                         let Some(symbol) = symbol_map.get(&ctx.data.coin) else {
                             continue;
                         };
@@ -276,9 +285,31 @@ impl HyperliquidLiveAdapter {
                             );
                         }
                     }
+                    HyperliquidMessage::HyperliquidError(error) => {
+                        cache.record_connection_failure(
+                            now_ms(),
+                            unhealthy_after_failures,
+                            error.clone(),
+                        );
+                        warn!(?error, "hyperliquid market websocket reported error");
+                    }
+                    HyperliquidMessage::NoData => {
+                        cache.record_connection_failure(
+                            now_ms(),
+                            unhealthy_after_failures,
+                            "hyperliquid market websocket disconnected".to_string(),
+                        );
+                        warn!("hyperliquid market websocket disconnected");
+                    }
                     _ => {}
                 }
             }
+            cache.record_connection_failure(
+                now_ms(),
+                unhealthy_after_failures,
+                "hyperliquid market websocket receiver closed".to_string(),
+            );
+            warn!("hyperliquid market websocket receiver closed");
         });
         self.market_ws.set_worker(task);
         Ok(())
@@ -294,7 +325,7 @@ impl HyperliquidLiveAdapter {
             .map(|symbol| (venue_symbol(&self.config, symbol), symbol.clone()))
             .collect::<HashMap<_, _>>();
         let (sender, mut receiver) = unbounded_channel();
-        let mut info_client = InfoClient::new(None, Some(base_url))
+        let mut info_client = InfoClient::with_reconnect(None, Some(base_url))
             .await
             .context("failed to build hyperliquid private websocket client")?;
         if let Ok(user_state) = info_client.user_state(self.account_address).await {
@@ -326,11 +357,13 @@ impl HyperliquidLiveAdapter {
             .context("failed to subscribe hyperliquid order updates")?;
 
         let private_state = self.private_ws.clone();
+        let unhealthy_after_failures = self.runtime.ws_unhealthy_after_failures;
         let task = tokio::spawn(async move {
             let _info_client = info_client;
             while let Some(message) = receiver.recv().await {
                 match message {
                     HyperliquidMessage::User(user_event) => {
+                        private_state.record_connection_success(now_ms());
                         if let UserData::Fills(fills) = user_event.data {
                             for fill in fills {
                                 let Some(symbol) = symbol_map.get(&fill.coin) else {
@@ -368,6 +401,7 @@ impl HyperliquidLiveAdapter {
                         }
                     }
                     HyperliquidMessage::OrderUpdates(order_updates) => {
+                        private_state.record_connection_success(now_ms());
                         for update in order_updates.data {
                             let Some(symbol) = symbol_map.get(&update.order.coin) else {
                                 continue;
@@ -383,9 +417,31 @@ impl HyperliquidLiveAdapter {
                             });
                         }
                     }
+                    HyperliquidMessage::HyperliquidError(error) => {
+                        private_state.record_connection_failure(
+                            now_ms(),
+                            unhealthy_after_failures,
+                            error.clone(),
+                        );
+                        warn!(?error, "hyperliquid private websocket reported error");
+                    }
+                    HyperliquidMessage::NoData => {
+                        private_state.record_connection_failure(
+                            now_ms(),
+                            unhealthy_after_failures,
+                            "hyperliquid private websocket disconnected".to_string(),
+                        );
+                        warn!("hyperliquid private websocket disconnected");
+                    }
                     _ => {}
                 }
             }
+            private_state.record_connection_failure(
+                now_ms(),
+                unhealthy_after_failures,
+                "hyperliquid private websocket receiver closed".to_string(),
+            );
+            warn!("hyperliquid private websocket receiver closed");
         });
         self.private_ws.push_worker(task);
         Ok(())

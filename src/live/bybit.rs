@@ -28,10 +28,9 @@ use crate::{
 use super::{
     base_asset, build_http_client, build_query, cache_is_fresh, enrich_fill_from_private,
     estimate_fee_quote, floor_to_step, format_decimal, hinted_fill, hmac_sha256_hex,
-    load_json_cache, lookup_or_wait_private_order, now_ms, parse_bool_flag, parse_f64,
-    parse_i64, parse_text_message, quote_fill, spawn_ws_loop, store_json_cache, venue_symbol,
-    PrivateOrderUpdate, WsMarketState, WsPrivateState, SYMBOL_CACHE_TTL_MS,
-    TRANSFER_CACHE_TTL_MS,
+    load_json_cache, lookup_or_wait_private_order, now_ms, parse_bool_flag, parse_f64, parse_i64,
+    parse_text_message, quote_fill, spawn_ws_loop, store_json_cache, venue_symbol,
+    PrivateOrderUpdate, WsMarketState, WsPrivateState, SYMBOL_CACHE_TTL_MS, TRANSFER_CACHE_TTL_MS,
 };
 
 const BYBIT_MAX_SUBSCRIBE_TOPICS_PER_MESSAGE: usize = 100;
@@ -76,7 +75,10 @@ impl BybitLiveAdapter {
             cache_is_fresh(
                 cache.observed_at_ms,
                 now_ms(),
-                (runtime.transfer_status_cache_ms.max(TRANSFER_CACHE_TTL_MS as u64)).min(i64::MAX as u64) as i64,
+                (runtime
+                    .transfer_status_cache_ms
+                    .max(TRANSFER_CACHE_TTL_MS as u64))
+                .min(i64::MAX as u64) as i64,
             )
         });
         let adapter = Self {
@@ -99,7 +101,10 @@ impl BybitLiveAdapter {
             if adapter.supported_symbols.lock().expect("lock").is_empty() {
                 return Err(error);
             }
-            warn!(?error, "bybit symbol catalog refresh failed; using persisted cache");
+            warn!(
+                ?error,
+                "bybit symbol catalog refresh failed; using persisted cache"
+            );
         }
         let tracked_symbols = adapter.tracked_symbols(symbols);
         adapter.start_market_ws(&tracked_symbols);
@@ -121,7 +126,10 @@ impl BybitLiveAdapter {
     }
 
     fn supports_symbol(&self, symbol: &str) -> bool {
-        self.supported_symbols.lock().expect("lock").contains(symbol)
+        self.supported_symbols
+            .lock()
+            .expect("lock")
+            .contains(symbol)
     }
 
     fn start_market_ws(&self, symbols: &[String]) {
@@ -406,7 +414,12 @@ impl BybitLiveAdapter {
             .expect("lock")
             .get(symbol)
             .cloned()
-            .with_context(|| format!("bybit instrument metadata missing for {}", venue_symbol(&self.config, symbol)))
+            .with_context(|| {
+                format!(
+                    "bybit instrument metadata missing for {}",
+                    venue_symbol(&self.config, symbol)
+                )
+            })
     }
 
     async fn refresh_symbol_catalog(&self) -> Result<()> {
@@ -816,7 +829,10 @@ impl VenueAdapter for BybitLiveAdapter {
         }
 
         let cache = build_bybit_transfer_status_cache(
-            response.result.map(|result| result.rows).unwrap_or_default(),
+            response
+                .result
+                .map(|result| result.rows)
+                .unwrap_or_default(),
             observed_at_ms,
         );
         let statuses = filter_bybit_transfer_statuses(&cache, &wanted);
@@ -1176,14 +1192,16 @@ fn build_bybit_transfer_status_cache(
     let mut by_asset = HashMap::new();
     for row in rows {
         let asset = base_asset(&row.coin);
-        let entry = by_asset.entry(asset.clone()).or_insert(AssetTransferStatus {
-            venue: Venue::Bybit,
-            asset: asset.clone(),
-            deposit_enabled: false,
-            withdraw_enabled: false,
-            observed_at_ms,
-            source: "bybit".to_string(),
-        });
+        let entry = by_asset
+            .entry(asset.clone())
+            .or_insert(AssetTransferStatus {
+                venue: Venue::Bybit,
+                asset: asset.clone(),
+                deposit_enabled: false,
+                withdraw_enabled: false,
+                observed_at_ms,
+                source: "bybit".to_string(),
+            });
         entry.deposit_enabled |= row
             .chains
             .iter()
