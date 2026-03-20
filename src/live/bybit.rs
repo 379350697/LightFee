@@ -44,6 +44,7 @@ pub struct BybitLiveAdapter {
     supported_symbols: Mutex<HashSet<String>>,
     transfer_status_cache: Mutex<Option<BybitTransferStatusCache>>,
     time_offset_ms: Mutex<Option<i64>>,
+    position_mode: Arc<Mutex<Option<BybitPositionMode>>>,
     market_ws: Arc<WsMarketState>,
     private_ws: Arc<WsPrivateState>,
 }
@@ -94,6 +95,7 @@ impl BybitLiveAdapter {
             supported_symbols: Mutex::new(supported_symbols),
             transfer_status_cache: Mutex::new(transfer_status_cache),
             time_offset_ms: Mutex::new(None),
+            position_mode: Arc::new(Mutex::new(None)),
             market_ws,
             private_ws: WsPrivateState::new(),
         };
@@ -139,6 +141,7 @@ impl BybitLiveAdapter {
             symbol,
         );
         if removed {
+            self.persist_symbol_catalog();
             warn!(
                 symbol,
                 venue_symbol = %venue_symbol(&self.config, symbol),
@@ -146,6 +149,25 @@ impl BybitLiveAdapter {
                 "bybit pruned stale symbol from local catalog"
             );
         }
+    }
+
+    fn persist_symbol_catalog(&self) {
+        let metadata = self.metadata.lock().expect("lock").clone();
+        let supported_symbols = self
+            .supported_symbols
+            .lock()
+            .expect("lock")
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        store_json_cache(
+            "bybit-symbols.json",
+            &BybitSymbolCatalogCache {
+                updated_at_ms: now_ms(),
+                supported_symbols,
+                metadata,
+            },
+        );
     }
 
     fn start_market_ws(&self, symbols: &[String]) {
@@ -270,6 +292,7 @@ impl BybitLiveAdapter {
         let reconnect_initial_ms = self.runtime.ws_reconnect_initial_ms;
         let reconnect_max_ms = self.runtime.ws_reconnect_max_ms;
         let unhealthy_after_failures = self.runtime.ws_unhealthy_after_failures;
+        let position_mode = self.position_mode.clone();
         let symbol_map = symbols
             .iter()
             .map(|symbol| (venue_symbol(&self.config, symbol), symbol.clone()))
@@ -345,6 +368,7 @@ impl BybitLiveAdapter {
                                         Some(Ok(Message::Text(text))) => {
                                             match handle_bybit_private_message(
                                                 &private_state,
+                                                &position_mode,
                                                 &symbol_map,
                                                 text.as_ref(),
                                                 &mut subscribed,
@@ -489,6 +513,15 @@ impl BybitLiveAdapter {
                     instrument.symbol,
                     BybitInstrumentMeta {
                         qty_step: parse_f64(&instrument.lot_size_filter.qty_step)?,
+                        min_order_qty: parse_optional_f64_field(
+                            instrument.lot_size_filter.min_order_qty.as_deref(),
+                        )?,
+                        max_market_order_qty: parse_optional_f64_field(
+                            instrument.lot_size_filter.max_mkt_order_qty.as_deref(),
+                        )?,
+                        min_notional_value: parse_optional_f64_field(
+                            instrument.lot_size_filter.min_notional_value.as_deref(),
+                        )?,
                     },
                 );
             }
@@ -560,9 +593,38 @@ impl BybitLiveAdapter {
             best_ask: parse_f64(&ticker.ask1_price)?,
             bid_size: parse_f64(&ticker.bid1_size)?,
             ask_size: parse_f64(&ticker.ask1_size)?,
+            mark_price: None,
             funding_rate: parse_f64(&ticker.funding_rate)?,
             funding_timestamp_ms: parse_i64(&ticker.next_funding_time)?,
         })
+    }
+
+    async fn submit_order(
+        &self,
+        request: &OrderRequest,
+        meta: &BybitInstrumentMeta,
+        quantity: f64,
+        position_mode: BybitPositionMode,
+    ) -> Result<BybitApiResponse<BybitOrderResult>> {
+        let body = serde_json::json!({
+            "category": "linear",
+            "symbol": venue_symbol(&self.config, &request.symbol),
+            "side": match request.side {
+                Side::Buy => "Buy",
+                Side::Sell => "Sell",
+            },
+            "orderType": "Market",
+            "qty": format_decimal(quantity, meta.qty_step),
+            "reduceOnly": request.reduce_only,
+            "positionIdx": bybit_position_idx(position_mode, request.side, request.reduce_only),
+            "orderLinkId": request.client_order_id,
+        })
+        .to_string();
+        self.signed_request(reqwest::Method::POST, "/v5/order/create", None, Some(body))
+            .await?
+            .json::<BybitApiResponse<BybitOrderResult>>()
+            .await
+            .context("failed to decode bybit order response")
     }
 
     async fn signed_request(
@@ -656,6 +718,14 @@ impl BybitLiveAdapter {
         self.time_offset_ms.lock().expect("lock").replace(offset_ms);
         Ok(now_ms() + offset_ms)
     }
+
+    fn position_mode(&self) -> BybitPositionMode {
+        self.position_mode
+            .lock()
+            .expect("lock")
+            .clone()
+            .unwrap_or(BybitPositionMode::OneWay)
+    }
 }
 
 fn format_bybit_http_error(status: reqwest::StatusCode, body: &str) -> anyhow::Error {
@@ -740,34 +810,29 @@ impl VenueAdapter for BybitLiveAdapter {
 
     async fn place_order(&self, request: OrderRequest) -> Result<OrderFill> {
         let meta = self.symbol_meta(&request.symbol).await?;
+        ensure_bybit_order_link_id(&request.client_order_id)?;
         let quantity = floor_to_step(request.quantity, meta.qty_step);
-        if quantity <= 0.0 {
-            return Err(anyhow!(
-                "bybit order quantity rounded to zero for {}",
-                request.symbol
-            ));
-        }
+        validate_bybit_order_request(&meta, &request.symbol, quantity, request.price_hint)?;
 
-        let body = serde_json::json!({
-            "category": "linear",
-            "symbol": venue_symbol(&self.config, &request.symbol),
-            "side": match request.side {
-                Side::Buy => "Buy",
-                Side::Sell => "Sell",
-            },
-            "orderType": "Market",
-            "qty": format_decimal(quantity, meta.qty_step),
-            "reduceOnly": request.reduce_only,
-            "positionIdx": 0,
-            "orderLinkId": request.client_order_id,
-        })
-        .to_string();
-        let response = self
-            .signed_request(reqwest::Method::POST, "/v5/order/create", None, Some(body))
-            .await?
-            .json::<BybitApiResponse<BybitOrderResult>>()
-            .await
-            .context("failed to decode bybit order response")?;
+        let initial_mode = self.position_mode();
+        let mut response = self
+            .submit_order(&request, &meta, quantity, initial_mode)
+            .await?;
+        if response.ret_code != 0
+            && bybit_position_mode_retry_allowed(response.ret_code, &response.ret_msg)
+        {
+            let fallback_mode = initial_mode.alternate();
+            let fallback_response = self
+                .submit_order(&request, &meta, quantity, fallback_mode)
+                .await?;
+            if fallback_response.ret_code == 0 {
+                self.position_mode
+                    .lock()
+                    .expect("lock")
+                    .replace(fallback_mode);
+                response = fallback_response;
+            }
+        }
         if response.ret_code != 0 {
             return Err(format_bybit_api_error(
                 "bybit order failed",
@@ -884,6 +949,10 @@ impl VenueAdapter for BybitLiveAdapter {
             .result
             .map(|result| {
                 result.list.into_iter().try_fold(0.0, |acc, row| {
+                    update_bybit_position_mode_slot(
+                        &self.position_mode,
+                        bybit_position_mode_from_position_idx(row.position_idx),
+                    );
                     let quantity = parse_f64(&row.size)?;
                     let signed = match row.side.as_deref() {
                         Some("Buy") => quantity.abs(),
@@ -963,6 +1032,10 @@ impl VenueAdapter for BybitLiveAdapter {
         self.private_ws.abort_workers();
         Ok(())
     }
+
+    fn supported_symbols(&self, requested_symbols: &[String]) -> Option<Vec<String>> {
+        Some(self.tracked_symbols(requested_symbols))
+    }
 }
 
 fn bybit_public_ws_url(base_url: &str) -> &'static str {
@@ -996,6 +1069,7 @@ fn build_bybit_subscribe_messages(topics: &[String]) -> Vec<String> {
 
 fn handle_bybit_private_message(
     private_state: &Arc<WsPrivateState>,
+    position_mode: &Arc<Mutex<Option<BybitPositionMode>>>,
     symbol_map: &HashMap<String, String>,
     raw: &str,
     subscribed: &mut bool,
@@ -1139,6 +1213,12 @@ fn handle_bybit_private_message(
                 .and_then(|value| value.as_i64())
                 .unwrap_or_else(now_ms);
             for row in data {
+                update_bybit_position_mode_slot(
+                    position_mode,
+                    bybit_position_mode_from_position_idx(
+                        row.get("positionIdx").and_then(position_idx_from_value),
+                    ),
+                );
                 let Some(venue_symbol) = row.get("symbol").and_then(|value| value.as_str()) else {
                     continue;
                 };
@@ -1175,9 +1255,153 @@ fn extract_bybit_quote_fee(value: Option<&serde_json::Value>) -> Option<f64> {
     })
 }
 
+fn parse_optional_f64_field(raw: Option<&str>) -> Result<Option<f64>> {
+    raw.filter(|value| !value.is_empty())
+        .map(parse_f64)
+        .transpose()
+}
+
+fn ensure_bybit_order_link_id(client_order_id: &str) -> Result<()> {
+    if client_order_id.is_empty() {
+        return Err(anyhow!("bybit orderLinkId must not be empty"));
+    }
+    if client_order_id.len() > 36 {
+        return Err(anyhow!(
+            "bybit orderLinkId too long: {} > 36",
+            client_order_id.len()
+        ));
+    }
+    if !client_order_id
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+    {
+        return Err(anyhow!(
+            "bybit orderLinkId contains unsupported characters: {client_order_id}"
+        ));
+    }
+    Ok(())
+}
+
+fn bybit_position_mode_from_position_idx(position_idx: Option<i64>) -> Option<BybitPositionMode> {
+    match position_idx {
+        Some(1 | 2) => Some(BybitPositionMode::Hedge),
+        Some(0) => Some(BybitPositionMode::OneWay),
+        _ => None,
+    }
+}
+
+fn update_bybit_position_mode_slot(
+    slot: &Arc<Mutex<Option<BybitPositionMode>>>,
+    mode: Option<BybitPositionMode>,
+) {
+    let Some(mode) = mode else {
+        return;
+    };
+    let mut current = slot.lock().expect("lock");
+    match (*current, mode) {
+        (Some(BybitPositionMode::Hedge), BybitPositionMode::OneWay) => {}
+        _ => {
+            current.replace(mode);
+        }
+    }
+}
+
+fn position_idx_from_value(value: &serde_json::Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_str().and_then(|raw| raw.parse::<i64>().ok()))
+}
+
+fn bybit_position_idx(mode: BybitPositionMode, side: Side, reduce_only: bool) -> i64 {
+    match mode {
+        BybitPositionMode::OneWay => 0,
+        BybitPositionMode::Hedge => match (side, reduce_only) {
+            (Side::Buy, false) => 1,
+            (Side::Sell, false) => 2,
+            (Side::Sell, true) => 1,
+            (Side::Buy, true) => 2,
+        },
+    }
+}
+
+fn bybit_position_mode_retry_allowed(ret_code: i64, ret_msg: &str) -> bool {
+    if ret_code != 10001 {
+        return false;
+    }
+    let normalized = ret_msg.to_ascii_lowercase();
+    normalized.contains("position idx") || normalized.contains("position mode")
+}
+
+fn validate_bybit_order_request(
+    meta: &BybitInstrumentMeta,
+    symbol: &str,
+    quantity: f64,
+    price_hint: Option<f64>,
+) -> Result<()> {
+    if quantity <= 0.0 {
+        return Err(anyhow!(
+            "bybit order quantity rounded to zero for {}",
+            symbol
+        ));
+    }
+    if let Some(min_order_qty) = meta.min_order_qty {
+        if quantity < min_order_qty {
+            return Err(anyhow!(
+                "bybit order quantity {} below min qty {} for {}",
+                quantity,
+                min_order_qty,
+                symbol
+            ));
+        }
+    }
+    if let Some(max_market_order_qty) = meta.max_market_order_qty {
+        if quantity > max_market_order_qty {
+            return Err(anyhow!(
+                "bybit order quantity {} above max market qty {} for {}",
+                quantity,
+                max_market_order_qty,
+                symbol
+            ));
+        }
+    }
+    if let (Some(min_notional_value), Some(price_hint)) = (
+        meta.min_notional_value,
+        price_hint.filter(|price| price.is_finite() && *price > 0.0),
+    ) {
+        let notional = quantity * price_hint;
+        if notional < min_notional_value {
+            return Err(anyhow!(
+                "bybit order notional {} below min notional {} for {}",
+                notional,
+                min_notional_value,
+                symbol
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct BybitInstrumentMeta {
     qty_step: f64,
+    min_order_qty: Option<f64>,
+    max_market_order_qty: Option<f64>,
+    min_notional_value: Option<f64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BybitPositionMode {
+    OneWay,
+    Hedge,
+}
+
+impl BybitPositionMode {
+    fn alternate(self) -> Self {
+        match self {
+            Self::OneWay => Self::Hedge,
+            Self::Hedge => Self::OneWay,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1231,6 +1455,12 @@ struct BybitInstrument {
 struct BybitLotSizeFilter {
     #[serde(rename = "qtyStep")]
     qty_step: String,
+    #[serde(rename = "minOrderQty")]
+    min_order_qty: Option<String>,
+    #[serde(rename = "maxMktOrderQty")]
+    max_mkt_order_qty: Option<String>,
+    #[serde(rename = "minNotionalValue")]
+    min_notional_value: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1271,6 +1501,8 @@ struct BybitPositionList {
 struct BybitPosition {
     size: String,
     side: Option<String>,
+    #[serde(rename = "positionIdx")]
+    position_idx: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1379,9 +1611,12 @@ mod tests {
     use crate::models::Venue;
 
     use super::{
-        build_bybit_transfer_status_cache, bybit_transfer_status_cache_is_fresh,
+        build_bybit_transfer_status_cache, bybit_position_idx,
+        bybit_position_mode_from_position_idx, bybit_position_mode_retry_allowed,
+        bybit_transfer_status_cache_is_fresh, ensure_bybit_order_link_id,
         filter_bybit_transfer_statuses, format_bybit_api_error, format_bybit_http_error,
-        prune_bybit_symbol_catalog_entry, BybitCoinChain, BybitCoinInfo, BybitInstrumentMeta,
+        prune_bybit_symbol_catalog_entry, validate_bybit_order_request, BybitCoinChain,
+        BybitCoinInfo, BybitInstrumentMeta, BybitPositionMode,
     };
 
     #[test]
@@ -1434,8 +1669,15 @@ mod tests {
 
     #[test]
     fn pruning_missing_symbol_removes_cached_metadata_and_support() {
-        let mut metadata =
-            HashMap::from([("FETUSDT".to_string(), BybitInstrumentMeta { qty_step: 0.1 })]);
+        let mut metadata = HashMap::from([(
+            "FETUSDT".to_string(),
+            BybitInstrumentMeta {
+                qty_step: 0.1,
+                min_order_qty: None,
+                max_market_order_qty: None,
+                min_notional_value: None,
+            },
+        )]);
         let mut supported_symbols = HashSet::from(["FETUSDT".to_string(), "BTCUSDT".to_string()]);
 
         let removed =
@@ -1466,5 +1708,95 @@ mod tests {
         assert!(rendered.contains("order failed"));
         assert!(rendered.contains("ret_code=110003"));
         assert!(rendered.contains("order price exceeds limit"));
+    }
+
+    #[test]
+    fn order_link_id_validation_rejects_invalid_values() {
+        let long_error = ensure_bybit_order_link_id(&"a".repeat(37)).expect_err("reject long id");
+        assert!(long_error.to_string().contains("too long"));
+        let char_error = ensure_bybit_order_link_id("bad:id").expect_err("reject invalid chars");
+        assert!(char_error.to_string().contains("unsupported characters"));
+    }
+
+    #[test]
+    fn position_idx_maps_correctly_for_one_way_and_hedge_modes() {
+        assert_eq!(
+            bybit_position_idx(BybitPositionMode::OneWay, crate::models::Side::Buy, false),
+            0
+        );
+        assert_eq!(
+            bybit_position_idx(BybitPositionMode::Hedge, crate::models::Side::Buy, false),
+            1
+        );
+        assert_eq!(
+            bybit_position_idx(BybitPositionMode::Hedge, crate::models::Side::Sell, false),
+            2
+        );
+        assert_eq!(
+            bybit_position_idx(BybitPositionMode::Hedge, crate::models::Side::Sell, true),
+            1
+        );
+        assert_eq!(
+            bybit_position_idx(BybitPositionMode::Hedge, crate::models::Side::Buy, true),
+            2
+        );
+    }
+
+    #[test]
+    fn position_mode_infers_from_position_idx() {
+        assert_eq!(
+            bybit_position_mode_from_position_idx(Some(0)),
+            Some(BybitPositionMode::OneWay)
+        );
+        assert_eq!(
+            bybit_position_mode_from_position_idx(Some(1)),
+            Some(BybitPositionMode::Hedge)
+        );
+        assert_eq!(
+            bybit_position_mode_from_position_idx(Some(2)),
+            Some(BybitPositionMode::Hedge)
+        );
+        assert_eq!(bybit_position_mode_from_position_idx(None), None);
+    }
+
+    #[test]
+    fn position_mode_retry_is_only_enabled_for_mode_mismatch_errors() {
+        assert!(bybit_position_mode_retry_allowed(
+            10001,
+            "position idx not match position mode"
+        ));
+        assert!(!bybit_position_mode_retry_allowed(
+            110001,
+            "order not found"
+        ));
+    }
+
+    #[test]
+    fn order_validation_applies_market_qty_and_notional_constraints() {
+        let meta = BybitInstrumentMeta {
+            qty_step: 0.1,
+            min_order_qty: Some(1.0),
+            max_market_order_qty: Some(5.0),
+            min_notional_value: Some(10.0),
+        };
+        assert!(validate_bybit_order_request(&meta, "FETUSDT", 2.0, Some(6.0)).is_ok());
+        assert!(
+            validate_bybit_order_request(&meta, "FETUSDT", 0.5, Some(6.0))
+                .expect_err("below min")
+                .to_string()
+                .contains("below min qty")
+        );
+        assert!(
+            validate_bybit_order_request(&meta, "FETUSDT", 6.0, Some(6.0))
+                .expect_err("above max")
+                .to_string()
+                .contains("above max market qty")
+        );
+        assert!(
+            validate_bybit_order_request(&meta, "FETUSDT", 1.0, Some(5.0))
+                .expect_err("below min notional")
+                .to_string()
+                .contains("below min notional")
+        );
     }
 }

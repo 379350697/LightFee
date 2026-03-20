@@ -91,6 +91,8 @@ pub struct SymbolMarketSnapshot {
     pub best_ask: f64,
     pub bid_size: f64,
     pub ask_size: f64,
+    #[serde(default)]
+    pub mark_price: Option<f64>,
     pub funding_rate: f64,
     pub funding_timestamp_ms: i64,
 }
@@ -150,6 +152,8 @@ pub struct OrderRequest {
     pub client_order_id: String,
     #[serde(default)]
     pub price_hint: Option<f64>,
+    #[serde(default)]
+    pub mark_price_hint: Option<f64>,
     #[serde(default)]
     pub observed_at_ms: Option<i64>,
 }

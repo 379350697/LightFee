@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     sync::{Arc, Mutex},
 };
 
@@ -27,10 +27,11 @@ use crate::{
 
 use super::{
     base_asset, build_http_client, build_query, cache_is_fresh, enrich_fill_from_private,
-    estimate_fee_quote, floor_to_step, format_decimal, hinted_fill, hmac_sha256_hex,
-    load_json_cache, lookup_or_wait_private_order, now_ms, parse_f64, parse_i64,
-    parse_text_message, quote_fill, spawn_ws_loop, store_json_cache, venue_symbol,
-    PrivateOrderUpdate, WsMarketState, WsPrivateState, SYMBOL_CACHE_TTL_MS,
+    estimate_fee_quote, filter_transfer_statuses, floor_to_step, format_decimal, hinted_fill,
+    hmac_sha256_hex, load_json_cache, lookup_or_wait_private_order, now_ms, parse_f64, parse_i64,
+    parse_text_message, quote_fill, spawn_ws_loop, store_json_cache, transfer_cache_ttl_ms,
+    venue_symbol, PrivateOrderUpdate, VenueTransferStatusCache, WsMarketState, WsPrivateState,
+    SYMBOL_CACHE_TTL_MS,
 };
 
 const BINANCE_MAX_SUBSCRIBE_STREAMS_PER_MESSAGE: usize = 150;
@@ -47,6 +48,7 @@ pub struct BinanceLiveAdapter {
     time_offset_ms: Mutex<Option<i64>>,
     market_ws: Arc<WsMarketState>,
     private_ws: Arc<WsPrivateState>,
+    transfer_status_cache: Mutex<Option<VenueTransferStatusCache>>,
 }
 
 impl BinanceLiveAdapter {
@@ -73,6 +75,8 @@ impl BinanceLiveAdapter {
         let market_ws = WsMarketState::new();
         let persisted_catalog =
             load_json_cache::<BinanceSymbolCatalogCache>("binance-symbols.json");
+        let persisted_transfer_cache =
+            load_json_cache::<VenueTransferStatusCache>("binance-transfer-status.json");
         let mut metadata = HashMap::new();
         let mut supported_symbols = HashSet::new();
         if let Some(cache) = persisted_catalog {
@@ -82,6 +86,13 @@ impl BinanceLiveAdapter {
             metadata.extend(cache.metadata);
             supported_symbols.extend(cache.supported_symbols);
         }
+        let transfer_status_cache = persisted_transfer_cache.filter(|cache| {
+            cache_is_fresh(
+                cache.observed_at_ms,
+                now_ms(),
+                transfer_cache_ttl_ms(runtime.transfer_status_cache_ms),
+            )
+        });
 
         let adapter = Self {
             config: config.clone(),
@@ -95,6 +106,7 @@ impl BinanceLiveAdapter {
             time_offset_ms: Mutex::new(None),
             market_ws,
             private_ws: WsPrivateState::new(),
+            transfer_status_cache: Mutex::new(transfer_status_cache),
         };
         if let Err(error) = adapter.refresh_symbol_catalog().await {
             if adapter.supported_symbols.lock().expect("lock").is_empty() {
@@ -129,6 +141,23 @@ impl BinanceLiveAdapter {
             .lock()
             .expect("lock")
             .contains(symbol)
+    }
+
+    fn cached_transfer_statuses(
+        &self,
+        wanted: &BTreeSet<String>,
+        now_ms: i64,
+    ) -> Option<Vec<AssetTransferStatus>> {
+        let cache = self.transfer_status_cache.lock().expect("lock");
+        let cache = cache.as_ref()?;
+        if !cache_is_fresh(
+            cache.observed_at_ms,
+            now_ms,
+            transfer_cache_ttl_ms(self.runtime.transfer_status_cache_ms),
+        ) {
+            return None;
+        }
+        Some(filter_transfer_statuses(cache, wanted))
     }
 
     fn start_market_ws(&self, symbols: &[String]) {
@@ -206,6 +235,14 @@ impl BinanceLiveAdapter {
                         );
                     }
                     "markPriceUpdate" => {
+                        cache.update_mark_price(
+                            symbol,
+                            parse_f64(
+                                data.get("p")
+                                    .and_then(|value| value.as_str())
+                                    .ok_or_else(|| anyhow!("binance ws missing mark price"))?,
+                            )?,
+                        );
                         cache.update_funding(
                             symbol,
                             parse_f64(
@@ -402,6 +439,7 @@ impl BinanceLiveAdapter {
             best_ask: parse_f64(&book.ask_price)?,
             bid_size: parse_f64(&book.bid_qty)?,
             ask_size: parse_f64(&book.ask_qty)?,
+            mark_price: Some(parse_f64(&premium.mark_price)?),
             funding_rate: parse_f64(&premium.last_funding_rate)?,
             funding_timestamp_ms: parse_i64(&premium.next_funding_time)?,
         })
@@ -635,16 +673,17 @@ impl VenueAdapter for BinanceLiveAdapter {
     }
 
     async fn place_order(&self, request: OrderRequest) -> Result<OrderFill> {
+        ensure_binance_client_order_id(&request.client_order_id)?;
         let meta = self.symbol_meta(&request.symbol).await?;
         let position_mode = self.position_mode().await?;
         let quantity = floor_to_step(request.quantity, meta.step_size);
-        if quantity < meta.min_qty {
-            return Err(anyhow!(
-                "binance order quantity {} below min qty {}",
-                quantity,
-                meta.min_qty
-            ));
-        }
+        validate_binance_order_request(
+            &meta,
+            &request.symbol,
+            quantity,
+            request.price_hint,
+            request.mark_price_hint,
+        )?;
 
         let timestamp = self.server_timestamp_ms().await?.to_string();
         let mut params = vec![
@@ -800,6 +839,18 @@ impl VenueAdapter for BinanceLiveAdapter {
             return Ok(Vec::new());
         }
 
+        let wanted = assets
+            .iter()
+            .map(|asset| base_asset(asset))
+            .collect::<BTreeSet<_>>();
+        if wanted.is_empty() {
+            return Ok(Vec::new());
+        }
+        let observed_at_ms = now_ms();
+        if let Some(statuses) = self.cached_transfer_statuses(&wanted, observed_at_ms) {
+            return Ok(statuses);
+        }
+
         let params = vec![
             ("recvWindow", "5000".to_string()),
             ("timestamp", self.server_timestamp_ms().await?.to_string()),
@@ -816,13 +867,7 @@ impl VenueAdapter for BinanceLiveAdapter {
             .json::<Vec<BinanceCapitalCoin>>()
             .await
             .context("failed to decode binance capital config")?;
-        let wanted = assets
-            .iter()
-            .map(|asset| base_asset(asset))
-            .collect::<std::collections::BTreeSet<_>>();
-        let observed_at_ms = now_ms();
-
-        Ok(coins
+        let statuses = coins
             .into_iter()
             .filter_map(|coin| {
                 let asset = base_asset(&coin.coin);
@@ -846,7 +891,21 @@ impl VenueAdapter for BinanceLiveAdapter {
                     source: "binance".to_string(),
                 })
             })
-            .collect())
+            .collect::<Vec<_>>();
+        let cache = VenueTransferStatusCache {
+            observed_at_ms,
+            statuses: statuses.clone(),
+        };
+        store_json_cache("binance-transfer-status.json", &cache);
+        self.transfer_status_cache
+            .lock()
+            .expect("lock")
+            .replace(cache);
+        Ok(statuses)
+    }
+
+    fn supported_symbols(&self, requested_symbols: &[String]) -> Option<Vec<String>> {
+        Some(self.tracked_symbols(requested_symbols))
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -860,6 +919,9 @@ impl VenueAdapter for BinanceLiveAdapter {
 struct BinanceSymbolMeta {
     min_qty: f64,
     step_size: f64,
+    max_qty: Option<f64>,
+    min_notional: Option<f64>,
+    market_take_bound: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -889,6 +951,11 @@ struct BinanceBookTicker {
 
 #[derive(Debug, Deserialize)]
 struct BinancePremiumIndex {
+    #[serde(
+        rename = "markPrice",
+        deserialize_with = "deserialize_string_or_number"
+    )]
+    mark_price: String,
     #[serde(
         rename = "lastFundingRate",
         deserialize_with = "deserialize_string_or_number"
@@ -946,6 +1013,8 @@ struct BinanceExchangeSymbol {
     contract_type: Option<String>,
     #[serde(rename = "quoteAsset")]
     quote_asset: Option<String>,
+    #[serde(rename = "marketTakeBound", default)]
+    market_take_bound: Option<String>,
     filters: Vec<BinanceFilter>,
 }
 
@@ -955,8 +1024,14 @@ struct BinanceFilter {
     filter_type: String,
     #[serde(rename = "minQty", default)]
     min_qty: Option<String>,
+    #[serde(rename = "maxQty", default)]
+    max_qty: Option<String>,
     #[serde(rename = "stepSize", default)]
     step_size: Option<String>,
+    #[serde(rename = "notional", default)]
+    notional: Option<String>,
+    #[serde(rename = "minNotional", default)]
+    min_notional: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1009,6 +1084,10 @@ fn binance_symbol_meta_from_exchange_symbol(
     let Some(lot_size) = lot_size else {
         return Ok(None);
     };
+    let min_notional_filter = symbol_info
+        .filters
+        .iter()
+        .find(|filter| matches!(filter.filter_type.as_str(), "MIN_NOTIONAL" | "NOTIONAL"));
     Ok(Some(BinanceSymbolMeta {
         min_qty: parse_f64(
             lot_size
@@ -1022,6 +1101,28 @@ fn binance_symbol_meta_from_exchange_symbol(
                 .as_deref()
                 .ok_or_else(|| anyhow!("binance stepSize missing for {}", symbol_info.symbol))?,
         )?,
+        max_qty: lot_size
+            .max_qty
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .map(parse_f64)
+            .transpose()?,
+        min_notional: min_notional_filter
+            .and_then(|filter| {
+                filter
+                    .notional
+                    .as_deref()
+                    .or(filter.min_notional.as_deref())
+            })
+            .filter(|value| !value.is_empty())
+            .map(parse_f64)
+            .transpose()?,
+        market_take_bound: symbol_info
+            .market_take_bound
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .map(parse_f64)
+            .transpose()?,
     }))
 }
 
@@ -1251,21 +1352,104 @@ fn handle_binance_private_message(
     Ok(())
 }
 
+fn ensure_binance_client_order_id(client_order_id: &str) -> Result<()> {
+    if client_order_id.is_empty() {
+        return Err(anyhow!("binance client order id must not be empty"));
+    }
+    if client_order_id.len() > 36 {
+        return Err(anyhow!(
+            "binance client order id too long: {} > 36",
+            client_order_id.len()
+        ));
+    }
+    if !client_order_id
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | ':' | '/' | '_' | '-'))
+    {
+        return Err(anyhow!(
+            "binance client order id contains unsupported characters: {client_order_id}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_binance_order_request(
+    meta: &BinanceSymbolMeta,
+    symbol: &str,
+    quantity: f64,
+    price_hint: Option<f64>,
+    mark_price_hint: Option<f64>,
+) -> Result<()> {
+    if quantity < meta.min_qty {
+        return Err(anyhow!(
+            "binance order quantity {} below min qty {} for {}",
+            quantity,
+            meta.min_qty,
+            symbol
+        ));
+    }
+    if let Some(max_qty) = meta.max_qty {
+        if quantity > max_qty {
+            return Err(anyhow!(
+                "binance order quantity {} above max qty {} for {}",
+                quantity,
+                max_qty,
+                symbol
+            ));
+        }
+    }
+    if let (Some(min_notional), Some(price_hint)) = (
+        meta.min_notional,
+        price_hint.filter(|price| price.is_finite() && *price > 0.0),
+    ) {
+        let notional = quantity * price_hint;
+        if notional < min_notional {
+            return Err(anyhow!(
+                "binance order notional {} below min notional {} for {}",
+                notional,
+                min_notional,
+                symbol
+            ));
+        }
+    }
+    if let (Some(market_take_bound), Some(price_hint), Some(mark_price_hint)) = (
+        meta.market_take_bound,
+        price_hint.filter(|price| price.is_finite() && *price > 0.0),
+        mark_price_hint.filter(|price| price.is_finite() && *price > 0.0),
+    ) {
+        let max_price = mark_price_hint * (1.0 + market_take_bound);
+        let min_price = mark_price_hint * (1.0 - market_take_bound);
+        if price_hint > max_price || price_hint < min_price {
+            return Err(anyhow!(
+                "binance order price hint {} exceeds marketTakeBound {} around mark price {} for {}",
+                price_hint,
+                market_take_bound,
+                mark_price_hint,
+                symbol
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        binance_position_side, build_binance_subscribe_messages, format_binance_http_error,
-        BinancePositionMode, BinancePremiumIndex, BINANCE_MAX_SUBSCRIBE_STREAMS_PER_MESSAGE,
+        binance_position_side, build_binance_subscribe_messages, ensure_binance_client_order_id,
+        format_binance_http_error, validate_binance_order_request, BinancePositionMode,
+        BinancePremiumIndex, BinanceSymbolMeta, BINANCE_MAX_SUBSCRIBE_STREAMS_PER_MESSAGE,
     };
     use crate::models::Side;
 
     #[test]
     fn premium_index_accepts_integer_next_funding_time() {
         let payload = r#"{
+            "markPrice":"0.0",
             "lastFundingRate":"0.0001",
             "nextFundingTime":1773964800000
         }"#;
         let decoded: BinancePremiumIndex = serde_json::from_str(payload).expect("decode");
+        assert_eq!(decoded.mark_price, "0.0");
         assert_eq!(decoded.last_funding_rate, "0.0001");
         assert_eq!(decoded.next_funding_time, "1773964800000");
     }
@@ -1324,6 +1508,50 @@ mod tests {
         let rendered = error.to_string();
         assert!(rendered.contains("status=429 Too Many Requests"));
         assert!(rendered.contains("body=rate limited"));
+    }
+
+    #[test]
+    fn client_order_id_validation_rejects_overlong_values() {
+        let error = ensure_binance_client_order_id(&"a".repeat(37)).expect_err("reject long id");
+        assert!(error.to_string().contains("too long"));
+    }
+
+    #[test]
+    fn client_order_id_validation_rejects_unsupported_characters() {
+        let error = ensure_binance_client_order_id("bad id").expect_err("reject invalid chars");
+        assert!(error.to_string().contains("unsupported characters"));
+    }
+
+    #[test]
+    fn order_validation_applies_max_qty_and_min_notional_constraints() {
+        let meta = BinanceSymbolMeta {
+            min_qty: 0.001,
+            step_size: 0.001,
+            max_qty: Some(5.0),
+            min_notional: Some(10.0),
+            market_take_bound: Some(0.1),
+        };
+        assert!(
+            validate_binance_order_request(&meta, "ETHUSDT", 1.0, Some(20.0), Some(20.0)).is_ok()
+        );
+        assert!(
+            validate_binance_order_request(&meta, "ETHUSDT", 6.0, Some(20.0), Some(20.0))
+                .expect_err("above max")
+                .to_string()
+                .contains("above max qty")
+        );
+        assert!(
+            validate_binance_order_request(&meta, "ETHUSDT", 0.2, Some(20.0), Some(20.0))
+                .expect_err("below min notional")
+                .to_string()
+                .contains("below min notional")
+        );
+        assert!(
+            validate_binance_order_request(&meta, "ETHUSDT", 1.0, Some(25.0), Some(20.0))
+                .expect_err("outside market take bound")
+                .to_string()
+                .contains("marketTakeBound")
+        );
     }
 }
 

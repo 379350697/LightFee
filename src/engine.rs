@@ -1,5 +1,6 @@
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
+    hash::{DefaultHasher, Hash, Hasher},
     sync::Arc,
     time::Instant,
 };
@@ -12,7 +13,9 @@ use serde_json::json;
 use crate::{
     config::{AppConfig, StaggeredExitMode},
     journal::JsonlJournal,
-    live::{now_ms, quote_fill},
+    live::{
+        cache_is_fresh, load_json_cache, now_ms, quote_fill, store_json_cache, SYMBOL_CACHE_TTL_MS,
+    },
     market::MarketView,
     models::{CandidateOpportunity, FundingLeg, FundingOpportunityType, OrderRequest, Side, Venue},
     opportunity_source::{
@@ -95,6 +98,8 @@ pub struct EngineState {
     #[serde(default)]
     pub open_position: Option<OpenPosition>,
     pub last_error: Option<String>,
+    #[serde(default)]
+    pub venue_health: BTreeMap<Venue, PersistedVenueHealthState>,
 }
 
 impl Default for EngineState {
@@ -107,6 +112,7 @@ impl Default for EngineState {
             open_positions: Vec::new(),
             open_position: None,
             last_error: None,
+            venue_health: BTreeMap::new(),
         }
     }
 }
@@ -124,7 +130,9 @@ pub struct Engine {
     recent_submit_ack_ms: BTreeMap<Venue, VecDeque<u64>>,
     venue_entry_cooldowns: BTreeMap<Venue, VenueEntryCooldown>,
     recent_order_health: BTreeMap<Venue, VecDeque<VenueOrderHealthSample>>,
+    venue_health_updated_at_ms: BTreeMap<Venue, i64>,
     cached_transfer_status_view: Option<CachedTransferStatusView>,
+    scan_symbols: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -157,10 +165,35 @@ struct CachedTransferStatusView {
     view: TransferStatusView,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 struct VenueOrderHealthSample {
     failed: bool,
     uncertain: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PersistedVenueHealthState {
+    #[serde(default)]
+    updated_at_ms: i64,
+    #[serde(default)]
+    recent_submit_ack_ms: Vec<u64>,
+    #[serde(default)]
+    recent_order_health: Vec<VenueOrderHealthSample>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct PersistedScanPair {
+    long: Venue,
+    short: Venue,
+    symbols: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct PersistedScanSymbolCache {
+    updated_at_ms: i64,
+    requested_symbols: Vec<String>,
+    pairs: Vec<PersistedScanPair>,
+    scan_symbols: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -321,8 +354,16 @@ impl Engine {
         } else if !state.open_positions.is_empty() {
             state.mode = EngineMode::Recovering;
         }
+        let (recent_submit_ack_ms, recent_order_health, venue_health_updated_at_ms) =
+            restore_venue_health_from_state(&state);
+        let cached_scan_symbol_state = load_persisted_scan_symbol_cache(&config);
+        let initial_scan_symbols = cached_scan_symbol_state
+            .as_ref()
+            .map(|cache| cache.scan_symbols.clone())
+            .filter(|symbols| !symbols.is_empty())
+            .unwrap_or_else(|| config.symbols.clone());
 
-        Ok(Self {
+        let mut engine = Self {
             journal,
             store,
             config,
@@ -332,11 +373,15 @@ impl Engine {
             state,
             last_live_recovery_probe_ms: None,
             last_persisted_state: loaded_state.as_ref().map(persistent_state_view),
-            recent_submit_ack_ms: BTreeMap::new(),
+            recent_submit_ack_ms,
             venue_entry_cooldowns: BTreeMap::new(),
-            recent_order_health: BTreeMap::new(),
+            recent_order_health,
+            venue_health_updated_at_ms,
             cached_transfer_status_view: None,
-        })
+            scan_symbols: initial_scan_symbols,
+        };
+        engine.initialize_scan_symbols(cached_scan_symbol_state.as_ref());
+        Ok(engine)
     }
 
     pub fn state(&self) -> &EngineState {
@@ -353,6 +398,49 @@ impl Engine {
 
     fn sync_open_position_mirror(&mut self) {
         self.state.open_position = self.state.open_positions.first().cloned();
+    }
+
+    fn active_scan_symbols(&self) -> &[String] {
+        if self.scan_symbols.is_empty() {
+            &self.config.symbols
+        } else {
+            &self.scan_symbols
+        }
+    }
+
+    fn initialize_scan_symbols(&mut self, cached: Option<&PersistedScanSymbolCache>) {
+        if let Some(cache) = cached.filter(|cache| !cache.scan_symbols.is_empty()) {
+            self.scan_symbols = cache.scan_symbols.clone();
+            self.log_event(
+                "runtime.scan_symbol_cache.used",
+                &json!({
+                    "source": "disk",
+                    "symbol_count": self.scan_symbols.len(),
+                }),
+            );
+        }
+
+        let Some(refreshed) = build_scan_symbol_cache(&self.config, &self.adapters) else {
+            if self.scan_symbols.is_empty() {
+                self.scan_symbols = self.config.symbols.clone();
+            }
+            return;
+        };
+        if refreshed.scan_symbols.is_empty() {
+            if self.scan_symbols.is_empty() {
+                self.scan_symbols = self.config.symbols.clone();
+            }
+            return;
+        }
+
+        self.scan_symbols = refreshed.scan_symbols.clone();
+        store_json_cache(&scan_symbol_cache_filename(&self.config), &refreshed);
+        self.log_event(
+            "runtime.scan_symbol_cache.refreshed",
+            &json!({
+                "symbol_count": self.scan_symbols.len(),
+            }),
+        );
     }
 
     fn active_position_count(&self) -> usize {
@@ -463,8 +551,10 @@ impl Engine {
         let selected_candidates = if should_scan {
             let hints = self.fetch_hints().await;
             let transfer_statuses = self.fetch_transfer_status_view().await;
+            let mut scan_config = self.config.clone();
+            scan_config.symbols = self.active_scan_symbols().to_vec();
             let mut candidates = discover_candidates(
-                &self.config,
+                &scan_config,
                 &market,
                 hints.as_deref(),
                 transfer_statuses.as_ref(),
@@ -564,7 +654,7 @@ impl Engine {
     }
 
     async fn fetch_market_view(&mut self) -> Result<MarketView> {
-        let symbols = self.config.symbols.clone();
+        let symbols = self.active_scan_symbols().to_vec();
         let futures = self.adapters.iter().map(|(venue, adapter)| {
             let adapter = Arc::clone(adapter);
             let symbols = symbols.clone();
@@ -608,7 +698,7 @@ impl Engine {
             return None;
         };
 
-        match source.fetch_hints(&self.config.symbols).await {
+        match source.fetch_hints(self.active_scan_symbols()).await {
             Ok(hints) if !hints.is_empty() => {
                 self.log_event(
                     "hint_source.used",
@@ -647,8 +737,7 @@ impl Engine {
         }
 
         let assets = self
-            .config
-            .symbols
+            .active_scan_symbols()
             .iter()
             .map(|symbol| normalize_symbol_key(symbol))
             .filter(|asset| !asset.is_empty())
@@ -750,7 +839,7 @@ impl Engine {
             return true;
         }
 
-        self.config.symbols.iter().any(|symbol| {
+        self.active_scan_symbols().iter().any(|symbol| {
             self.adapters.keys().copied().any(|venue| {
                 market
                     .symbol(venue, symbol)
@@ -1410,12 +1499,17 @@ impl Engine {
             side: Side::Sell,
             quantity: executable_quantity,
             reduce_only: false,
-            client_order_id: format!("{position_id}-entry-short"),
+            client_order_id: compact_client_order_id(position_id.as_str(), "entry_short"),
             price_hint: self.order_price_hint(
                 market,
                 candidate.short_venue,
                 &candidate.symbol,
                 Side::Sell,
+            ),
+            mark_price_hint: self.order_mark_price_hint(
+                market,
+                candidate.short_venue,
+                &candidate.symbol,
             ),
             observed_at_ms: market.observed_at_ms(candidate.short_venue),
         };
@@ -1424,12 +1518,17 @@ impl Engine {
             side: Side::Buy,
             quantity: executable_quantity,
             reduce_only: false,
-            client_order_id: format!("{position_id}-entry-long"),
+            client_order_id: compact_client_order_id(position_id.as_str(), "entry_long"),
             price_hint: self.order_price_hint(
                 market,
                 candidate.long_venue,
                 &candidate.symbol,
                 Side::Buy,
+            ),
+            mark_price_hint: self.order_mark_price_hint(
+                market,
+                candidate.long_venue,
+                &candidate.symbol,
             ),
             observed_at_ms: market.observed_at_ms(candidate.long_venue),
         };
@@ -1719,12 +1818,17 @@ impl Engine {
             side: Side::Buy,
             quantity: position.quantity,
             reduce_only: true,
-            client_order_id: format!("{}-exit-short", position.position_id),
+            client_order_id: compact_client_order_id(position.position_id.as_str(), "exit_short"),
             price_hint: self.order_price_hint(
                 market,
                 position.short_venue,
                 &position.symbol,
                 Side::Buy,
+            ),
+            mark_price_hint: self.order_mark_price_hint(
+                market,
+                position.short_venue,
+                &position.symbol,
             ),
             observed_at_ms: market.observed_at_ms(position.short_venue),
         };
@@ -1733,12 +1837,17 @@ impl Engine {
             side: Side::Sell,
             quantity: position.quantity,
             reduce_only: true,
-            client_order_id: format!("{}-exit-long", position.position_id),
+            client_order_id: compact_client_order_id(position.position_id.as_str(), "exit_long"),
             price_hint: self.order_price_hint(
                 market,
                 position.long_venue,
                 &position.symbol,
                 Side::Sell,
+            ),
+            mark_price_hint: self.order_mark_price_hint(
+                market,
+                position.long_venue,
+                &position.symbol,
             ),
             observed_at_ms: market.observed_at_ms(position.long_venue),
         };
@@ -1814,8 +1923,9 @@ impl Engine {
             side,
             quantity,
             reduce_only: true,
-            client_order_id: format!("{position_id}-compensate"),
+            client_order_id: compact_client_order_id(position_id, "compensate"),
             price_hint: self.order_price_hint(market, venue, symbol, side),
+            mark_price_hint: self.order_mark_price_hint(market, venue, symbol),
             observed_at_ms: market.observed_at_ms(venue),
         };
         self.execute_order_leg(
@@ -1851,7 +1961,23 @@ impl Engine {
         })
     }
 
+    fn order_mark_price_hint(
+        &self,
+        market: &MarketView,
+        venue: Venue,
+        symbol: &str,
+    ) -> Option<f64> {
+        market
+            .symbol(venue, symbol)
+            .and_then(|quote| quote.mark_price)
+    }
+
     fn persist_state(&mut self) -> Result<()> {
+        self.state.venue_health = build_persisted_venue_health_state(
+            &self.recent_submit_ack_ms,
+            &self.recent_order_health,
+            &self.venue_health_updated_at_ms,
+        );
         let snapshot = persistent_state_view(&self.state);
         if self.last_persisted_state.as_ref() == Some(&snapshot) {
             return Ok(());
@@ -2196,6 +2322,8 @@ impl Engine {
         while samples.len() > window_size {
             samples.pop_front();
         }
+        self.venue_health_updated_at_ms
+            .insert(venue, wall_clock_now_ms());
     }
 
     fn record_order_health(&mut self, venue: Venue, failed: bool, uncertain: bool) {
@@ -2204,6 +2332,8 @@ impl Engine {
         while samples.len() > ORDER_HEALTH_WINDOW_SIZE {
             samples.pop_front();
         }
+        self.venue_health_updated_at_ms
+            .insert(venue, wall_clock_now_ms());
     }
 
     fn venue_entry_health_score(&self, venue: Venue) -> f64 {
@@ -2538,6 +2668,32 @@ fn duration_ms_u64(duration: std::time::Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
+fn compact_client_order_id(position_id: &str, stage: &str) -> String {
+    let raw_stage_code = match stage {
+        "entry_long" => "el",
+        "entry_short" => "es",
+        "exit_long" => "xl",
+        "exit_short" => "xs",
+        "compensate" => "cp",
+        other => {
+            if other.len() >= 2 {
+                &other[..2]
+            } else {
+                other
+            }
+        }
+    };
+    let stage_code = raw_stage_code
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .take(2)
+        .collect::<String>();
+    let mut hasher = DefaultHasher::new();
+    position_id.hash(&mut hasher);
+    stage.hash(&mut hasher);
+    format!("lf{stage_code}{:016x}", hasher.finish())
+}
+
 fn wall_clock_now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
@@ -2646,6 +2802,202 @@ fn should_probe_live_recovery(last_probe_ms: Option<i64>, now_ms: i64, interval_
         .unwrap_or(true)
 }
 
+fn load_persisted_scan_symbol_cache(config: &AppConfig) -> Option<PersistedScanSymbolCache> {
+    let cache = load_json_cache::<PersistedScanSymbolCache>(&scan_symbol_cache_filename(config))?;
+    if !cache_is_fresh(
+        cache.updated_at_ms,
+        wall_clock_now_ms(),
+        SYMBOL_CACHE_TTL_MS,
+    ) {
+        return None;
+    }
+    if !scan_symbol_cache_matches_config(&cache, config) {
+        return None;
+    }
+    Some(cache)
+}
+
+fn build_scan_symbol_cache(
+    config: &AppConfig,
+    adapters: &BTreeMap<Venue, Arc<dyn VenueAdapter>>,
+) -> Option<PersistedScanSymbolCache> {
+    let requested_symbols = normalized_requested_symbols(&config.symbols);
+    if requested_symbols.is_empty() {
+        return None;
+    }
+    let pairs = canonical_scan_pairs(config);
+    if pairs.is_empty() {
+        return None;
+    }
+
+    let unique_venues = pairs
+        .iter()
+        .flat_map(|pair| [pair.long, pair.short])
+        .collect::<BTreeSet<_>>();
+    let mut supported_by_venue = BTreeMap::<Venue, HashSet<String>>::new();
+    for venue in unique_venues {
+        let supported = adapters
+            .get(&venue)?
+            .supported_symbols(&requested_symbols)?
+            .into_iter()
+            .collect::<HashSet<_>>();
+        supported_by_venue.insert(venue, supported);
+    }
+
+    let mut scan_symbols = BTreeSet::new();
+    for pair in &pairs {
+        let long_supported = supported_by_venue.get(&pair.long)?;
+        let short_supported = supported_by_venue.get(&pair.short)?;
+        let allowed_symbols = if pair.symbols.is_empty() {
+            requested_symbols.clone()
+        } else {
+            pair.symbols.clone()
+        };
+        for symbol in allowed_symbols {
+            if long_supported.contains(symbol.as_str()) && short_supported.contains(symbol.as_str())
+            {
+                scan_symbols.insert(symbol);
+            }
+        }
+    }
+
+    Some(PersistedScanSymbolCache {
+        updated_at_ms: wall_clock_now_ms(),
+        requested_symbols,
+        pairs,
+        scan_symbols: scan_symbols.into_iter().collect(),
+    })
+}
+
+fn normalized_requested_symbols(symbols: &[String]) -> Vec<String> {
+    let mut normalized = symbols.to_vec();
+    normalized.sort();
+    normalized.dedup();
+    normalized
+}
+
+fn scan_symbol_cache_filename(config: &AppConfig) -> String {
+    let mut hasher = DefaultHasher::new();
+    normalized_requested_symbols(&config.symbols).hash(&mut hasher);
+    config.persistence.event_log_path.hash(&mut hasher);
+    config.persistence.snapshot_path.hash(&mut hasher);
+    for pair in canonical_scan_pairs(config) {
+        pair.long.hash(&mut hasher);
+        pair.short.hash(&mut hasher);
+        pair.symbols.hash(&mut hasher);
+    }
+    format!("scan-symbols-{:016x}.json", hasher.finish())
+}
+
+fn canonical_scan_pairs(config: &AppConfig) -> Vec<PersistedScanPair> {
+    let mut pairs = config
+        .directed_pairs_or_all()
+        .into_iter()
+        .map(|pair| {
+            let mut symbols = pair.symbols;
+            symbols.sort();
+            symbols.dedup();
+            PersistedScanPair {
+                long: pair.long,
+                short: pair.short,
+                symbols,
+            }
+        })
+        .collect::<Vec<_>>();
+    pairs.sort_by(|left, right| {
+        left.long
+            .cmp(&right.long)
+            .then_with(|| left.short.cmp(&right.short))
+            .then_with(|| left.symbols.cmp(&right.symbols))
+    });
+    pairs
+}
+
+fn scan_symbol_cache_matches_config(cache: &PersistedScanSymbolCache, config: &AppConfig) -> bool {
+    cache.requested_symbols == normalized_requested_symbols(&config.symbols)
+        && cache.pairs == canonical_scan_pairs(config)
+}
+
+fn restore_venue_health_from_state(
+    state: &EngineState,
+) -> (
+    BTreeMap<Venue, VecDeque<u64>>,
+    BTreeMap<Venue, VecDeque<VenueOrderHealthSample>>,
+    BTreeMap<Venue, i64>,
+) {
+    let mut recent_submit_ack_ms = BTreeMap::new();
+    let mut recent_order_health = BTreeMap::new();
+    let mut updated_at_ms = BTreeMap::new();
+
+    for (venue, persisted) in &state.venue_health {
+        if persisted.updated_at_ms > 0
+            && !cache_is_fresh(
+                persisted.updated_at_ms,
+                wall_clock_now_ms(),
+                SYMBOL_CACHE_TTL_MS,
+            )
+        {
+            continue;
+        }
+        if !persisted.recent_submit_ack_ms.is_empty() {
+            recent_submit_ack_ms.insert(
+                *venue,
+                persisted
+                    .recent_submit_ack_ms
+                    .iter()
+                    .copied()
+                    .collect::<VecDeque<_>>(),
+            );
+        }
+        if !persisted.recent_order_health.is_empty() {
+            recent_order_health.insert(
+                *venue,
+                persisted
+                    .recent_order_health
+                    .iter()
+                    .copied()
+                    .collect::<VecDeque<_>>(),
+            );
+        }
+        if persisted.updated_at_ms > 0 {
+            updated_at_ms.insert(*venue, persisted.updated_at_ms);
+        }
+    }
+
+    (recent_submit_ack_ms, recent_order_health, updated_at_ms)
+}
+
+fn build_persisted_venue_health_state(
+    recent_submit_ack_ms: &BTreeMap<Venue, VecDeque<u64>>,
+    recent_order_health: &BTreeMap<Venue, VecDeque<VenueOrderHealthSample>>,
+    updated_at_ms: &BTreeMap<Venue, i64>,
+) -> BTreeMap<Venue, PersistedVenueHealthState> {
+    let venues = recent_submit_ack_ms
+        .keys()
+        .chain(recent_order_health.keys())
+        .copied()
+        .collect::<BTreeSet<_>>();
+    venues
+        .into_iter()
+        .map(|venue| {
+            (
+                venue,
+                PersistedVenueHealthState {
+                    updated_at_ms: updated_at_ms.get(&venue).copied().unwrap_or_default(),
+                    recent_submit_ack_ms: recent_submit_ack_ms
+                        .get(&venue)
+                        .map(|samples| samples.iter().copied().collect())
+                        .unwrap_or_default(),
+                    recent_order_health: recent_order_health
+                        .get(&venue)
+                        .map(|samples| samples.iter().copied().collect())
+                        .unwrap_or_default(),
+                },
+            )
+        })
+        .collect()
+}
+
 fn persistent_state_view(state: &EngineState) -> EngineState {
     let mut snapshot = state.clone();
     snapshot.cycle = 0;
@@ -2727,13 +3079,13 @@ fn checklist_item(key: &'static str, ok: bool, detail: String) -> OpportunityChe
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::collections::{BTreeMap, VecDeque};
 
     use crate::config::StrategyConfig;
     use anyhow::anyhow;
 
     use super::{
-        cached_flat_guard_reason, hyperliquid_entry_gate_reason,
+        cached_flat_guard_reason, compact_client_order_id, hyperliquid_entry_gate_reason,
         order_error_may_have_created_exposure, order_quote_expired_reason, persistent_state_view,
         should_probe_live_recovery, venue_order_health_risk_score, EngineMode, EngineState,
         VenueOrderHealthSample,
@@ -2761,6 +3113,7 @@ mod tests {
             open_positions: Vec::new(),
             open_position: None,
             last_error: None,
+            venue_health: BTreeMap::new(),
         };
 
         let persisted = persistent_state_view(&state);
@@ -2769,6 +3122,25 @@ mod tests {
         assert_eq!(persisted.last_market_ts_ms, None);
         assert_eq!(persisted.last_scan, None);
         assert_eq!(persisted.mode, EngineMode::Running);
+    }
+
+    #[test]
+    fn compact_client_order_id_stays_short_and_stage_specific() {
+        let entry_long = compact_client_order_id(
+            "pos-1234567890-binance->hyperliquid-stableusdt",
+            "entry_long",
+        );
+        let entry_short = compact_client_order_id(
+            "pos-1234567890-binance->hyperliquid-stableusdt",
+            "entry_short",
+        );
+        assert!(entry_long.len() < 36);
+        assert!(entry_short.len() < 36);
+        assert_ne!(entry_long, entry_short);
+        assert!(entry_long.chars().all(|ch| ch.is_ascii_alphanumeric()));
+        assert!(entry_short.chars().all(|ch| ch.is_ascii_alphanumeric()));
+        assert!(entry_long.starts_with("lfel"));
+        assert!(entry_short.starts_with("lfes"));
     }
 
     #[test]

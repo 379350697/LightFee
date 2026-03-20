@@ -13,7 +13,8 @@ pub use hyperliquid::HyperliquidLiveAdapter;
 pub use okx::OkxLiveAdapter;
 
 pub(crate) use cache::{
-    cache_is_fresh, load_json_cache, store_json_cache, SYMBOL_CACHE_TTL_MS, TRANSFER_CACHE_TTL_MS,
+    cache_is_fresh, filter_transfer_statuses, load_json_cache, store_json_cache,
+    transfer_cache_ttl_ms, VenueTransferStatusCache, SYMBOL_CACHE_TTL_MS, TRANSFER_CACHE_TTL_MS,
 };
 pub(crate) use common::{
     base_asset, build_http_client, build_query, estimate_fee_quote, floor_to_step, format_decimal,

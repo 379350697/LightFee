@@ -187,4 +187,20 @@ impl VenueAdapter for ScriptedVenueAdapter {
     async fn normalize_quantity(&self, _symbol: &str, quantity: f64) -> Result<f64> {
         Ok(quantity)
     }
+
+    fn supported_symbols(&self, requested_symbols: &[String]) -> Option<Vec<String>> {
+        let inner = self.inner.lock().expect("lock");
+        let available = inner
+            .snapshots
+            .iter()
+            .flat_map(|snapshot| snapshot.symbols.iter().map(|symbol| symbol.symbol.clone()))
+            .collect::<std::collections::BTreeSet<_>>();
+        Some(
+            requested_symbols
+                .iter()
+                .filter(|symbol| available.contains(symbol.as_str()))
+                .cloned()
+                .collect(),
+        )
+    }
 }

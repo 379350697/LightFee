@@ -172,6 +172,7 @@ impl HyperliquidLiveAdapter {
             &venue_symbol(&self.config, symbol),
         );
         if removed {
+            self.persist_symbol_catalog();
             warn!(
                 symbol,
                 venue_symbol = %venue_symbol(&self.config, symbol),
@@ -179,6 +180,25 @@ impl HyperliquidLiveAdapter {
                 "hyperliquid pruned stale symbol from local catalog"
             );
         }
+    }
+
+    fn persist_symbol_catalog(&self) {
+        let metadata = self.meta_cache.lock().expect("lock").clone();
+        let supported_symbols = self
+            .supported_symbols
+            .lock()
+            .expect("lock")
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        store_json_cache(
+            "hyperliquid-symbols.json",
+            &HyperliquidSymbolCatalogCache {
+                updated_at_ms: now_ms(),
+                supported_symbols,
+                metadata,
+            },
+        );
     }
 
     async fn refresh_symbol_catalog(&self) -> Result<()> {
@@ -528,6 +548,7 @@ impl HyperliquidLiveAdapter {
             best_ask: parse_f64(&best_ask.px)?,
             bid_size: parse_f64(&best_bid.sz)?,
             ask_size: parse_f64(&best_ask.sz)?,
+            mark_price: None,
             funding_rate,
             funding_timestamp_ms: next_hour_boundary(book.time as i64),
         })
@@ -855,6 +876,10 @@ impl VenueAdapter for HyperliquidLiveAdapter {
         self.private_ws.abort_workers();
         self.order_ws.shutdown().await;
         Ok(())
+    }
+
+    fn supported_symbols(&self, requested_symbols: &[String]) -> Option<Vec<String>> {
+        Some(self.tracked_symbols(requested_symbols))
     }
 }
 

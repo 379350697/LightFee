@@ -27,6 +27,7 @@ pub(crate) struct WsBookQuote {
 #[derive(Clone, Debug, Default)]
 struct WsSymbolState {
     quote: Option<WsBookQuote>,
+    mark_price: Option<f64>,
     funding_rate: Option<f64>,
     funding_timestamp_ms: Option<i64>,
 }
@@ -75,6 +76,12 @@ impl WsMarketState {
         state.funding_timestamp_ms = Some(funding_timestamp_ms);
     }
 
+    pub(crate) fn update_mark_price(&self, symbol: &str, mark_price: f64) {
+        let mut symbols = self.symbols.write().expect("lock");
+        let state = symbols.entry(symbol.to_string()).or_default();
+        state.mark_price = Some(mark_price);
+    }
+
     pub(crate) fn quote(&self, symbol: &str) -> Option<WsBookQuote> {
         self.symbols
             .read()
@@ -103,6 +110,7 @@ impl WsMarketState {
             best_ask: quote.best_ask,
             bid_size: quote.bid_size,
             ask_size: quote.ask_size,
+            mark_price: state.mark_price,
             funding_rate,
             funding_timestamp_ms,
         })
@@ -271,6 +279,7 @@ pub(crate) fn merged_quote_snapshot(
         best_ask: quote.best_ask,
         bid_size: quote.bid_size,
         ask_size: quote.ask_size,
+        mark_price: None,
         funding_rate,
         funding_timestamp_ms,
     }

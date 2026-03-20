@@ -11,9 +11,9 @@ use lightfee::{
     config::{OpportunitySourceMode, RuntimeMode, StaggeredExitMode},
     strategy::discover_candidates,
     AppConfig, AssetTransferStatus, DirectedPairConfig, Engine, EngineMode, FundingOpportunityType,
-    MarketView, OpportunityHint, OpportunityHintSource, PersistenceConfig, RuntimeConfig,
-    ScriptedVenueAdapter, StrategyConfig, SymbolMarketSnapshot, TransferStatusView, Venue,
-    VenueAdapter, VenueConfig, VenueMarketSnapshot,
+    MarketView, OpportunityHint, OpportunityHintSource, OrderExecutionTiming, PersistenceConfig,
+    RuntimeConfig, ScriptedVenueAdapter, StrategyConfig, SymbolMarketSnapshot, TransferStatusView,
+    Venue, VenueAdapter, VenueConfig, VenueMarketSnapshot,
 };
 use serde_json::Value;
 use tempfile::TempDir;
@@ -313,6 +313,230 @@ async fn transfer_status_fetch_is_cached_between_ticks() {
 
     assert_eq!(*binance_calls.lock().expect("lock"), 1);
     assert_eq!(*okx_calls.lock().expect("lock"), 1);
+}
+
+#[tokio::test]
+async fn restart_restores_venue_health_snapshot_for_hyperliquid_gate() {
+    let temp = TempDir::new().expect("tempdir");
+    let mut config = test_config(&temp, true);
+    config.runtime.mode = RuntimeMode::Live;
+    config.runtime.max_order_quote_age_ms = 0;
+    config.strategy.hyperliquid_submit_ack_min_samples = 1;
+    config.strategy.hyperliquid_max_submit_ack_p95_ms = 500;
+    config.strategy.max_concurrent_positions = 1;
+    config.venues = vec![venue(Venue::Binance, 0.5), venue(Venue::Hyperliquid, 0.3)];
+    config.directed_pairs = vec![DirectedPairConfig {
+        long: Venue::Binance,
+        short: Venue::Hyperliquid,
+        symbols: vec!["BTCUSDT".to_string()],
+    }];
+
+    let binance = Arc::new(TimedFillAdapter::new(
+        Venue::Binance,
+        vec![
+            snapshot(
+                Venue::Binance,
+                0,
+                99.95,
+                100.0,
+                200.0,
+                200.0,
+                -0.0004,
+                60_000,
+            ),
+            snapshot(
+                Venue::Binance,
+                61_000,
+                99.95,
+                100.0,
+                200.0,
+                200.0,
+                -0.0004,
+                60_000,
+            ),
+        ],
+        None,
+    ));
+    let hyper = Arc::new(TimedFillAdapter::new(
+        Venue::Hyperliquid,
+        vec![
+            snapshot(
+                Venue::Hyperliquid,
+                0,
+                100.2,
+                100.25,
+                200.0,
+                200.0,
+                0.0010,
+                60_000,
+            ),
+            snapshot(
+                Venue::Hyperliquid,
+                61_000,
+                100.2,
+                100.25,
+                200.0,
+                200.0,
+                0.0010,
+                60_000,
+            ),
+        ],
+        Some(OrderExecutionTiming {
+            quote_resolve_ms: Some(1),
+            order_prepare_ms: Some(1),
+            submit_ack_ms: Some(1_500),
+        }),
+    ));
+
+    let mut engine = Engine::new(
+        config.clone(),
+        vec![
+            binance.clone() as Arc<dyn VenueAdapter>,
+            hyper.clone() as Arc<dyn VenueAdapter>,
+        ],
+    )
+    .await
+    .expect("engine");
+
+    engine.tick().await.expect("entry tick");
+    engine.tick().await.expect("exit tick");
+    assert!(engine.state().open_position.is_none());
+    drop(engine);
+
+    let mut restarted = Engine::new(
+        config,
+        vec![
+            Arc::new(TimedFillAdapter::new(
+                Venue::Binance,
+                vec![snapshot(
+                    Venue::Binance,
+                    0,
+                    99.95,
+                    100.0,
+                    200.0,
+                    200.0,
+                    -0.0004,
+                    60_000,
+                )],
+                None,
+            )) as Arc<dyn VenueAdapter>,
+            Arc::new(TimedFillAdapter::new(
+                Venue::Hyperliquid,
+                vec![snapshot(
+                    Venue::Hyperliquid,
+                    0,
+                    100.2,
+                    100.25,
+                    200.0,
+                    200.0,
+                    0.0010,
+                    60_000,
+                )],
+                None,
+            )) as Arc<dyn VenueAdapter>,
+        ],
+    )
+    .await
+    .expect("restart");
+    restarted.tick().await.expect("restart tick");
+
+    let best = restarted
+        .state()
+        .last_scan
+        .as_ref()
+        .and_then(|scan| scan.best_candidate.as_ref())
+        .expect("best candidate");
+    assert!(best
+        .blocked_reasons
+        .iter()
+        .any(|reason| reason.contains("hyperliquid_recent_submit_ack_p95_ms_above_limit")));
+}
+
+#[tokio::test]
+async fn restart_reuses_scan_symbol_cache_to_filter_requested_symbols() {
+    let temp = TempDir::new().expect("tempdir");
+    let mut config = test_config(&temp, false);
+    config.venues = vec![venue(Venue::Binance, 0.5), venue(Venue::Okx, 0.5)];
+    config.symbols = vec!["BTCUSDT".to_string(), "ETHUSDT".to_string()];
+    config.directed_pairs = vec![DirectedPairConfig {
+        long: Venue::Binance,
+        short: Venue::Okx,
+        symbols: config.symbols.clone(),
+    }];
+
+    let mut engine = Engine::new(
+        config.clone(),
+        vec![
+            Arc::new(ScriptedVenueAdapter::new(
+                Venue::Binance,
+                0.5,
+                vec![venue_snapshot(
+                    Venue::Binance,
+                    0,
+                    vec![
+                        symbol_snapshot("BTCUSDT", 100.0, 100.0, 200.0, 200.0, -0.0004, 60_000),
+                        symbol_snapshot("ETHUSDT", 110.0, 110.0, 200.0, 200.0, -0.0003, 60_000),
+                    ],
+                )],
+            )) as Arc<dyn VenueAdapter>,
+            Arc::new(ScriptedVenueAdapter::new(
+                Venue::Okx,
+                0.5,
+                vec![venue_snapshot(
+                    Venue::Okx,
+                    0,
+                    vec![symbol_snapshot(
+                        "BTCUSDT", 100.4, 100.4, 200.0, 200.0, 0.0010, 60_000,
+                    )],
+                )],
+            )) as Arc<dyn VenueAdapter>,
+        ],
+    )
+    .await
+    .expect("engine");
+    engine.tick().await.expect("seed cache tick");
+    drop(engine);
+
+    let mut restarted = Engine::new(
+        config.clone(),
+        vec![
+            Arc::new(StrictRequestedSymbolsAdapter::new(
+                Venue::Binance,
+                vec!["BTCUSDT".to_string()],
+                venue_snapshot(
+                    Venue::Binance,
+                    0,
+                    vec![symbol_snapshot(
+                        "BTCUSDT", 100.0, 100.0, 200.0, 200.0, -0.0004, 60_000,
+                    )],
+                ),
+            )) as Arc<dyn VenueAdapter>,
+            Arc::new(StrictRequestedSymbolsAdapter::new(
+                Venue::Okx,
+                vec!["BTCUSDT".to_string()],
+                venue_snapshot(
+                    Venue::Okx,
+                    0,
+                    vec![symbol_snapshot(
+                        "BTCUSDT", 100.4, 100.4, 200.0, 200.0, 0.0010, 60_000,
+                    )],
+                ),
+            )) as Arc<dyn VenueAdapter>,
+        ],
+    )
+    .await
+    .expect("restart");
+
+    restarted.tick().await.expect("cached scan tick");
+    assert_eq!(
+        restarted
+            .state()
+            .last_scan
+            .as_ref()
+            .expect("last scan")
+            .candidate_count,
+        1
+    );
 }
 
 #[test]
@@ -2024,6 +2248,7 @@ fn symbol_snapshot(
         best_ask,
         bid_size,
         ask_size,
+        mark_price: None,
         funding_rate,
         funding_timestamp_ms,
     }
@@ -2067,6 +2292,21 @@ struct CountingTransferAdapter {
 struct SoftFailingMarketAdapter {
     venue: Venue,
     error: String,
+}
+
+#[derive(Debug)]
+struct TimedFillAdapter {
+    venue: Venue,
+    snapshots: Mutex<Vec<VenueMarketSnapshot>>,
+    positions: Mutex<BTreeMap<String, f64>>,
+    timing: Option<OrderExecutionTiming>,
+}
+
+#[derive(Debug)]
+struct StrictRequestedSymbolsAdapter {
+    venue: Venue,
+    allowed_symbols: Vec<String>,
+    snapshot: VenueMarketSnapshot,
 }
 
 #[derive(Debug)]
@@ -2117,6 +2357,40 @@ impl SelectiveNormalizeAdapter {
             .get(symbol)
             .copied()
             .unwrap_or_default()
+    }
+}
+
+impl TimedFillAdapter {
+    fn new(
+        venue: Venue,
+        snapshots: Vec<VenueMarketSnapshot>,
+        timing: Option<OrderExecutionTiming>,
+    ) -> Self {
+        Self {
+            venue,
+            snapshots: Mutex::new(snapshots),
+            positions: Mutex::new(BTreeMap::new()),
+            timing,
+        }
+    }
+
+    fn current_snapshot(&self) -> VenueMarketSnapshot {
+        self.snapshots
+            .lock()
+            .expect("lock")
+            .first()
+            .cloned()
+            .expect("snapshot")
+    }
+}
+
+impl StrictRequestedSymbolsAdapter {
+    fn new(venue: Venue, allowed_symbols: Vec<String>, snapshot: VenueMarketSnapshot) -> Self {
+        Self {
+            venue,
+            allowed_symbols,
+            snapshot,
+        }
     }
 }
 
@@ -2269,6 +2543,123 @@ impl VenueAdapter for SoftFailingMarketAdapter {
             symbol: symbol.to_string(),
             size: 0.0,
             updated_at_ms: 0,
+        })
+    }
+}
+
+#[async_trait]
+impl VenueAdapter for TimedFillAdapter {
+    fn venue(&self) -> Venue {
+        self.venue
+    }
+
+    async fn fetch_market_snapshot(&self, symbols: &[String]) -> Result<VenueMarketSnapshot> {
+        let mut snapshots = self.snapshots.lock().expect("lock");
+        let snapshot = if snapshots.len() > 1 {
+            snapshots.remove(0)
+        } else {
+            snapshots.first().cloned().expect("snapshot")
+        };
+        let mut filtered = snapshot.clone();
+        if !symbols.is_empty() {
+            filtered
+                .symbols
+                .retain(|item| symbols.iter().any(|symbol| symbol == &item.symbol));
+        }
+        Ok(filtered)
+    }
+
+    async fn place_order(&self, request: lightfee::OrderRequest) -> Result<lightfee::OrderFill> {
+        let snapshot = self.current_snapshot();
+        let symbol = snapshot
+            .symbols
+            .iter()
+            .find(|item| item.symbol == request.symbol)
+            .expect("symbol snapshot");
+        let mut positions = self.positions.lock().expect("lock");
+        let position = positions.entry(request.symbol.clone()).or_default();
+        let mut quantity = request.quantity;
+        if request.reduce_only {
+            quantity = match request.side {
+                lightfee::Side::Buy if *position < 0.0 => (-*position).min(quantity),
+                lightfee::Side::Sell if *position > 0.0 => position.abs().min(quantity),
+                _ => 0.0,
+            };
+        }
+        *position += request.side.signed_qty(quantity);
+        Ok(lightfee::OrderFill {
+            venue: self.venue,
+            symbol: request.symbol,
+            side: request.side,
+            quantity,
+            average_price: match request.side {
+                lightfee::Side::Buy => symbol.best_ask,
+                lightfee::Side::Sell => symbol.best_bid,
+            },
+            fee_quote: 0.0,
+            order_id: format!("{}-timed", self.venue),
+            filled_at_ms: snapshot.observed_at_ms,
+            timing: self.timing.clone(),
+        })
+    }
+
+    async fn fetch_position(&self, symbol: &str) -> Result<lightfee::PositionSnapshot> {
+        Ok(lightfee::PositionSnapshot {
+            venue: self.venue,
+            symbol: symbol.to_string(),
+            size: self
+                .positions
+                .lock()
+                .expect("lock")
+                .get(symbol)
+                .copied()
+                .unwrap_or_default(),
+            updated_at_ms: self.current_snapshot().observed_at_ms,
+        })
+    }
+}
+
+#[async_trait]
+impl VenueAdapter for StrictRequestedSymbolsAdapter {
+    fn venue(&self) -> Venue {
+        self.venue
+    }
+
+    async fn fetch_market_snapshot(&self, symbols: &[String]) -> Result<VenueMarketSnapshot> {
+        if symbols
+            .iter()
+            .any(|symbol| !self.allowed_symbols.contains(symbol))
+        {
+            return Err(anyhow!(
+                "{} received uncached symbol request: {:?}",
+                self.venue,
+                symbols
+            ));
+        }
+
+        let mut filtered = self.snapshot.clone();
+        if !symbols.is_empty() {
+            filtered
+                .symbols
+                .retain(|item| symbols.iter().any(|symbol| symbol == &item.symbol));
+        }
+        Ok(filtered)
+    }
+
+    async fn place_order(&self, request: lightfee::OrderRequest) -> Result<lightfee::OrderFill> {
+        Err(anyhow!(
+            "{} should not place order for {}",
+            self.venue,
+            request.symbol
+        ))
+    }
+
+    async fn fetch_position(&self, symbol: &str) -> Result<lightfee::PositionSnapshot> {
+        Ok(lightfee::PositionSnapshot {
+            venue: self.venue,
+            symbol: symbol.to_string(),
+            size: 0.0,
+            updated_at_ms: self.snapshot.observed_at_ms,
         })
     }
 }

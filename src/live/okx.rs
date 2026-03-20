@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     sync::{Arc, Mutex},
 };
 
@@ -27,10 +27,11 @@ use crate::{
 
 use super::{
     base_asset, build_http_client, build_query, cache_is_fresh, enrich_fill_from_private,
-    estimate_fee_quote, floor_to_step, format_decimal, hinted_fill, hmac_sha256_base64,
-    iso8601_from_ms, load_json_cache, lookup_or_wait_private_order, merged_quote_snapshot, now_ms,
-    parse_f64, parse_i64, parse_text_message, quote_fill, spawn_ws_loop, store_json_cache,
-    venue_symbol, PrivateOrderUpdate, WsMarketState, WsPrivateState, SYMBOL_CACHE_TTL_MS,
+    estimate_fee_quote, filter_transfer_statuses, floor_to_step, format_decimal, hinted_fill,
+    hmac_sha256_base64, iso8601_from_ms, load_json_cache, lookup_or_wait_private_order,
+    merged_quote_snapshot, now_ms, parse_f64, parse_i64, parse_text_message, quote_fill,
+    spawn_ws_loop, store_json_cache, transfer_cache_ttl_ms, venue_symbol, PrivateOrderUpdate,
+    VenueTransferStatusCache, WsMarketState, WsPrivateState, SYMBOL_CACHE_TTL_MS,
 };
 
 const OKX_MAX_SUBSCRIBE_ARGS_PER_MESSAGE: usize = 100;
@@ -46,6 +47,7 @@ pub struct OkxLiveAdapter {
     time_offset_ms: Mutex<Option<i64>>,
     market_ws: Arc<WsMarketState>,
     private_ws: Arc<WsPrivateState>,
+    transfer_status_cache: Mutex<Option<VenueTransferStatusCache>>,
 }
 
 impl OkxLiveAdapter {
@@ -60,6 +62,8 @@ impl OkxLiveAdapter {
 
         let market_ws = WsMarketState::new();
         let persisted_catalog = load_json_cache::<OkxSymbolCatalogCache>("okx-symbols.json");
+        let persisted_transfer_cache =
+            load_json_cache::<VenueTransferStatusCache>("okx-transfer-status.json");
         let mut metadata = HashMap::new();
         let mut supported_symbols = HashSet::new();
         if let Some(cache) = persisted_catalog {
@@ -69,6 +73,13 @@ impl OkxLiveAdapter {
             metadata.extend(cache.metadata);
             supported_symbols.extend(cache.supported_symbols);
         }
+        let transfer_status_cache = persisted_transfer_cache.filter(|cache| {
+            cache_is_fresh(
+                cache.observed_at_ms,
+                now_ms(),
+                transfer_cache_ttl_ms(runtime.transfer_status_cache_ms),
+            )
+        });
         let adapter = Self {
             config: config.clone(),
             runtime: runtime.clone(),
@@ -84,6 +95,7 @@ impl OkxLiveAdapter {
             time_offset_ms: Mutex::new(None),
             market_ws,
             private_ws: WsPrivateState::new(),
+            transfer_status_cache: Mutex::new(transfer_status_cache),
         };
         if let Err(error) = adapter.refresh_symbol_catalog().await {
             if adapter.supported_symbols.lock().expect("lock").is_empty() {
@@ -129,12 +141,49 @@ impl OkxLiveAdapter {
         if !removed {
             return;
         }
+        self.persist_symbol_catalog();
         warn!(
             symbol,
             venue_symbol = %venue_symbol(&self.config, symbol),
             reason,
             "okx symbol removed from supported set"
         );
+    }
+
+    fn persist_symbol_catalog(&self) {
+        let metadata = self.metadata.lock().expect("lock").clone();
+        let supported_symbols = self
+            .supported_symbols
+            .lock()
+            .expect("lock")
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        store_json_cache(
+            "okx-symbols.json",
+            &OkxSymbolCatalogCache {
+                updated_at_ms: now_ms(),
+                supported_symbols,
+                metadata,
+            },
+        );
+    }
+
+    fn cached_transfer_statuses(
+        &self,
+        wanted: &BTreeSet<String>,
+        now_ms: i64,
+    ) -> Option<Vec<AssetTransferStatus>> {
+        let cache = self.transfer_status_cache.lock().expect("lock");
+        let cache = cache.as_ref()?;
+        if !cache_is_fresh(
+            cache.observed_at_ms,
+            now_ms,
+            transfer_cache_ttl_ms(self.runtime.transfer_status_cache_ms),
+        ) {
+            return None;
+        }
+        Some(filter_transfer_statuses(cache, wanted))
     }
 
     fn start_market_ws(&self, symbols: &[String]) {
@@ -500,7 +549,7 @@ impl OkxLiveAdapter {
     }
 
     async fn refresh_symbol_catalog(&self) -> Result<()> {
-        let instrument_map = fetch_okx_instrument_meta_map(&self.client, &self.base_url).await?;
+        let instrument_map = self.fetch_instrument_meta_map().await?;
         let mut metadata = HashMap::new();
         let mut supported_symbols = HashSet::new();
         for (instrument_id, meta) in instrument_map {
@@ -519,6 +568,42 @@ impl OkxLiveAdapter {
         *self.metadata.lock().expect("lock") = metadata;
         *self.supported_symbols.lock().expect("lock") = supported_symbols;
         Ok(())
+    }
+
+    async fn fetch_instrument_meta_map(&self) -> Result<HashMap<String, OkxInstrumentMeta>> {
+        if self.config.live.resolved_api_key().is_some()
+            && self.config.live.resolved_api_secret().is_some()
+            && self.config.live.resolved_api_passphrase().is_some()
+        {
+            let query = Some(build_query(&[("instType", "SWAP".to_string())]));
+            match self
+                .signed_request(
+                    reqwest::Method::GET,
+                    "/api/v5/account/instruments",
+                    query,
+                    None,
+                )
+                .await
+            {
+                Ok(response) => {
+                    let response = response
+                        .json::<OkxApiResponse<OkxInstrument>>()
+                        .await
+                        .context("failed to decode okx account instruments")?;
+                    let response =
+                        ensure_okx_api_success("okx account instruments failed", response)?;
+                    return okx_instrument_meta_map_from_rows(response.data);
+                }
+                Err(error) => {
+                    warn!(
+                        ?error,
+                        "okx account instruments fetch failed; falling back to public instruments"
+                    );
+                }
+            }
+        }
+
+        fetch_okx_public_instrument_meta_map(&self.client, &self.base_url).await
     }
 
     async fn position_mode(&self) -> Result<OkxPositionMode> {
@@ -608,6 +693,7 @@ impl OkxLiveAdapter {
             best_ask: parse_f64(&best_ask[0])?,
             bid_size: parse_f64(&best_bid[1])? * meta.ct_val,
             ask_size: parse_f64(&best_ask[1])? * meta.ct_val,
+            mark_price: None,
             funding_rate: parse_f64(&funding.funding_rate)?,
             funding_timestamp_ms: parse_i64(&funding.next_funding_time)?,
         })
@@ -720,11 +806,35 @@ fn format_okx_http_error(status: reqwest::StatusCode, body: &str) -> anyhow::Err
 
 fn format_okx_order_ack_error(ack: &OkxOrderAck) -> anyhow::Error {
     anyhow!(
-        "okx order rejected: s_code={} s_msg={} ord_id={}",
+        "okx order rejected: s_code={} s_msg={} ord_id={} cl_ord_id={} tag={}",
         ack.s_code.as_deref().unwrap_or("unknown"),
         ack.s_msg.as_deref().unwrap_or("unknown"),
-        ack.ord_id.as_deref().unwrap_or("unknown")
+        ack.ord_id.as_deref().unwrap_or("unknown"),
+        ack.cl_ord_id.as_deref().unwrap_or("unknown"),
+        ack.tag.as_deref().unwrap_or("unknown")
     )
+}
+
+fn format_okx_order_response_error(
+    context: &str,
+    response: &OkxApiResponse<OkxOrderAck>,
+) -> anyhow::Error {
+    let top_code = response.code.as_deref().unwrap_or("unknown");
+    let top_msg = response.msg.as_deref().unwrap_or("unknown");
+    if let Some(ack) = response.data.first() {
+        return anyhow!(
+            "{context}: code={} msg={} s_code={} s_msg={} ord_id={} cl_ord_id={} tag={}",
+            top_code,
+            top_msg,
+            ack.s_code.as_deref().unwrap_or("unknown"),
+            ack.s_msg.as_deref().unwrap_or("unknown"),
+            ack.ord_id.as_deref().unwrap_or("unknown"),
+            ack.cl_ord_id.as_deref().unwrap_or("unknown"),
+            ack.tag.as_deref().unwrap_or("unknown")
+        );
+    }
+
+    anyhow!("{context}: code={} msg={}", top_code, top_msg)
 }
 
 fn ensure_okx_api_success<T>(
@@ -802,15 +912,11 @@ impl VenueAdapter for OkxLiveAdapter {
     }
 
     async fn place_order(&self, request: OrderRequest) -> Result<OrderFill> {
+        ensure_okx_client_order_id(&request.client_order_id)?;
         let meta = self.symbol_meta(&request.symbol).await?;
         let position_mode = self.position_mode().await?;
         let contracts = floor_to_step(request.quantity / meta.ct_val, meta.lot_sz);
-        if contracts <= 0.0 {
-            return Err(anyhow!(
-                "okx order contracts rounded to zero for {}",
-                request.symbol
-            ));
-        }
+        validate_okx_order_request(&meta, &request.symbol, contracts)?;
 
         let body = serde_json::json!({
             "instId": venue_symbol(&self.config, &request.symbol),
@@ -837,7 +943,12 @@ impl VenueAdapter for OkxLiveAdapter {
             .json::<OkxApiResponse<OkxOrderAck>>()
             .await
             .context("failed to decode okx order ack")?;
-        let response = ensure_okx_api_success("okx order ack failed", response)?;
+        if response.code.as_deref().is_some_and(|code| code != "0") {
+            return Err(format_okx_order_response_error(
+                "okx order ack failed",
+                &response,
+            ));
+        }
         let ack = response
             .data
             .into_iter()
@@ -994,9 +1105,13 @@ impl VenueAdapter for OkxLiveAdapter {
         let wanted = assets
             .iter()
             .map(|asset| base_asset(asset))
-            .collect::<std::collections::BTreeSet<_>>();
+            .collect::<BTreeSet<_>>();
         if wanted.is_empty() {
             return Ok(Vec::new());
+        }
+        let observed_at_ms = now_ms();
+        if let Some(statuses) = self.cached_transfer_statuses(&wanted, observed_at_ms) {
+            return Ok(statuses);
         }
 
         let query = build_query(&[("ccy", wanted.iter().cloned().collect::<Vec<_>>().join(","))]);
@@ -1012,9 +1127,7 @@ impl VenueAdapter for OkxLiveAdapter {
             .await
             .context("failed to decode okx currencies")?;
         let response = ensure_okx_api_success("okx currencies failed", response)?;
-        let observed_at_ms = now_ms();
-
-        Ok(response
+        let statuses = response
             .data
             .into_iter()
             .fold(
@@ -1035,7 +1148,21 @@ impl VenueAdapter for OkxLiveAdapter {
                 },
             )
             .into_values()
-            .collect())
+            .collect::<Vec<_>>();
+        let cache = VenueTransferStatusCache {
+            observed_at_ms,
+            statuses: statuses.clone(),
+        };
+        store_json_cache("okx-transfer-status.json", &cache);
+        self.transfer_status_cache
+            .lock()
+            .expect("lock")
+            .replace(cache);
+        Ok(statuses)
+    }
+
+    fn supported_symbols(&self, requested_symbols: &[String]) -> Option<Vec<String>> {
+        Some(self.tracked_symbols(requested_symbols))
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -1049,6 +1176,8 @@ impl VenueAdapter for OkxLiveAdapter {
 struct OkxInstrumentMeta {
     ct_val: f64,
     lot_sz: f64,
+    min_sz: Option<f64>,
+    max_mkt_sz: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1081,6 +1210,10 @@ struct OkxInstrument {
     ct_val: String,
     #[serde(rename = "lotSz")]
     lot_sz: String,
+    #[serde(rename = "minSz")]
+    min_sz: Option<String>,
+    #[serde(rename = "maxMktSz")]
+    max_mkt_sz: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1108,10 +1241,13 @@ struct OkxServerTime {
 struct OkxOrderAck {
     #[serde(rename = "ordId")]
     ord_id: Option<String>,
+    #[serde(rename = "clOrdId")]
+    cl_ord_id: Option<String>,
     #[serde(rename = "sCode")]
     s_code: Option<String>,
     #[serde(rename = "sMsg")]
     s_msg: Option<String>,
+    tag: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1199,7 +1335,35 @@ fn okx_ct_val_map_from_cached_metadata(
     map
 }
 
-async fn fetch_okx_instrument_meta_map(
+fn okx_instrument_meta_map_from_rows(
+    instruments: Vec<OkxInstrument>,
+) -> Result<HashMap<String, OkxInstrumentMeta>> {
+    let mut map = HashMap::new();
+    for instrument in instruments {
+        map.insert(
+            instrument.inst_id,
+            OkxInstrumentMeta {
+                ct_val: parse_f64(&instrument.ct_val)?,
+                lot_sz: parse_f64(&instrument.lot_sz)?,
+                min_sz: instrument
+                    .min_sz
+                    .as_deref()
+                    .filter(|value| !value.is_empty())
+                    .map(parse_f64)
+                    .transpose()?,
+                max_mkt_sz: instrument
+                    .max_mkt_sz
+                    .as_deref()
+                    .filter(|value| !value.is_empty())
+                    .map(parse_f64)
+                    .transpose()?,
+            },
+        );
+    }
+    Ok(map)
+}
+
+async fn fetch_okx_public_instrument_meta_map(
     client: &Client,
     base_url: &str,
 ) -> Result<HashMap<String, OkxInstrumentMeta>> {
@@ -1214,17 +1378,7 @@ async fn fetch_okx_instrument_meta_map(
         .json::<OkxApiResponse<OkxInstrument>>()
         .await
         .context("failed to decode okx instruments")?;
-    let mut map = HashMap::new();
-    for instrument in response.data {
-        map.insert(
-            instrument.inst_id,
-            OkxInstrumentMeta {
-                ct_val: parse_f64(&instrument.ct_val)?,
-                lot_sz: parse_f64(&instrument.lot_sz)?,
-            },
-        );
-    }
-    Ok(map)
+    okx_instrument_meta_map_from_rows(response.data)
 }
 
 fn okx_symbol_key(inst_id: &str) -> String {
@@ -1416,13 +1570,67 @@ struct OkxCurrency {
     can_wd: bool,
 }
 
+fn ensure_okx_client_order_id(client_order_id: &str) -> Result<()> {
+    if client_order_id.is_empty() {
+        return Err(anyhow!("okx client order id must not be empty"));
+    }
+    if client_order_id.len() > 32 {
+        return Err(anyhow!(
+            "okx client order id too long: {} > 32",
+            client_order_id.len()
+        ));
+    }
+    if !client_order_id.chars().all(|ch| ch.is_ascii_alphanumeric()) {
+        return Err(anyhow!(
+            "okx client order id must be alphanumeric: {client_order_id}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_okx_order_request(
+    meta: &OkxInstrumentMeta,
+    symbol: &str,
+    contracts: f64,
+) -> Result<()> {
+    if contracts <= 0.0 {
+        return Err(anyhow!(
+            "okx order contracts rounded to zero for {}",
+            symbol
+        ));
+    }
+    if let Some(min_sz) = meta.min_sz {
+        if contracts < min_sz {
+            return Err(anyhow!(
+                "okx order contracts {} below min sz {} for {}",
+                contracts,
+                min_sz,
+                symbol
+            ));
+        }
+    }
+    if let Some(max_mkt_sz) = meta.max_mkt_sz {
+        if contracts > max_mkt_sz {
+            return Err(anyhow!(
+                "okx order contracts {} above max market sz {} for {}",
+                contracts,
+                max_mkt_sz,
+                symbol
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
 
     use super::{
-        build_okx_private_subscribe_messages, build_okx_subscribe_messages, format_okx_http_error,
-        format_okx_order_ack_error, okx_pos_side, prune_okx_symbol_catalog_entry,
+        build_okx_private_subscribe_messages, build_okx_subscribe_messages,
+        ensure_okx_client_order_id, format_okx_http_error, format_okx_order_ack_error,
+        format_okx_order_response_error, okx_instrument_meta_map_from_rows, okx_pos_side,
+        prune_okx_symbol_catalog_entry, validate_okx_order_request, OkxApiResponse, OkxInstrument,
         OkxInstrumentMeta, OkxOrderAck, OkxPositionMode, OKX_MAX_SUBSCRIBE_ARGS_PER_MESSAGE,
     };
     use crate::models::Side;
@@ -1484,6 +1692,8 @@ mod tests {
             OkxInstrumentMeta {
                 ct_val: 1.0,
                 lot_sz: 0.1,
+                min_sz: None,
+                max_mkt_sz: None,
             },
         )]);
         let mut supported_symbols = HashSet::from(["ARCUSDT".to_string(), "BTCUSDT".to_string()]);
@@ -1495,6 +1705,54 @@ mod tests {
         assert!(!metadata.contains_key("ARCUSDT"));
         assert!(!supported_symbols.contains("ARCUSDT"));
         assert!(supported_symbols.contains("BTCUSDT"));
+    }
+
+    #[test]
+    fn client_order_id_validation_rejects_non_alphanumeric_values() {
+        let error = ensure_okx_client_order_id("lf-el-123").expect_err("reject invalid chars");
+        assert!(error.to_string().contains("alphanumeric"));
+    }
+
+    #[test]
+    fn client_order_id_validation_rejects_overlong_values() {
+        let error = ensure_okx_client_order_id(&"a".repeat(33)).expect_err("reject long id");
+        assert!(error.to_string().contains("too long"));
+    }
+
+    #[test]
+    fn order_validation_applies_contract_size_constraints() {
+        let meta = OkxInstrumentMeta {
+            ct_val: 1.0,
+            lot_sz: 0.1,
+            min_sz: Some(1.0),
+            max_mkt_sz: Some(5.0),
+        };
+        assert!(validate_okx_order_request(&meta, "ETHUSDT", 2.0).is_ok());
+        assert!(validate_okx_order_request(&meta, "ETHUSDT", 0.5)
+            .expect_err("below min")
+            .to_string()
+            .contains("below min sz"));
+        assert!(validate_okx_order_request(&meta, "ETHUSDT", 6.0)
+            .expect_err("above max")
+            .to_string()
+            .contains("above max market sz"));
+    }
+
+    #[test]
+    fn instrument_meta_map_parses_account_level_size_constraints() {
+        let map = okx_instrument_meta_map_from_rows(vec![OkxInstrument {
+            inst_id: "ETH-USDT-SWAP".to_string(),
+            ct_val: "0.01".to_string(),
+            lot_sz: "1".to_string(),
+            min_sz: Some("2".to_string()),
+            max_mkt_sz: Some("1000".to_string()),
+        }])
+        .expect("parse meta map");
+        let meta = map.get("ETH-USDT-SWAP").expect("instrument");
+        assert_eq!(meta.ct_val, 0.01);
+        assert_eq!(meta.lot_sz, 1.0);
+        assert_eq!(meta.min_sz, Some(2.0));
+        assert_eq!(meta.max_mkt_sz, Some(1000.0));
     }
 
     #[test]
@@ -1513,12 +1771,40 @@ mod tests {
     fn order_ack_error_includes_exchange_code_and_message() {
         let error = format_okx_order_ack_error(&OkxOrderAck {
             ord_id: Some("123".to_string()),
+            cl_ord_id: Some("cid-123".to_string()),
             s_code: Some("51008".to_string()),
             s_msg: Some("Order failed due to margin".to_string()),
+            tag: Some("alpha".to_string()),
         });
         let rendered = error.to_string();
         assert!(rendered.contains("s_code=51008"));
         assert!(rendered.contains("Order failed due to margin"));
         assert!(rendered.contains("ord_id=123"));
+        assert!(rendered.contains("cl_ord_id=cid-123"));
+        assert!(rendered.contains("tag=alpha"));
+    }
+
+    #[test]
+    fn top_level_order_ack_failure_includes_row_level_details() {
+        let error = format_okx_order_response_error(
+            "okx order ack failed",
+            &OkxApiResponse {
+                code: Some("1".to_string()),
+                msg: Some("All operations failed".to_string()),
+                data: vec![OkxOrderAck {
+                    ord_id: None,
+                    cl_ord_id: Some("cid-abc".to_string()),
+                    s_code: Some("51008".to_string()),
+                    s_msg: Some("Insufficient margin".to_string()),
+                    tag: Some("alpha".to_string()),
+                }],
+            },
+        );
+        let rendered = error.to_string();
+        assert!(rendered.contains("code=1"));
+        assert!(rendered.contains("All operations failed"));
+        assert!(rendered.contains("s_code=51008"));
+        assert!(rendered.contains("Insufficient margin"));
+        assert!(rendered.contains("cl_ord_id=cid-abc"));
     }
 }

@@ -188,6 +188,7 @@ mod tests {
             reduce_only: false,
             client_order_id: "test".to_string(),
             price_hint: Some(123.45),
+            mark_price_hint: None,
             observed_at_ms: Some(9_999),
         };
 

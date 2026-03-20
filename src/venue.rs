@@ -38,6 +38,10 @@ pub trait VenueAdapter: Send + Sync {
         Ok(Vec::new())
     }
 
+    fn supported_symbols(&self, _requested_symbols: &[String]) -> Option<Vec<String>> {
+        None
+    }
+
     async fn shutdown(&self) -> Result<()> {
         Ok(())
     }

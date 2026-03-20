@@ -166,6 +166,9 @@ async fn main() -> Result<()> {
         price_hint: market
             .symbol(candidate.short_venue, &candidate.symbol)
             .map(|quote| quote.best_bid),
+        mark_price_hint: market
+            .symbol(candidate.short_venue, &candidate.symbol)
+            .and_then(|quote| quote.mark_price),
         observed_at_ms: market.observed_at_ms(candidate.short_venue),
     };
     let long_open = OrderRequest {
@@ -177,6 +180,9 @@ async fn main() -> Result<()> {
         price_hint: market
             .symbol(candidate.long_venue, &candidate.symbol)
             .map(|quote| quote.best_ask),
+        mark_price_hint: market
+            .symbol(candidate.long_venue, &candidate.symbol)
+            .and_then(|quote| quote.mark_price),
         observed_at_ms: market.observed_at_ms(candidate.long_venue),
     };
 
@@ -203,6 +209,7 @@ async fn main() -> Result<()> {
                     reduce_only: true,
                     client_order_id: smoke_order_id(request_id_seed, candidate.short_venue, "cp"),
                     price_hint: Some(short_fill.average_price),
+                    mark_price_hint: None,
                     observed_at_ms: Some(short_fill.filled_at_ms),
                 };
                 let _ = adapter(&adapters, candidate.short_venue)?
@@ -225,6 +232,7 @@ async fn main() -> Result<()> {
         reduce_only: true,
         client_order_id: smoke_order_id(request_id_seed, candidate.short_venue, "cs"),
         price_hint: Some(short_fill.average_price),
+        mark_price_hint: None,
         observed_at_ms: Some(short_fill.filled_at_ms),
     };
     let long_close = OrderRequest {
@@ -234,6 +242,7 @@ async fn main() -> Result<()> {
         reduce_only: true,
         client_order_id: smoke_order_id(request_id_seed, candidate.long_venue, "cl"),
         price_hint: Some(long_fill.average_price),
+        mark_price_hint: None,
         observed_at_ms: Some(long_fill.filled_at_ms),
     };
 
@@ -528,6 +537,7 @@ async fn flatten_open_positions(
                 reduce_only: true,
                 client_order_id: smoke_order_id(seed_ms, adapter.venue(), "fx"),
                 price_hint: None,
+                mark_price_hint: None,
                 observed_at_ms: None,
             };
             let (fill, latency) = timed_place_order(adapter.clone(), request)
