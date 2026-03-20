@@ -473,9 +473,10 @@ impl BybitLiveAdapter {
                 .await
                 .context("failed to decode bybit instruments info")?;
             if response.ret_code != 0 {
-                return Err(anyhow!(
-                    "bybit instruments info failed: {}",
-                    response.ret_msg
+                return Err(format_bybit_api_error(
+                    "bybit instruments info failed",
+                    response.ret_code,
+                    &response.ret_msg,
                 ));
             }
             let result = response.result.unwrap_or_default();
@@ -528,7 +529,11 @@ impl BybitLiveAdapter {
             .await
             .context("failed to decode bybit tickers")?;
         if response.ret_code != 0 {
-            return Err(anyhow!("bybit tickers failed: {}", response.ret_msg));
+            return Err(format_bybit_api_error(
+                "bybit tickers failed",
+                response.ret_code,
+                &response.ret_msg,
+            ));
         }
         let Some(ticker) = response
             .result
@@ -604,12 +609,16 @@ impl BybitLiveAdapter {
             request
         };
 
-        request
+        let response = request
             .send()
             .await
-            .context("failed to send signed bybit request")?
-            .error_for_status()
-            .context("bybit private endpoint returned non-success status")
+            .context("failed to send signed bybit request")?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(format_bybit_http_error(status, &body));
+        }
+        Ok(response)
     }
 
     async fn server_timestamp_ms(&self) -> Result<i64> {
@@ -629,7 +638,11 @@ impl BybitLiveAdapter {
             .await
             .context("failed to decode bybit server time")?;
         if response.ret_code != 0 {
-            return Err(anyhow!("bybit server time failed: {}", response.ret_msg));
+            return Err(format_bybit_api_error(
+                "bybit server time failed",
+                response.ret_code,
+                &response.ret_msg,
+            ));
         }
         let server_time = response
             .time
@@ -643,6 +656,34 @@ impl BybitLiveAdapter {
         self.time_offset_ms.lock().expect("lock").replace(offset_ms);
         Ok(now_ms() + offset_ms)
     }
+}
+
+fn format_bybit_http_error(status: reqwest::StatusCode, body: &str) -> anyhow::Error {
+    let trimmed = body.trim();
+    if let Ok(payload) = serde_json::from_str::<BybitErrorPayload>(trimmed) {
+        return anyhow!(
+            "bybit private endpoint returned non-success status: status={} ret_code={} ret_msg={}",
+            status,
+            payload.ret_code,
+            payload.ret_msg
+        );
+    }
+    if trimmed.is_empty() {
+        anyhow!(
+            "bybit private endpoint returned non-success status: status={}",
+            status
+        )
+    } else {
+        anyhow!(
+            "bybit private endpoint returned non-success status: status={} body={}",
+            status,
+            trimmed
+        )
+    }
+}
+
+fn format_bybit_api_error(context: &str, ret_code: i64, ret_msg: &str) -> anyhow::Error {
+    anyhow!("{context}: ret_code={ret_code} ret_msg={ret_msg}")
 }
 
 fn prune_bybit_symbol_catalog_entry(
@@ -728,7 +769,11 @@ impl VenueAdapter for BybitLiveAdapter {
             .await
             .context("failed to decode bybit order response")?;
         if response.ret_code != 0 {
-            return Err(anyhow!("bybit order failed: {}", response.ret_msg));
+            return Err(format_bybit_api_error(
+                "bybit order failed",
+                response.ret_code,
+                &response.ret_msg,
+            ));
         }
         let order_id = response
             .result
@@ -829,7 +874,11 @@ impl VenueAdapter for BybitLiveAdapter {
         let response = response
             .ok_or_else(|| last_error.unwrap_or_else(|| anyhow!("bybit position query failed")))?;
         if response.ret_code != 0 {
-            return Err(anyhow!("bybit position query failed: {}", response.ret_msg));
+            return Err(format_bybit_api_error(
+                "bybit position query failed",
+                response.ret_code,
+                &response.ret_msg,
+            ));
         }
         let size = response
             .result
@@ -886,7 +935,11 @@ impl VenueAdapter for BybitLiveAdapter {
             .await
             .context("failed to decode bybit coin info")?;
         if response.ret_code != 0 {
-            return Err(anyhow!("bybit coin info failed: {}", response.ret_msg));
+            return Err(format_bybit_api_error(
+                "bybit coin info failed",
+                response.ret_code,
+                &response.ret_msg,
+            ));
         }
 
         let cache = build_bybit_transfer_status_cache(
@@ -1145,6 +1198,14 @@ struct BybitApiResponse<T> {
 }
 
 #[derive(Debug, Deserialize)]
+struct BybitErrorPayload {
+    #[serde(rename = "retCode")]
+    ret_code: i64,
+    #[serde(rename = "retMsg")]
+    ret_msg: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct BybitServerTimeResult {
     #[serde(rename = "timeNano")]
     time_nano: String,
@@ -1319,8 +1380,8 @@ mod tests {
 
     use super::{
         build_bybit_transfer_status_cache, bybit_transfer_status_cache_is_fresh,
-        filter_bybit_transfer_statuses, prune_bybit_symbol_catalog_entry, BybitCoinChain,
-        BybitCoinInfo, BybitInstrumentMeta,
+        filter_bybit_transfer_statuses, format_bybit_api_error, format_bybit_http_error,
+        prune_bybit_symbol_catalog_entry, BybitCoinChain, BybitCoinInfo, BybitInstrumentMeta,
     };
 
     #[test]
@@ -1384,5 +1445,26 @@ mod tests {
         assert!(!metadata.contains_key("FETUSDT"));
         assert!(!supported_symbols.contains("FETUSDT"));
         assert!(supported_symbols.contains("BTCUSDT"));
+    }
+
+    #[test]
+    fn private_http_error_includes_status_code_and_exchange_message() {
+        let error = format_bybit_http_error(
+            reqwest::StatusCode::FORBIDDEN,
+            r#"{"retCode":10005,"retMsg":"Permission denied"}"#,
+        );
+        let rendered = error.to_string();
+        assert!(rendered.contains("status=403 Forbidden"));
+        assert!(rendered.contains("ret_code=10005"));
+        assert!(rendered.contains("Permission denied"));
+    }
+
+    #[test]
+    fn api_error_includes_context_and_exchange_code() {
+        let error = format_bybit_api_error("order failed", 110003, "order price exceeds limit");
+        let rendered = error.to_string();
+        assert!(rendered.contains("order failed"));
+        assert!(rendered.contains("ret_code=110003"));
+        assert!(rendered.contains("order price exceeds limit"));
     }
 }

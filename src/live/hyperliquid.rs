@@ -1150,7 +1150,10 @@ fn decode_ws_post_action_response(
             .context("failed to decode hyperliquid ws action payload"),
         "error" => Err(anyhow!(
             "hyperliquid ws post error: {}",
-            payload.as_str().unwrap_or("unknown")
+            payload
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| payload.to_string())
         )),
         other => Err(anyhow!(
             "unexpected hyperliquid ws post response type {other}"
@@ -1485,6 +1488,29 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("request id"));
         assert!(message.contains("256"));
+    }
+
+    #[test]
+    fn ws_post_action_response_error_includes_raw_payload() {
+        let response = json!({
+            "channel": "post",
+            "data": {
+                "id": 256,
+                "response": {
+                    "type": "error",
+                    "payload": {
+                        "code": "BadAloPx",
+                        "message": "Post only order would cross"
+                    }
+                }
+            }
+        });
+
+        let error = decode_ws_post_action_response(256, &response).expect_err("error payload");
+        let message = error.to_string();
+        assert!(message.contains("hyperliquid ws post error"));
+        assert!(message.contains("BadAloPx"));
+        assert!(message.contains("Post only order would cross"));
     }
 
     #[test]

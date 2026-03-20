@@ -532,6 +532,7 @@ impl OkxLiveAdapter {
             .json::<OkxApiResponse<OkxAccountConfig>>()
             .await
             .context("failed to decode okx account config")?;
+        let response = ensure_okx_api_success("okx account config failed", response)?;
         let mode = response
             .data
             .into_iter()
@@ -569,6 +570,7 @@ impl OkxLiveAdapter {
             .json::<OkxApiResponse<OkxBook>>()
             .await
             .context("failed to decode okx order book")?;
+        let book = ensure_okx_api_success("okx order book failed", book)?;
         let funding = self
             .client
             .get(format!("{}/api/v5/public/funding-rate", self.base_url))
@@ -581,6 +583,7 @@ impl OkxLiveAdapter {
             .json::<OkxApiResponse<OkxFundingRate>>()
             .await
             .context("failed to decode okx funding rate")?;
+        let funding = ensure_okx_api_success("okx funding rate failed", funding)?;
         let book = book
             .data
             .into_iter()
@@ -678,13 +681,64 @@ impl OkxLiveAdapter {
             request
         };
 
-        request
+        let response = request
             .send()
             .await
-            .context("failed to send signed okx request")?
-            .error_for_status()
-            .context("okx private endpoint returned non-success status")
+            .context("failed to send signed okx request")?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(format_okx_http_error(status, &body));
+        }
+        Ok(response)
     }
+}
+
+fn format_okx_http_error(status: reqwest::StatusCode, body: &str) -> anyhow::Error {
+    let trimmed = body.trim();
+    if let Ok(payload) = serde_json::from_str::<OkxErrorPayload>(trimmed) {
+        return anyhow!(
+            "okx private endpoint returned non-success status: status={} code={} msg={}",
+            status,
+            payload.code,
+            payload.msg
+        );
+    }
+    if trimmed.is_empty() {
+        anyhow!(
+            "okx private endpoint returned non-success status: status={}",
+            status
+        )
+    } else {
+        anyhow!(
+            "okx private endpoint returned non-success status: status={} body={}",
+            status,
+            trimmed
+        )
+    }
+}
+
+fn format_okx_order_ack_error(ack: &OkxOrderAck) -> anyhow::Error {
+    anyhow!(
+        "okx order rejected: s_code={} s_msg={} ord_id={}",
+        ack.s_code.as_deref().unwrap_or("unknown"),
+        ack.s_msg.as_deref().unwrap_or("unknown"),
+        ack.ord_id.as_deref().unwrap_or("unknown")
+    )
+}
+
+fn ensure_okx_api_success<T>(
+    context: &str,
+    response: OkxApiResponse<T>,
+) -> Result<OkxApiResponse<T>> {
+    if response.code.as_deref().is_some_and(|code| code != "0") {
+        return Err(anyhow!(
+            "{context}: code={} msg={}",
+            response.code.as_deref().unwrap_or("unknown"),
+            response.msg.as_deref().unwrap_or("unknown")
+        ));
+    }
+    Ok(response)
 }
 
 fn is_missing_okx_instrument_meta(error: &anyhow::Error) -> bool {
@@ -783,16 +837,14 @@ impl VenueAdapter for OkxLiveAdapter {
             .json::<OkxApiResponse<OkxOrderAck>>()
             .await
             .context("failed to decode okx order ack")?;
+        let response = ensure_okx_api_success("okx order ack failed", response)?;
         let ack = response
             .data
             .into_iter()
             .next()
             .ok_or_else(|| anyhow!("okx order ack missing row"))?;
         if ack.s_code.as_deref().unwrap_or("0") != "0" {
-            return Err(anyhow!(
-                "okx order rejected: {}",
-                ack.s_msg.unwrap_or_else(|| "unknown error".to_string())
-            ));
+            return Err(format_okx_order_ack_error(&ack));
         }
 
         let (average_price, filled_at_ms) = if let Some(fill) = hinted_fill(&request) {
@@ -866,6 +918,7 @@ impl VenueAdapter for OkxLiveAdapter {
             .json::<OkxApiResponse<OkxPosition>>()
             .await
             .context("failed to decode okx positions")?;
+        let response = ensure_okx_api_success("okx positions failed", response)?;
         let meta = self.symbol_meta(symbol).await?;
         let size = response.data.into_iter().try_fold(0.0, |acc, position| {
             let contracts = parse_f64(&position.pos)?;
@@ -897,6 +950,7 @@ impl VenueAdapter for OkxLiveAdapter {
             .json::<OkxApiResponse<OkxPosition>>()
             .await
             .context("failed to decode okx positions")?;
+        let response = ensure_okx_api_success("okx positions failed", response)?;
 
         let metadata = self.metadata.lock().expect("lock").clone();
         let mut positions_by_symbol = HashMap::new();
@@ -957,6 +1011,7 @@ impl VenueAdapter for OkxLiveAdapter {
             .json::<OkxApiResponse<OkxCurrency>>()
             .await
             .context("failed to decode okx currencies")?;
+        let response = ensure_okx_api_success("okx currencies failed", response)?;
         let observed_at_ms = now_ms();
 
         Ok(response
@@ -1005,7 +1060,17 @@ struct OkxSymbolCatalogCache {
 
 #[derive(Debug, Deserialize)]
 struct OkxApiResponse<T> {
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    msg: Option<String>,
     data: Vec<T>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OkxErrorPayload {
+    code: String,
+    msg: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1356,9 +1421,9 @@ mod tests {
     use std::collections::{HashMap, HashSet};
 
     use super::{
-        build_okx_private_subscribe_messages, build_okx_subscribe_messages, okx_pos_side,
-        prune_okx_symbol_catalog_entry, OkxInstrumentMeta, OkxPositionMode,
-        OKX_MAX_SUBSCRIBE_ARGS_PER_MESSAGE,
+        build_okx_private_subscribe_messages, build_okx_subscribe_messages, format_okx_http_error,
+        format_okx_order_ack_error, okx_pos_side, prune_okx_symbol_catalog_entry,
+        OkxInstrumentMeta, OkxOrderAck, OkxPositionMode, OKX_MAX_SUBSCRIBE_ARGS_PER_MESSAGE,
     };
     use crate::models::Side;
 
@@ -1430,5 +1495,30 @@ mod tests {
         assert!(!metadata.contains_key("ARCUSDT"));
         assert!(!supported_symbols.contains("ARCUSDT"));
         assert!(supported_symbols.contains("BTCUSDT"));
+    }
+
+    #[test]
+    fn private_http_error_includes_status_code_and_exchange_message() {
+        let error = format_okx_http_error(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            r#"{"code":"50011","msg":"Requests too frequent."}"#,
+        );
+        let rendered = error.to_string();
+        assert!(rendered.contains("status=429 Too Many Requests"));
+        assert!(rendered.contains("code=50011"));
+        assert!(rendered.contains("Requests too frequent"));
+    }
+
+    #[test]
+    fn order_ack_error_includes_exchange_code_and_message() {
+        let error = format_okx_order_ack_error(&OkxOrderAck {
+            ord_id: Some("123".to_string()),
+            s_code: Some("51008".to_string()),
+            s_msg: Some("Order failed due to margin".to_string()),
+        });
+        let rendered = error.to_string();
+        assert!(rendered.contains("s_code=51008"));
+        assert!(rendered.contains("Order failed due to margin"));
+        assert!(rendered.contains("ord_id=123"));
     }
 }
