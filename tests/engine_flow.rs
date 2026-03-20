@@ -1,4 +1,8 @@
-use std::{fs, path::PathBuf, sync::Arc};
+use std::{
+    fs,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -262,6 +266,43 @@ async fn no_entry_window_emits_candidate_checklist_diagnostics() {
     assert!(checklist.iter().any(|item| {
         item["key"].as_str() == Some("market_fresh_long") && item["ok"].as_bool() == Some(true)
     }));
+}
+
+#[tokio::test]
+async fn transfer_status_fetch_is_cached_between_ticks() {
+    let temp = TempDir::new().expect("tempdir");
+    let mut config = test_config(&temp, false);
+    config.runtime.transfer_status_cache_ms = 60_000;
+    config.venues = vec![venue(Venue::Binance, 0.5), venue(Venue::Okx, 0.5)];
+    config.directed_pairs = vec![DirectedPairConfig {
+        long: Venue::Binance,
+        short: Venue::Okx,
+        symbols: vec!["BTCUSDT".to_string()],
+    }];
+
+    let binance_calls = Arc::new(Mutex::new(0_usize));
+    let okx_calls = Arc::new(Mutex::new(0_usize));
+    let adapters: Vec<Arc<dyn VenueAdapter>> = vec![
+        Arc::new(CountingTransferAdapter::new(
+            Venue::Binance,
+            snapshot(Venue::Binance, 1_000, 100.0, 100.2, 10.0, 10.0, 0.0005, 60_000),
+            transfer_status(Venue::Binance, "BTC", true, true),
+            binance_calls.clone(),
+        )),
+        Arc::new(CountingTransferAdapter::new(
+            Venue::Okx,
+            snapshot(Venue::Okx, 1_000, 100.4, 100.6, 10.0, 10.0, -0.0004, 60_000),
+            transfer_status(Venue::Okx, "BTC", true, true),
+            okx_calls.clone(),
+        )),
+    ];
+
+    let mut engine = Engine::new(config, adapters).await.expect("engine");
+    engine.tick().await.expect("first tick");
+    engine.tick().await.expect("second tick");
+
+    assert_eq!(*binance_calls.lock().expect("lock"), 1);
+    assert_eq!(*okx_calls.lock().expect("lock"), 1);
 }
 
 #[test]
@@ -1716,6 +1757,30 @@ struct UncertainFillAdapter {
     uncertain_failures_remaining: std::sync::Mutex<usize>,
 }
 
+#[derive(Debug)]
+struct CountingTransferAdapter {
+    venue: Venue,
+    snapshot: VenueMarketSnapshot,
+    transfer_status: AssetTransferStatus,
+    transfer_calls: Arc<Mutex<usize>>,
+}
+
+impl CountingTransferAdapter {
+    fn new(
+        venue: Venue,
+        snapshot: VenueMarketSnapshot,
+        transfer_status: AssetTransferStatus,
+        transfer_calls: Arc<Mutex<usize>>,
+    ) -> Self {
+        Self {
+            venue,
+            snapshot,
+            transfer_status,
+            transfer_calls,
+        }
+    }
+}
+
 impl UncertainFillAdapter {
     fn new(venue: Venue, snapshot: VenueMarketSnapshot) -> Self {
         Self {
@@ -1787,6 +1852,54 @@ impl VenueAdapter for UncertainFillAdapter {
             size: *self.position.lock().expect("lock"),
             updated_at_ms: self.snapshot.observed_at_ms,
         })
+    }
+}
+
+#[async_trait]
+impl VenueAdapter for CountingTransferAdapter {
+    fn venue(&self) -> Venue {
+        self.venue
+    }
+
+    async fn fetch_market_snapshot(&self, _symbols: &[String]) -> Result<VenueMarketSnapshot> {
+        Ok(self.snapshot.clone())
+    }
+
+    async fn place_order(&self, request: lightfee::OrderRequest) -> Result<lightfee::OrderFill> {
+        let symbol = self
+            .snapshot
+            .symbols
+            .iter()
+            .find(|item| item.symbol == request.symbol)
+            .expect("symbol snapshot");
+        Ok(lightfee::OrderFill {
+            venue: self.venue,
+            symbol: request.symbol,
+            side: request.side,
+            quantity: request.quantity,
+            average_price: match request.side {
+                lightfee::Side::Buy => symbol.best_ask,
+                lightfee::Side::Sell => symbol.best_bid,
+            },
+            fee_quote: 0.0,
+            order_id: format!("{}-counting", self.venue),
+            filled_at_ms: self.snapshot.observed_at_ms,
+            timing: None,
+        })
+    }
+
+    async fn fetch_position(&self, symbol: &str) -> Result<lightfee::PositionSnapshot> {
+        Ok(lightfee::PositionSnapshot {
+            venue: self.venue,
+            symbol: symbol.to_string(),
+            size: 0.0,
+            updated_at_ms: self.snapshot.observed_at_ms,
+        })
+    }
+
+    async fn fetch_transfer_statuses(&self, _assets: &[String]) -> Result<Vec<AssetTransferStatus>> {
+        *self.transfer_calls.lock().expect("lock") += 1;
+        Ok(vec![self.transfer_status.clone()])
     }
 }
 

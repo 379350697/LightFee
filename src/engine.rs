@@ -12,6 +12,7 @@ use serde_json::json;
 use crate::{
     config::{AppConfig, StaggeredExitMode},
     journal::JsonlJournal,
+    live::now_ms,
     market::MarketView,
     models::{CandidateOpportunity, FundingLeg, FundingOpportunityType, OrderRequest, Side, Venue},
     opportunity_source::{
@@ -120,6 +121,7 @@ pub struct Engine {
     recent_submit_ack_ms: BTreeMap<Venue, VecDeque<u64>>,
     venue_entry_cooldowns: BTreeMap<Venue, VenueEntryCooldown>,
     recent_order_health: BTreeMap<Venue, VecDeque<VenueOrderHealthSample>>,
+    cached_transfer_status_view: Option<CachedTransferStatusView>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -144,6 +146,12 @@ struct OrderLegContext<'a> {
 struct VenueEntryCooldown {
     until_wall_clock_ms: i64,
     reason: String,
+}
+
+#[derive(Clone, Debug)]
+struct CachedTransferStatusView {
+    observed_at_ms: i64,
+    view: TransferStatusView,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -324,6 +332,7 @@ impl Engine {
             recent_submit_ack_ms: BTreeMap::new(),
             venue_entry_cooldowns: BTreeMap::new(),
             recent_order_health: BTreeMap::new(),
+            cached_transfer_status_view: None,
         })
     }
 
@@ -613,6 +622,18 @@ impl Engine {
     }
 
     async fn fetch_transfer_status_view(&mut self) -> Option<TransferStatusView> {
+        let cached_at_ms = now_ms();
+        if let Some((cached, observed_at_ms)) = self.cached_transfer_status_view(cached_at_ms) {
+            self.log_event(
+                "transfer_cache.used",
+                &json!({
+                    "source": "engine",
+                    "observed_at_ms": observed_at_ms,
+                }),
+            );
+            return Some(cached);
+        }
+
         let assets = self
             .config
             .symbols
@@ -628,14 +649,20 @@ impl Engine {
         if let Some(source) = self.transfer_status_source.as_ref().cloned() {
             match source.fetch_transfer_statuses(&assets, &venues).await {
                 Ok(statuses) if !statuses.is_empty() => {
+                    let status_count = statuses.len();
+                    let view = TransferStatusView::from_statuses(statuses);
+                    self.cached_transfer_status_view = Some(CachedTransferStatusView {
+                        observed_at_ms: cached_at_ms,
+                        view: view.clone(),
+                    });
                     self.log_event(
                         "transfer_source.used",
                         &json!({
                             "source": "external",
-                            "count": statuses.len(),
+                            "count": status_count,
                         }),
                     );
-                    return Some(TransferStatusView::from_statuses(statuses));
+                    return Some(view);
                 }
                 Ok(_) => {}
                 Err(error) => {
@@ -678,8 +705,25 @@ impl Engine {
         if statuses.is_empty() {
             None
         } else {
-            Some(TransferStatusView::from_statuses(statuses))
+            let view = TransferStatusView::from_statuses(statuses);
+            self.cached_transfer_status_view = Some(CachedTransferStatusView {
+                observed_at_ms: cached_at_ms,
+                view: view.clone(),
+            });
+            Some(view)
         }
+    }
+
+    fn cached_transfer_status_view(&self, now_ms: i64) -> Option<(TransferStatusView, i64)> {
+        let ttl_ms = self.config.runtime.transfer_status_cache_ms.min(i64::MAX as u64) as i64;
+        if ttl_ms <= 0 {
+            return None;
+        }
+        let cache = self.cached_transfer_status_view.as_ref()?;
+        if now_ms.saturating_sub(cache.observed_at_ms) > ttl_ms {
+            return None;
+        }
+        Some((cache.view.clone(), cache.observed_at_ms))
     }
 
     fn should_scan_entries(&self, market: &MarketView) -> bool {
