@@ -1,0 +1,69 @@
+symbols = ["XRPUSDT", "DOGEUSDT", "ADAUSDT", "TRXUSDT", "ETHUSDT"]
+
+[runtime]
+mode = "live"
+opportunity_source = "chillybot_first"
+chillybot_api_base = "https://api.chillybot.xyz"
+chillybot_timeout_ms = 3000
+poll_interval_ms = 1500
+max_market_age_ms = 4000
+auto_trade_enabled = false
+
+[strategy]
+entry_window_secs = 86400
+post_funding_hold_secs = 0
+max_entry_notional = 12.0
+live_max_entry_notional = 12.0
+max_concurrent_positions = 1
+max_scan_minutes_before_funding = 0
+min_scan_minutes_before_funding = 0
+min_funding_edge_bps = -1000.0
+min_expected_edge_bps = -1000.0
+min_worst_case_edge_bps = -1000.0
+exit_slippage_reserve_bps = 3.0
+execution_buffer_bps = 2.0
+capital_buffer_bps = 1.0
+transfer_healthy_bias_bps = 0.25
+transfer_unknown_bias_bps = 0.0
+transfer_degraded_bias_bps = -0.5
+profit_take_quote = 30.0
+stop_loss_quote = 20.0
+trailing_drawdown_quote = 10.0
+
+[persistence]
+event_log_path = "runtime/live-smoke-events.jsonl"
+snapshot_path = "runtime/live-smoke-state.json"
+
+[[venues]]
+venue = "binance"
+taker_fee_bps = 0.5
+max_notional = 12.0
+[venues.live]
+api_key_env = "LIGHTFEE_BINANCE_API_KEY"
+api_secret_env = "LIGHTFEE_BINANCE_API_SECRET"
+
+[[venues]]
+venue = "okx"
+taker_fee_bps = 0.5
+max_notional = 12.0
+[venues.live]
+api_key_env = "LIGHTFEE_OKX_API_KEY"
+api_secret_env = "LIGHTFEE_OKX_API_SECRET"
+api_passphrase_env = "LIGHTFEE_OKX_API_PASSPHRASE"
+
+[[venues]]
+venue = "bybit"
+taker_fee_bps = 0.6
+max_notional = 12.0
+[venues.live]
+api_key_env = "LIGHTFEE_BYBIT_API_KEY"
+api_secret_env = "LIGHTFEE_BYBIT_API_SECRET"
+
+[[venues]]
+venue = "hyperliquid"
+taker_fee_bps = 0.3
+max_notional = 12.0
+[venues.live]
+wallet_private_key_env = "LIGHTFEE_HYPERLIQUID_PRIVATE_KEY"
+account_address_env = "LIGHTFEE_HYPERLIQUID_ACCOUNT_ADDRESS"
+is_testnet = false

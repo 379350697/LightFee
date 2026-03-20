@@ -1,0 +1,67 @@
+symbols = ["BTCUSDT"]
+
+[runtime]
+mode = "paper"
+opportunity_source = "chillybot_first"
+chillybot_api_base = "https://api.chillybot.xyz"
+chillybot_timeout_ms = 2000
+poll_interval_ms = 1000
+max_market_age_ms = 3000
+max_order_quote_age_ms = 3000
+uncertain_order_cooldown_ms = 30000
+auto_trade_enabled = true
+
+[strategy]
+entry_window_secs = 180
+post_funding_hold_secs = 0
+max_entry_notional = 1000.0
+live_max_entry_notional = 30.0
+max_concurrent_positions = 2
+max_scan_minutes_before_funding = 15
+min_scan_minutes_before_funding = 5
+max_stagger_gap_minutes = 480
+max_top_book_usage_ratio = 0.85
+staggered_exit_mode = "after_first_stage"
+min_funding_edge_bps = 6.0
+min_expected_edge_bps = 1.0
+min_worst_case_edge_bps = 0.0
+exit_slippage_reserve_bps = 3.0
+execution_buffer_bps = 2.0
+capital_buffer_bps = 1.0
+transfer_healthy_bias_bps = 0.25
+transfer_unknown_bias_bps = 0.0
+transfer_degraded_bias_bps = -0.5
+profit_take_quote = 30.0
+stop_loss_quote = 20.0
+trailing_drawdown_quote = 10.0
+hyperliquid_max_submit_ack_p95_ms = 1200
+hyperliquid_submit_ack_window_size = 5
+hyperliquid_submit_ack_min_samples = 3
+
+[persistence]
+event_log_path = "runtime/events.jsonl"
+snapshot_path = "runtime/state.json"
+
+[[venues]]
+venue = "binance"
+taker_fee_bps = 0.5
+max_notional = 1000.0
+market_data_file = "demo/binance.json"
+
+[[venues]]
+venue = "okx"
+taker_fee_bps = 0.5
+max_notional = 1000.0
+market_data_file = "demo/okx.json"
+
+[[venues]]
+venue = "bybit"
+taker_fee_bps = 0.6
+max_notional = 1000.0
+market_data_file = "demo/bybit.json"
+
+[[venues]]
+venue = "hyperliquid"
+taker_fee_bps = 0.3
+max_notional = 1000.0
+market_data_file = "demo/hyperliquid.json"

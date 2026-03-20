@@ -1,0 +1,18 @@
+[Unit]
+Description=LightFee unattended funding arbitrage engine
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/lightfee
+EnvironmentFile=/etc/lightfee/lightfee.env
+ExecStart=/opt/lightfee/target/release/lightfee /etc/lightfee/live.toml
+Restart=always
+RestartSec=3
+TimeoutStopSec=15
+KillSignal=SIGINT
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,516 @@
+use std::{
+    env,
+    path::PathBuf,
+    sync::Arc,
+    time::{Instant, SystemTime, UNIX_EPOCH},
+};
+
+use anyhow::{anyhow, Context, Result};
+use futures::future::join_all;
+use lightfee::{
+    config::RuntimeMode, strategy::discover_candidates, AppConfig, BinanceLiveAdapter,
+    BybitLiveAdapter, ChillybotOpportunitySource, MarketView, OkxLiveAdapter,
+    OpportunityHintSource, OrderFill, OrderRequest, Side, TransferStatusSource, TransferStatusView,
+    Venue, VenueAdapter,
+};
+use tokio::time::{sleep, Duration};
+
+#[derive(Clone, Copy, Debug)]
+struct LatencySample {
+    local_roundtrip_ms: u128,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    if args.is_empty() {
+        return Err(anyhow!(
+            "usage: cargo run --bin live_smoke -- [--execute] <config-path>"
+        ));
+    }
+
+    let execute = args.iter().any(|arg| arg == "--execute");
+    let flatten_open = args.iter().any(|arg| arg == "--flatten-open");
+    let config_arg = args
+        .iter()
+        .find(|arg| arg.as_str() != "--execute" && arg.as_str() != "--flatten-open")
+        .ok_or_else(|| anyhow!("missing config path"))?;
+    let config_path = PathBuf::from(config_arg);
+    let config = AppConfig::load(&config_path)?;
+    if !matches!(config.runtime.mode, RuntimeMode::Live) {
+        return Err(anyhow!("live_smoke requires runtime.mode = \"live\""));
+    }
+
+    let adapters = build_live_adapters(&config).await?;
+    let hint_source = build_hint_source(&config)?;
+    let transfer_source = build_transfer_source(&config)?;
+
+    let symbols = config.symbols.clone();
+    if flatten_open {
+        flatten_open_positions(&adapters, &symbols).await?;
+        return Ok(());
+    }
+
+    let market = fetch_market(&adapters, &symbols).await?;
+    let hints = fetch_hints(hint_source.as_ref(), &symbols).await;
+    let transfer_view = fetch_transfer_view(transfer_source.as_ref(), &adapters, &symbols).await;
+    let candidates =
+        discover_candidates(&config, &market, hints.as_deref(), transfer_view.as_ref());
+
+    println!("mode=live_smoke execute={execute}");
+    println!("symbols={:?}", symbols);
+    println!("candidate_count={}", candidates.len());
+
+    let mut selected = None;
+    for candidate in candidates.iter().filter(|item| item.is_tradeable()) {
+        let long_position = adapter(&adapters, candidate.long_venue)?
+            .fetch_position(&candidate.symbol)
+            .await;
+        let short_position = adapter(&adapters, candidate.short_venue)?
+            .fetch_position(&candidate.symbol)
+            .await;
+        match (long_position, short_position) {
+            (Ok(long_position), Ok(short_position))
+                if long_position.size.abs() <= 1e-9 && short_position.size.abs() <= 1e-9 =>
+            {
+                selected = Some(candidate.clone());
+                break;
+            }
+            (Ok(long_position), Ok(short_position)) => {
+                println!(
+                    "skip pair={} reason=open_position long_size={} short_size={}",
+                    candidate.pair_id, long_position.size, short_position.size
+                );
+            }
+            (Err(error), _) | (_, Err(error)) => {
+                println!(
+                    "skip pair={} reason=position_check_failed error={error:#}",
+                    candidate.pair_id
+                );
+            }
+        }
+    }
+
+    let candidate = selected.ok_or_else(|| anyhow!("no flat tradeable candidate found"))?;
+    let executable_quantity = common_executable_quantity(
+        &adapters,
+        candidate.long_venue,
+        candidate.short_venue,
+        &candidate.symbol,
+        candidate.quantity,
+    )
+    .await?;
+    if executable_quantity <= 0.0 {
+        return Err(anyhow!(
+            "quantity rounded to zero for {} on {} and {}",
+            candidate.symbol,
+            candidate.long_venue,
+            candidate.short_venue
+        ));
+    }
+    let executable_entry_notional =
+        candidate.entry_notional_quote * (executable_quantity / candidate.quantity.max(1e-9));
+    println!(
+        "selected pair={} symbol={} long={} short={} requested_qty={} executable_qty={} per_leg_notional={:.4} gross_notional≈{:.4} transfer_state={:?} advisories={:?}",
+        candidate.pair_id,
+        candidate.symbol,
+        candidate.long_venue,
+        candidate.short_venue,
+        candidate.quantity,
+        executable_quantity,
+        executable_entry_notional,
+        executable_entry_notional * 2.0,
+        candidate.transfer_state,
+        candidate.advisories,
+    );
+
+    if !execute {
+        println!("dry-run only; no orders submitted");
+        return Ok(());
+    }
+
+    let request_id_seed = market.now_ms();
+    let short_open = OrderRequest {
+        symbol: candidate.symbol.clone(),
+        side: Side::Sell,
+        quantity: executable_quantity,
+        reduce_only: false,
+        client_order_id: smoke_order_id(request_id_seed, candidate.short_venue, "os"),
+        price_hint: market
+            .symbol(candidate.short_venue, &candidate.symbol)
+            .map(|quote| quote.best_bid),
+        observed_at_ms: market.observed_at_ms(candidate.short_venue),
+    };
+    let long_open = OrderRequest {
+        symbol: candidate.symbol.clone(),
+        side: Side::Buy,
+        quantity: executable_quantity,
+        reduce_only: false,
+        client_order_id: smoke_order_id(request_id_seed, candidate.long_venue, "ol"),
+        price_hint: market
+            .symbol(candidate.long_venue, &candidate.symbol)
+            .map(|quote| quote.best_ask),
+        observed_at_ms: market.observed_at_ms(candidate.long_venue),
+    };
+
+    println!(
+        "submitting open orders quantity={} symbol={}",
+        executable_quantity, candidate.symbol
+    );
+    let (short_fill, short_latency) =
+        timed_place_order(adapter(&adapters, candidate.short_venue)?, short_open)
+            .await
+            .with_context(|| format!("failed to open short leg on {}", candidate.short_venue))?;
+    let long_fill =
+        match timed_place_order(adapter(&adapters, candidate.long_venue)?, long_open).await {
+            Ok(result) => result,
+            Err(error) => {
+                println!(
+                    "long leg failed after short fill; compensating short leg on {}",
+                    candidate.short_venue
+                );
+                let compensate = OrderRequest {
+                    symbol: candidate.symbol.clone(),
+                    side: Side::Buy,
+                    quantity: short_fill.quantity,
+                    reduce_only: true,
+                    client_order_id: smoke_order_id(request_id_seed, candidate.short_venue, "cp"),
+                    price_hint: Some(short_fill.average_price),
+                    observed_at_ms: Some(short_fill.filled_at_ms),
+                };
+                let _ = adapter(&adapters, candidate.short_venue)?
+                    .place_order(compensate)
+                    .await;
+                return Err(error).context("failed to open long leg");
+            }
+        };
+    let (long_fill, long_latency) = long_fill;
+
+    print_fill("open_short", &short_fill, short_latency);
+    print_fill("open_long", &long_fill, long_latency);
+
+    sleep(Duration::from_millis(800)).await;
+
+    let short_close = OrderRequest {
+        symbol: candidate.symbol.clone(),
+        side: Side::Buy,
+        quantity: short_fill.quantity,
+        reduce_only: true,
+        client_order_id: smoke_order_id(request_id_seed, candidate.short_venue, "cs"),
+        price_hint: Some(short_fill.average_price),
+        observed_at_ms: Some(short_fill.filled_at_ms),
+    };
+    let long_close = OrderRequest {
+        symbol: candidate.symbol.clone(),
+        side: Side::Sell,
+        quantity: long_fill.quantity,
+        reduce_only: true,
+        client_order_id: smoke_order_id(request_id_seed, candidate.long_venue, "cl"),
+        price_hint: Some(long_fill.average_price),
+        observed_at_ms: Some(long_fill.filled_at_ms),
+    };
+
+    println!("submitting immediate close orders");
+    let (short_close_fill, short_close_latency) =
+        timed_place_order(adapter(&adapters, candidate.short_venue)?, short_close)
+            .await
+            .with_context(|| format!("failed to close short leg on {}", candidate.short_venue))?;
+    let (long_close_fill, long_close_latency) =
+        timed_place_order(adapter(&adapters, candidate.long_venue)?, long_close)
+            .await
+            .with_context(|| format!("failed to close long leg on {}", candidate.long_venue))?;
+
+    print_fill("close_short", &short_close_fill, short_close_latency);
+    print_fill("close_long", &long_close_fill, long_close_latency);
+
+    let total_fee = short_fill.fee_quote
+        + long_fill.fee_quote
+        + short_close_fill.fee_quote
+        + long_close_fill.fee_quote;
+    let max_latency_ms = [
+        short_latency.local_roundtrip_ms,
+        long_latency.local_roundtrip_ms,
+        short_close_latency.local_roundtrip_ms,
+        long_close_latency.local_roundtrip_ms,
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or_default();
+    let total_roundtrip_ms = short_latency.local_roundtrip_ms
+        + long_latency.local_roundtrip_ms
+        + short_close_latency.local_roundtrip_ms
+        + long_close_latency.local_roundtrip_ms;
+    println!(
+        "latency_summary total_roundtrip_ms={} max_single_order_ms={}",
+        total_roundtrip_ms, max_latency_ms
+    );
+    println!("smoke_test_completed total_fee_quote={total_fee:.8}");
+
+    Ok(())
+}
+
+async fn build_live_adapters(config: &AppConfig) -> Result<Vec<Arc<dyn VenueAdapter>>> {
+    let mut adapters: Vec<Arc<dyn VenueAdapter>> = Vec::new();
+    for venue_config in config.enabled_venues() {
+        let adapter: Arc<dyn VenueAdapter> = match venue_config.venue {
+            Venue::Binance => Arc::new(BinanceLiveAdapter::new(
+                venue_config,
+                config.runtime.chillybot_timeout_ms,
+                &config.symbols,
+            )?),
+            Venue::Okx => Arc::new(OkxLiveAdapter::new(
+                venue_config,
+                config.runtime.chillybot_timeout_ms,
+                &config.symbols,
+            )?),
+            Venue::Bybit => Arc::new(BybitLiveAdapter::new(
+                venue_config,
+                config.runtime.chillybot_timeout_ms,
+                &config.symbols,
+            )?),
+            Venue::Hyperliquid => Arc::new(
+                lightfee::HyperliquidLiveAdapter::new(
+                    venue_config,
+                    config.runtime.chillybot_timeout_ms,
+                    &config.symbols,
+                )
+                .await?,
+            ),
+        };
+        adapters.push(adapter);
+    }
+    Ok(adapters)
+}
+
+fn build_hint_source(config: &AppConfig) -> Result<Option<Arc<dyn OpportunityHintSource>>> {
+    match config.runtime.opportunity_source {
+        lightfee::config::OpportunitySourceMode::ExchangeOnly => Ok(None),
+        lightfee::config::OpportunitySourceMode::ChillybotFirst => {
+            Ok(Some(Arc::new(ChillybotOpportunitySource::new(
+                &config.runtime.chillybot_api_base,
+                config.runtime.chillybot_timeout_ms,
+            )?)))
+        }
+    }
+}
+
+fn build_transfer_source(config: &AppConfig) -> Result<Option<Arc<dyn TransferStatusSource>>> {
+    match config.runtime.opportunity_source {
+        lightfee::config::OpportunitySourceMode::ExchangeOnly => Ok(None),
+        lightfee::config::OpportunitySourceMode::ChillybotFirst => {
+            Ok(Some(Arc::new(ChillybotOpportunitySource::new(
+                &config.runtime.chillybot_api_base,
+                config.runtime.chillybot_timeout_ms,
+            )?)))
+        }
+    }
+}
+
+async fn fetch_market(
+    adapters: &[Arc<dyn VenueAdapter>],
+    symbols: &[String],
+) -> Result<MarketView> {
+    let futures = adapters.iter().map(|adapter| {
+        let adapter = Arc::clone(adapter);
+        let symbols = symbols.to_vec();
+        async move { adapter.fetch_market_snapshot(&symbols).await }
+    });
+    let snapshots = join_all(futures)
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(MarketView::from_snapshots(snapshots))
+}
+
+async fn fetch_hints(
+    source: Option<&Arc<dyn OpportunityHintSource>>,
+    symbols: &[String],
+) -> Option<Vec<lightfee::OpportunityHint>> {
+    let source = source?.clone();
+    source.fetch_hints(symbols).await.ok()
+}
+
+async fn fetch_transfer_view(
+    source: Option<&Arc<dyn TransferStatusSource>>,
+    adapters: &[Arc<dyn VenueAdapter>],
+    symbols: &[String],
+) -> Option<TransferStatusView> {
+    let assets = symbols
+        .iter()
+        .map(|symbol| lightfee::opportunity_source::normalize_symbol_key(symbol))
+        .filter(|asset| !asset.is_empty())
+        .collect::<Vec<_>>();
+    let venues = adapters
+        .iter()
+        .map(|adapter| adapter.venue())
+        .collect::<Vec<_>>();
+
+    if let Some(source) = source.cloned() {
+        if let Ok(statuses) = source.fetch_transfer_statuses(&assets, &venues).await {
+            if !statuses.is_empty() {
+                return Some(TransferStatusView::from_statuses(statuses));
+            }
+        }
+    }
+
+    let futures = adapters.iter().map(|adapter| {
+        let adapter = Arc::clone(adapter);
+        let assets = assets.clone();
+        async move { adapter.fetch_transfer_statuses(&assets).await }
+    });
+    let mut statuses = Vec::new();
+    for result in join_all(futures).await {
+        if let Ok(mut venue_statuses) = result {
+            statuses.append(&mut venue_statuses);
+        }
+    }
+    if statuses.is_empty() {
+        None
+    } else {
+        Some(TransferStatusView::from_statuses(statuses))
+    }
+}
+
+async fn common_executable_quantity(
+    adapters: &[Arc<dyn VenueAdapter>],
+    long_venue: Venue,
+    short_venue: Venue,
+    symbol: &str,
+    desired_quantity: f64,
+) -> Result<f64> {
+    let long_adapter = adapter(adapters, long_venue)?;
+    let short_adapter = adapter(adapters, short_venue)?;
+    let long_quantity = long_adapter
+        .normalize_quantity(symbol, desired_quantity)
+        .await?;
+    let short_quantity = short_adapter
+        .normalize_quantity(symbol, desired_quantity)
+        .await?;
+    let common_quantity = long_quantity.min(short_quantity);
+    if common_quantity <= 0.0 {
+        return Ok(0.0);
+    }
+
+    let long_common = long_adapter
+        .normalize_quantity(symbol, common_quantity)
+        .await?;
+    let short_common = short_adapter
+        .normalize_quantity(symbol, common_quantity)
+        .await?;
+    Ok(long_common.min(short_common))
+}
+
+fn adapter(adapters: &[Arc<dyn VenueAdapter>], venue: Venue) -> Result<Arc<dyn VenueAdapter>> {
+    adapters
+        .iter()
+        .find(|adapter| adapter.venue() == venue)
+        .cloned()
+        .ok_or_else(|| anyhow!("missing adapter for {venue}"))
+}
+
+fn print_fill(label: &str, fill: &OrderFill, latency: LatencySample) {
+    println!(
+        "{label} venue={} symbol={} side={:?} qty={} avg_price={} fee_quote={} order_id={} filled_at_ms={} local_roundtrip_ms={} quote_resolve_ms={} order_prepare_ms={} submit_ack_ms={}",
+        fill.venue,
+        fill.symbol,
+        fill.side,
+        fill.quantity,
+        fill.average_price,
+        fill.fee_quote,
+        fill.order_id,
+        fill.filled_at_ms,
+        latency.local_roundtrip_ms,
+        fill.timing
+            .as_ref()
+            .and_then(|timing| timing.quote_resolve_ms)
+            .unwrap_or_default(),
+        fill.timing
+            .as_ref()
+            .and_then(|timing| timing.order_prepare_ms)
+            .unwrap_or_default(),
+        fill.timing
+            .as_ref()
+            .and_then(|timing| timing.submit_ack_ms)
+            .unwrap_or_default(),
+    );
+}
+
+fn smoke_order_id(seed_ms: i64, venue: Venue, phase: &str) -> String {
+    format!("smk{}{}{}", seed_ms, venue_code(venue), phase)
+}
+
+fn venue_code(venue: Venue) -> &'static str {
+    match venue {
+        Venue::Binance => "bn",
+        Venue::Okx => "ok",
+        Venue::Bybit => "by",
+        Venue::Hyperliquid => "hl",
+    }
+}
+
+async fn timed_place_order(
+    adapter: Arc<dyn VenueAdapter>,
+    request: OrderRequest,
+) -> Result<(OrderFill, LatencySample)> {
+    let started_at = Instant::now();
+    let fill = adapter.place_order(request).await?;
+    Ok((
+        fill,
+        LatencySample {
+            local_roundtrip_ms: started_at.elapsed().as_millis(),
+        },
+    ))
+}
+
+async fn flatten_open_positions(
+    adapters: &[Arc<dyn VenueAdapter>],
+    symbols: &[String],
+) -> Result<()> {
+    let seed_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or_default();
+    let mut flattened = 0_u32;
+    for adapter in adapters {
+        for symbol in symbols {
+            let position = adapter.fetch_position(symbol).await?;
+            if position.size.abs() <= 1e-9 {
+                println!(
+                    "flatten_skip venue={} symbol={} reason=flat",
+                    adapter.venue(),
+                    symbol
+                );
+                continue;
+            }
+
+            let side = if position.size > 0.0 {
+                Side::Sell
+            } else {
+                Side::Buy
+            };
+            let request = OrderRequest {
+                symbol: symbol.clone(),
+                side,
+                quantity: position.size.abs(),
+                reduce_only: true,
+                client_order_id: smoke_order_id(seed_ms, adapter.venue(), "fx"),
+                price_hint: None,
+                observed_at_ms: None,
+            };
+            let (fill, latency) = timed_place_order(adapter.clone(), request)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to flatten open position on {} for {}",
+                        adapter.venue(),
+                        symbol
+                    )
+                })?;
+            print_fill("flatten", &fill, latency);
+            flattened += 1;
+        }
+    }
+
+    println!("flatten_completed order_count={flattened}");
+    Ok(())
+}

@@ -1,0 +1,48 @@
+[
+  {
+    "venue": "okx",
+    "observed_at_ms": 1710000000000,
+    "symbols": [
+      {
+        "symbol": "BTCUSDT",
+        "best_bid": 100.0,
+        "best_ask": 100.0,
+        "bid_size": 40.0,
+        "ask_size": 40.0,
+        "funding_rate": 0.0012,
+        "funding_timestamp_ms": 1710000060000
+      }
+    ]
+  },
+  {
+    "venue": "okx",
+    "observed_at_ms": 1710000045000,
+    "symbols": [
+      {
+        "symbol": "BTCUSDT",
+        "best_bid": 100.0,
+        "best_ask": 100.0,
+        "bid_size": 40.0,
+        "ask_size": 40.0,
+        "funding_rate": 0.0012,
+        "funding_timestamp_ms": 1710000060000
+      }
+    ]
+  },
+  {
+    "venue": "okx",
+    "observed_at_ms": 1710000075000,
+    "symbols": [
+      {
+        "symbol": "BTCUSDT",
+        "best_bid": 100.0,
+        "best_ask": 100.0,
+        "bid_size": 40.0,
+        "ask_size": 40.0,
+        "funding_rate": 0.0012,
+        "funding_timestamp_ms": 1710000060000
+      }
+    ]
+  }
+]
+
