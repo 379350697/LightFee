@@ -31,7 +31,8 @@ pub use models::{
     Venue, VenueMarketSnapshot,
 };
 pub use opportunity_source::{
-    ChillybotOpportunitySource, OpportunityHint, OpportunityHintSource, TransferStatusSource,
+    ChillybotOpportunitySource, FeedgrabChillybotSource, OpportunityHint, OpportunityHintSource,
+    TransferStatusSource,
 };
 pub use simulator::ScriptedVenueAdapter;
 pub use transfer::TransferStatusView;

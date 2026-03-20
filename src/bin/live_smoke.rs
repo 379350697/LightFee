@@ -10,9 +10,9 @@ use anyhow::{anyhow, Context, Result};
 use futures::future::join_all;
 use lightfee::{
     config::RuntimeMode, strategy::discover_candidates, AppConfig, BinanceLiveAdapter,
-    BybitLiveAdapter, CandidateOpportunity, ChillybotOpportunitySource, FundingOpportunityType,
-    MarketView, OkxLiveAdapter, OpportunityHintSource, OrderFill, OrderRequest, Side,
-    TransferStatusSource, TransferStatusView, Venue, VenueAdapter,
+    BybitLiveAdapter, CandidateOpportunity, ChillybotOpportunitySource, FeedgrabChillybotSource,
+    FundingOpportunityType, MarketView, OkxLiveAdapter, OpportunityHintSource, OrderFill,
+    OrderRequest, Side, TransferStatusSource, TransferStatusView, Venue, VenueAdapter,
 };
 use tokio::time::{sleep, Duration};
 
@@ -318,6 +318,12 @@ fn build_hint_source(config: &AppConfig) -> Result<Option<Arc<dyn OpportunityHin
                 config.runtime.chillybot_timeout_ms,
             )?)))
         }
+        lightfee::config::OpportunitySourceMode::ChillybotViaFeedgrab => {
+            Ok(Some(Arc::new(FeedgrabChillybotSource::new(
+                &config.runtime.chillybot_api_base,
+                config.runtime.chillybot_timeout_ms,
+            )?)))
+        }
     }
 }
 
@@ -326,6 +332,12 @@ fn build_transfer_source(config: &AppConfig) -> Result<Option<Arc<dyn TransferSt
         lightfee::config::OpportunitySourceMode::ExchangeOnly => Ok(None),
         lightfee::config::OpportunitySourceMode::ChillybotFirst => {
             Ok(Some(Arc::new(ChillybotOpportunitySource::new(
+                &config.runtime.chillybot_api_base,
+                config.runtime.chillybot_timeout_ms,
+            )?)))
+        }
+        lightfee::config::OpportunitySourceMode::ChillybotViaFeedgrab => {
+            Ok(Some(Arc::new(FeedgrabChillybotSource::new(
                 &config.runtime.chillybot_api_base,
                 config.runtime.chillybot_timeout_ms,
             )?)))

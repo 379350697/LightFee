@@ -136,6 +136,7 @@ impl Default for RuntimeConfig {
 pub enum OpportunitySourceMode {
     ExchangeOnly,
     ChillybotFirst,
+    ChillybotViaFeedgrab,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

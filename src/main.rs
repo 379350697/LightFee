@@ -5,8 +5,8 @@ use lightfee::{
     config::{OpportunitySourceMode, RuntimeMode},
     resilience::FailureBackoff,
     AppConfig, BinanceLiveAdapter, BybitLiveAdapter, ChillybotOpportunitySource, Engine,
-    HyperliquidLiveAdapter, OkxLiveAdapter, OpportunityHintSource, ScriptedVenueAdapter,
-    TransferStatusSource, Venue, VenueAdapter,
+    FeedgrabChillybotSource, HyperliquidLiveAdapter, OkxLiveAdapter, OpportunityHintSource,
+    ScriptedVenueAdapter, TransferStatusSource, Venue, VenueAdapter,
 };
 use tokio::time;
 use tracing::{error, info};
@@ -164,6 +164,15 @@ fn build_sources(
         OpportunitySourceMode::ExchangeOnly => Ok((None, None)),
         OpportunitySourceMode::ChillybotFirst => {
             let source = Arc::new(ChillybotOpportunitySource::new(
+                &config.runtime.chillybot_api_base,
+                config.runtime.chillybot_timeout_ms,
+            )?);
+            let opportunity_source: Arc<dyn OpportunityHintSource> = source.clone();
+            let transfer_status_source: Arc<dyn TransferStatusSource> = source;
+            Ok((Some(opportunity_source), Some(transfer_status_source)))
+        }
+        OpportunitySourceMode::ChillybotViaFeedgrab => {
+            let source = Arc::new(FeedgrabChillybotSource::new(
                 &config.runtime.chillybot_api_base,
                 config.runtime.chillybot_timeout_ms,
             )?);
