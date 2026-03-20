@@ -692,6 +692,15 @@ impl VenueAdapter for HyperliquidLiveAdapter {
         })
     }
 
+    async fn refresh_market_snapshot(&self, symbol: &str) -> Result<VenueMarketSnapshot> {
+        let snapshot = self.fetch_symbol_snapshot(symbol).await?;
+        Ok(VenueMarketSnapshot {
+            venue: Venue::Hyperliquid,
+            observed_at_ms: now_ms(),
+            symbols: vec![snapshot],
+        })
+    }
+
     async fn place_order(&self, request: OrderRequest) -> Result<OrderFill> {
         let asset = venue_symbol(&self.config, &request.symbol);
         let quote_resolve_started_at = Instant::now();

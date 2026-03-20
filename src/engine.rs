@@ -12,7 +12,7 @@ use serde_json::json;
 use crate::{
     config::{AppConfig, StaggeredExitMode},
     journal::JsonlJournal,
-    live::now_ms,
+    live::{now_ms, quote_fill},
     market::MarketView,
     models::{CandidateOpportunity, FundingLeg, FundingOpportunityType, OrderRequest, Side, Venue},
     opportunity_source::{
@@ -80,6 +80,9 @@ pub struct OpenPosition {
     pub second_stage_enabled_at_entry: bool,
     pub exit_reason: Option<String>,
 }
+
+const ENTRY_SELECTION_BUFFER_MULTIPLIER: usize = 4;
+const ENTRY_SELECTION_BUFFER_MAX: usize = 8;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EngineState {
@@ -772,6 +775,9 @@ impl Engine {
         if remaining_slots == 0 {
             return Vec::new();
         }
+        let selection_target = remaining_slots
+            .saturating_mul(ENTRY_SELECTION_BUFFER_MULTIPLIER)
+            .clamp(remaining_slots, ENTRY_SELECTION_BUFFER_MAX);
 
         let mut ranked = candidates
             .iter()
@@ -800,7 +806,7 @@ impl Engine {
                 continue;
             }
             selected.push(candidate);
-            if selected.len() >= remaining_slots {
+            if selected.len() >= selection_target {
                 break;
             }
         }
@@ -1906,28 +1912,45 @@ impl Engine {
         request: OrderRequest,
         context: OrderLegContext<'_>,
     ) -> Result<(crate::models::OrderFill, u64)> {
+        let mut request = request;
         if matches!(self.config.runtime.mode, crate::config::RuntimeMode::Live) {
-            if let Some(reason) = order_quote_expired_reason(
+            if let Some(mut reason) = order_quote_expired_reason(
                 self.config.runtime.max_order_quote_age_ms,
                 request.observed_at_ms,
                 request.reduce_only,
             ) {
-                self.log_event(
-                    "execution.order_blocked",
-                    &json!({
-                        "position_id": context.position_id,
-                        "pair_id": context.pair_id,
-                        "stage": context.stage,
-                        "venue": venue,
-                        "symbol": &request.symbol,
-                        "side": request.side,
-                        "requested_quantity": request.quantity,
-                        "reduce_only": request.reduce_only,
-                        "client_order_id": &request.client_order_id,
-                        "reason": reason,
-                    }),
-                );
-                return Err(anyhow!("order blocked: {reason}"));
+                if self
+                    .refresh_order_request_quote(venue, &mut request, &context, &reason)
+                    .await?
+                {
+                    if let Some(refreshed_reason) = order_quote_expired_reason(
+                        self.config.runtime.max_order_quote_age_ms,
+                        request.observed_at_ms,
+                        request.reduce_only,
+                    ) {
+                        reason = refreshed_reason;
+                    } else {
+                        reason.clear();
+                    }
+                }
+                if !reason.is_empty() {
+                    self.log_event(
+                        "execution.order_blocked",
+                        &json!({
+                            "position_id": context.position_id,
+                            "pair_id": context.pair_id,
+                            "stage": context.stage,
+                            "venue": venue,
+                            "symbol": &request.symbol,
+                            "side": request.side,
+                            "requested_quantity": request.quantity,
+                            "reduce_only": request.reduce_only,
+                            "client_order_id": &request.client_order_id,
+                            "reason": reason,
+                        }),
+                    );
+                    return Err(anyhow!("order blocked: {reason}"));
+                }
             }
         }
         self.log_event(
@@ -2005,6 +2028,63 @@ impl Engine {
                 Err(error)
             }
         }
+    }
+
+    async fn refresh_order_request_quote(
+        &mut self,
+        venue: Venue,
+        request: &mut OrderRequest,
+        context: &OrderLegContext<'_>,
+        expired_reason: &str,
+    ) -> Result<bool> {
+        if request.reduce_only {
+            return Ok(false);
+        }
+        let refreshed = self
+            .adapter(venue)?
+            .refresh_market_snapshot(&request.symbol)
+            .await;
+        let snapshot = match refreshed {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.log_event(
+                    "execution.order_quote_refresh_failed",
+                    &json!({
+                        "position_id": context.position_id,
+                        "pair_id": context.pair_id,
+                        "stage": context.stage,
+                        "venue": venue,
+                        "symbol": &request.symbol,
+                        "side": request.side,
+                        "client_order_id": &request.client_order_id,
+                        "expired_reason": expired_reason,
+                        "error": error.to_string(),
+                    }),
+                );
+                return Ok(false);
+            }
+        };
+        let previous_observed_at_ms = request.observed_at_ms;
+        let (price_hint, observed_at_ms) = quote_fill(&snapshot, &request.symbol, request.side)?;
+        request.price_hint = Some(price_hint);
+        request.observed_at_ms = Some(observed_at_ms);
+        self.log_event(
+            "execution.order_quote_refreshed",
+            &json!({
+                "position_id": context.position_id,
+                "pair_id": context.pair_id,
+                "stage": context.stage,
+                "venue": venue,
+                "symbol": &request.symbol,
+                "side": request.side,
+                "client_order_id": &request.client_order_id,
+                "expired_reason": expired_reason,
+                "previous_observed_at_ms": previous_observed_at_ms,
+                "refreshed_observed_at_ms": observed_at_ms,
+                "price_hint": price_hint,
+            }),
+        );
+        Ok(true)
     }
 
     async fn cleanup_failed_leg_exposure(

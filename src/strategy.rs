@@ -114,14 +114,13 @@ pub fn discover_candidates(
                 ((short_quote.best_bid - long_quote.best_ask) / reference_mid) * 10_000.0;
             let entry_slippage_bps = estimate_slippage_bps(long_quote, quantity, true)
                 + estimate_slippage_bps(short_quote, quantity, false);
-            let expected_edge_bps = funding_profile.funding_edge_bps + entry_cross_bps
+            let expected_edge_bps = funding_profile.funding_edge_bps
                 - fee_bps
                 - entry_slippage_bps
                 - config.strategy.exit_slippage_reserve_bps
                 - config.strategy.capital_buffer_bps;
             let worst_case_edge_bps = expected_edge_bps - config.strategy.execution_buffer_bps;
             let first_stage_expected_edge_bps = funding_profile.first_stage_funding_edge_bps
-                + entry_cross_bps
                 - fee_bps
                 - entry_slippage_bps
                 - config.strategy.exit_slippage_reserve_bps
@@ -351,13 +350,12 @@ fn estimate_slippage_bps(snapshot: &SymbolMarketSnapshot, quantity: f64, taking_
     }
 
     let depth_ratio = quantity / top_size;
-    let spread_component = snapshot.spread_bps() / 2.0;
     let impact_component = if depth_ratio <= 1.0 {
         depth_ratio * 0.8
     } else {
         0.8 + (depth_ratio - 1.0) * 15.0
     };
-    spread_component + impact_component
+    impact_component
 }
 
 fn capped_quantity_by_top_book_depth(
@@ -467,7 +465,7 @@ mod tests {
         models::{FundingOpportunityType, Venue, VenueMarketSnapshot},
     };
 
-    use super::discover_candidates;
+    use super::{discover_candidates, estimate_slippage_bps};
 
     #[test]
     fn quantity_is_capped_by_top_book_depth_before_ranking() {
@@ -785,5 +783,141 @@ mod tests {
             .any(|item| item == "expected_edge_below_floor"));
         assert!((candidate.funding_edge_bps - 4.0).abs() < 1e-9);
         assert!((candidate.total_funding_edge_bps - 24.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn slippage_estimate_does_not_double_count_spread() {
+        let snapshot = crate::models::SymbolMarketSnapshot {
+            symbol: "BTCUSDT".to_string(),
+            best_bid: 99.0,
+            best_ask: 101.0,
+            bid_size: 10.0,
+            ask_size: 10.0,
+            funding_rate: 0.0,
+            funding_timestamp_ms: 60_000,
+        };
+
+        let slippage_bps = estimate_slippage_bps(&snapshot, 5.0, true);
+
+        assert!((slippage_bps - 0.4).abs() < 1e-9);
+    }
+
+    #[test]
+    fn expected_edge_is_not_driven_by_entry_cross_direction() {
+        let config = AppConfig {
+            runtime: RuntimeConfig::default(),
+            strategy: StrategyConfig {
+                max_scan_minutes_before_funding: 0,
+                min_scan_minutes_before_funding: 0,
+                max_entry_notional: 100.0,
+                min_funding_edge_bps: -1_000.0,
+                min_expected_edge_bps: -1_000.0,
+                min_worst_case_edge_bps: -1_000.0,
+                exit_slippage_reserve_bps: 0.0,
+                capital_buffer_bps: 0.0,
+                execution_buffer_bps: 0.0,
+                ..StrategyConfig::default()
+            },
+            persistence: PersistenceConfig::default(),
+            venues: vec![
+                VenueConfig {
+                    venue: Venue::Binance,
+                    enabled: true,
+                    taker_fee_bps: 0.0,
+                    max_notional: 1_000.0,
+                    market_data_file: None,
+                    live: Default::default(),
+                },
+                VenueConfig {
+                    venue: Venue::Okx,
+                    enabled: true,
+                    taker_fee_bps: 0.0,
+                    max_notional: 1_000.0,
+                    market_data_file: None,
+                    live: Default::default(),
+                },
+            ],
+            symbols: vec!["BTCUSDT".to_string()],
+            directed_pairs: vec![crate::config::DirectedPairConfig {
+                long: Venue::Binance,
+                short: Venue::Okx,
+                symbols: vec!["BTCUSDT".to_string()],
+            }],
+        };
+
+        let negative_cross_market = MarketView::from_snapshots(vec![
+            VenueMarketSnapshot {
+                venue: Venue::Binance,
+                observed_at_ms: 0,
+                symbols: vec![crate::models::SymbolMarketSnapshot {
+                    symbol: "BTCUSDT".to_string(),
+                    best_bid: 100.0,
+                    best_ask: 100.0,
+                    bid_size: 50_000.0,
+                    ask_size: 50_000.0,
+                    funding_rate: -0.0005,
+                    funding_timestamp_ms: 60_000,
+                }],
+            },
+            VenueMarketSnapshot {
+                venue: Venue::Okx,
+                observed_at_ms: 0,
+                symbols: vec![crate::models::SymbolMarketSnapshot {
+                    symbol: "BTCUSDT".to_string(),
+                    best_bid: 99.0,
+                    best_ask: 99.0,
+                    bid_size: 50_000.0,
+                    ask_size: 50_000.0,
+                    funding_rate: 0.0005,
+                    funding_timestamp_ms: 60_000,
+                }],
+            },
+        ]);
+        let positive_cross_market = MarketView::from_snapshots(vec![
+            VenueMarketSnapshot {
+                venue: Venue::Binance,
+                observed_at_ms: 0,
+                symbols: vec![crate::models::SymbolMarketSnapshot {
+                    symbol: "BTCUSDT".to_string(),
+                    best_bid: 100.0,
+                    best_ask: 100.0,
+                    bid_size: 50_000.0,
+                    ask_size: 50_000.0,
+                    funding_rate: -0.0005,
+                    funding_timestamp_ms: 60_000,
+                }],
+            },
+            VenueMarketSnapshot {
+                venue: Venue::Okx,
+                observed_at_ms: 0,
+                symbols: vec![crate::models::SymbolMarketSnapshot {
+                    symbol: "BTCUSDT".to_string(),
+                    best_bid: 101.0,
+                    best_ask: 101.0,
+                    bid_size: 50_000.0,
+                    ask_size: 50_000.0,
+                    funding_rate: 0.0005,
+                    funding_timestamp_ms: 60_000,
+                }],
+            },
+        ]);
+
+        let negative_cross_candidate =
+            discover_candidates(&config, &negative_cross_market, None, None)
+                .into_iter()
+                .find(|item| item.long_venue == Venue::Binance && item.short_venue == Venue::Okx)
+                .expect("negative cross candidate");
+        let positive_cross_candidate =
+            discover_candidates(&config, &positive_cross_market, None, None)
+                .into_iter()
+                .find(|item| item.long_venue == Venue::Binance && item.short_venue == Venue::Okx)
+                .expect("positive cross candidate");
+
+        assert!(
+            (negative_cross_candidate.expected_edge_bps
+                - positive_cross_candidate.expected_edge_bps)
+                .abs()
+                < 0.5
+        );
     }
 }

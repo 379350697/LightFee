@@ -738,6 +738,15 @@ impl VenueAdapter for OkxLiveAdapter {
         })
     }
 
+    async fn refresh_market_snapshot(&self, symbol: &str) -> Result<VenueMarketSnapshot> {
+        let snapshot = self.fetch_symbol_snapshot(symbol).await?;
+        Ok(VenueMarketSnapshot {
+            venue: Venue::Okx,
+            observed_at_ms: now_ms(),
+            symbols: vec![snapshot],
+        })
+    }
+
     async fn place_order(&self, request: OrderRequest) -> Result<OrderFill> {
         let meta = self.symbol_meta(&request.symbol).await?;
         let position_mode = self.position_mode().await?;

@@ -11,6 +11,10 @@ pub trait VenueAdapter: Send + Sync {
 
     async fn fetch_market_snapshot(&self, symbols: &[String]) -> Result<VenueMarketSnapshot>;
 
+    async fn refresh_market_snapshot(&self, symbol: &str) -> Result<VenueMarketSnapshot> {
+        self.fetch_market_snapshot(&[symbol.to_string()]).await
+    }
+
     async fn place_order(&self, request: OrderRequest) -> Result<OrderFill>;
 
     fn cached_position(&self, _symbol: &str) -> Option<PositionSnapshot> {

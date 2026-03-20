@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -1062,6 +1063,220 @@ fn live_candidate_sizing_is_capped_to_30_quote_per_leg() {
 }
 
 #[tokio::test]
+async fn live_quote_refresh_unblocks_entry_after_stale_selection_snapshot() {
+    let temp = TempDir::new().expect("tempdir");
+    let mut config = test_config(&temp, true);
+    config.runtime.mode = RuntimeMode::Live;
+    config.runtime.max_order_quote_age_ms = 3_000;
+    config.symbols = vec!["BTCUSDT".to_string()];
+    config.directed_pairs = vec![DirectedPairConfig {
+        long: Venue::Binance,
+        short: Venue::Okx,
+        symbols: config.symbols.clone(),
+    }];
+    config.strategy.entry_window_secs = 3_600;
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let stale_observed_at_ms = now_ms - 4_100;
+    let funding_timestamp_ms = now_ms + 60_000;
+
+    let binance = Arc::new(ScriptedVenueAdapter::new(
+        Venue::Binance,
+        0.5,
+        vec![
+            venue_snapshot(
+                Venue::Binance,
+                stale_observed_at_ms,
+                vec![symbol_snapshot(
+                    "BTCUSDT",
+                    100.0,
+                    100.1,
+                    500.0,
+                    500.0,
+                    -0.0005,
+                    funding_timestamp_ms,
+                )],
+            ),
+            venue_snapshot(
+                Venue::Binance,
+                now_ms,
+                vec![symbol_snapshot(
+                    "BTCUSDT",
+                    100.0,
+                    100.1,
+                    500.0,
+                    500.0,
+                    -0.0005,
+                    funding_timestamp_ms,
+                )],
+            ),
+        ],
+    ));
+    let okx = Arc::new(ScriptedVenueAdapter::new(
+        Venue::Okx,
+        0.5,
+        vec![
+            venue_snapshot(
+                Venue::Okx,
+                stale_observed_at_ms,
+                vec![symbol_snapshot(
+                    "BTCUSDT",
+                    100.2,
+                    100.3,
+                    500.0,
+                    500.0,
+                    0.0015,
+                    funding_timestamp_ms,
+                )],
+            ),
+            venue_snapshot(
+                Venue::Okx,
+                now_ms,
+                vec![symbol_snapshot(
+                    "BTCUSDT",
+                    100.2,
+                    100.3,
+                    500.0,
+                    500.0,
+                    0.0015,
+                    funding_timestamp_ms,
+                )],
+            ),
+        ],
+    ));
+    let bybit = Arc::new(ScriptedVenueAdapter::new(
+        Venue::Bybit,
+        0.6,
+        vec![venue_snapshot(Venue::Bybit, now_ms, Vec::new())],
+    ));
+    let hyper = Arc::new(ScriptedVenueAdapter::new(
+        Venue::Hyperliquid,
+        0.3,
+        vec![venue_snapshot(Venue::Hyperliquid, now_ms, Vec::new())],
+    ));
+
+    let mut engine = Engine::new(
+        config.clone(),
+        vec![
+            binance.clone() as Arc<dyn VenueAdapter>,
+            okx.clone() as Arc<dyn VenueAdapter>,
+            bybit as Arc<dyn VenueAdapter>,
+            hyper as Arc<dyn VenueAdapter>,
+        ],
+    )
+    .await
+    .expect("engine");
+
+    engine.tick().await.expect("tick");
+
+    assert!(engine.state().open_position.is_some());
+    sleep(Duration::from_millis(250)).await;
+    let records = read_event_records(&config.persistence.event_log_path);
+    assert!(has_event(&records, "execution.order_quote_refreshed"));
+    assert!(has_event(&records, "entry.opened"));
+}
+
+#[tokio::test]
+async fn backup_candidate_is_tried_after_first_candidate_rounds_to_zero() {
+    let temp = TempDir::new().expect("tempdir");
+    let mut config = test_config(&temp, true);
+    config.runtime.mode = RuntimeMode::Live;
+    config.symbols = vec!["FETUSDT".to_string(), "BTCUSDT".to_string()];
+    config.directed_pairs = vec![DirectedPairConfig {
+        long: Venue::Binance,
+        short: Venue::Okx,
+        symbols: config.symbols.clone(),
+    }];
+    config.strategy.entry_window_secs = 3_600;
+    config.strategy.max_concurrent_positions = 1;
+    config.strategy.max_entry_notional = 30.0;
+    config.strategy.live_max_entry_notional = 30.0;
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let funding_timestamp_ms = now_ms + 60_000;
+
+    let market_symbols = vec![
+        symbol_snapshot(
+            "FETUSDT",
+            1.0,
+            1.0,
+            10_000.0,
+            10_000.0,
+            -0.0007,
+            funding_timestamp_ms,
+        ),
+        symbol_snapshot(
+            "BTCUSDT",
+            100.0,
+            100.0,
+            10_000.0,
+            10_000.0,
+            -0.0004,
+            funding_timestamp_ms,
+        ),
+    ];
+    let hedge_symbols = vec![
+        symbol_snapshot(
+            "FETUSDT",
+            1.01,
+            1.01,
+            10_000.0,
+            10_000.0,
+            0.0017,
+            funding_timestamp_ms,
+        ),
+        symbol_snapshot(
+            "BTCUSDT",
+            100.1,
+            100.1,
+            10_000.0,
+            10_000.0,
+            0.0015,
+            funding_timestamp_ms,
+        ),
+    ];
+
+    let binance = Arc::new(SelectiveNormalizeAdapter::new(
+        Venue::Binance,
+        vec![venue_snapshot(Venue::Binance, now_ms, market_symbols)],
+    ));
+    let okx = Arc::new(SelectiveNormalizeAdapter::new(
+        Venue::Okx,
+        vec![venue_snapshot(Venue::Okx, now_ms, hedge_symbols)],
+    ));
+    let bybit = Arc::new(ScriptedVenueAdapter::new(
+        Venue::Bybit,
+        0.6,
+        vec![venue_snapshot(Venue::Bybit, now_ms, Vec::new())],
+    ));
+    let hyper = Arc::new(ScriptedVenueAdapter::new(
+        Venue::Hyperliquid,
+        0.3,
+        vec![venue_snapshot(Venue::Hyperliquid, now_ms, Vec::new())],
+    ));
+
+    let mut engine = Engine::new(
+        config.clone(),
+        vec![
+            binance.clone() as Arc<dyn VenueAdapter>,
+            okx.clone() as Arc<dyn VenueAdapter>,
+            bybit as Arc<dyn VenueAdapter>,
+            hyper as Arc<dyn VenueAdapter>,
+        ],
+    )
+    .await
+    .expect("engine");
+
+    engine.tick().await.expect("tick");
+
+    assert!(engine.state().open_position.is_some());
+    let position = engine.state().open_position.as_ref().expect("position");
+    assert_eq!(position.symbol, "BTCUSDT");
+    sleep(Duration::from_millis(250)).await;
+    let records = read_event_records(&config.persistence.event_log_path);
+    assert!(has_event(&records, "execution.entry_blocked"));
+    assert!(has_event(&records, "entry.opened"));
+}
+
+#[tokio::test]
 async fn engine_opens_two_distinct_symbols_when_multiple_good_candidates_exist() {
     let temp = TempDir::new().expect("tempdir");
     let mut config = test_config(&temp, true);
@@ -1854,6 +2069,13 @@ struct SoftFailingMarketAdapter {
     error: String,
 }
 
+#[derive(Debug)]
+struct SelectiveNormalizeAdapter {
+    venue: Venue,
+    snapshots: Mutex<Vec<VenueMarketSnapshot>>,
+    positions: Mutex<BTreeMap<String, f64>>,
+}
+
 impl CountingTransferAdapter {
     fn new(
         venue: Venue,
@@ -1876,6 +2098,25 @@ impl SoftFailingMarketAdapter {
             venue,
             error: error.into(),
         }
+    }
+}
+
+impl SelectiveNormalizeAdapter {
+    fn new(venue: Venue, snapshots: Vec<VenueMarketSnapshot>) -> Self {
+        Self {
+            venue,
+            snapshots: Mutex::new(snapshots),
+            positions: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    fn position_size(&self, symbol: &str) -> f64 {
+        self.positions
+            .lock()
+            .expect("lock")
+            .get(symbol)
+            .copied()
+            .unwrap_or_default()
     }
 }
 
@@ -2029,6 +2270,78 @@ impl VenueAdapter for SoftFailingMarketAdapter {
             size: 0.0,
             updated_at_ms: 0,
         })
+    }
+}
+
+#[async_trait]
+impl VenueAdapter for SelectiveNormalizeAdapter {
+    fn venue(&self) -> Venue {
+        self.venue
+    }
+
+    async fn fetch_market_snapshot(&self, symbols: &[String]) -> Result<VenueMarketSnapshot> {
+        let mut snapshots = self.snapshots.lock().expect("lock");
+        let snapshot = if snapshots.len() > 1 {
+            snapshots.remove(0)
+        } else {
+            snapshots.first().cloned().expect("snapshot")
+        };
+        let mut filtered = snapshot.clone();
+        if !symbols.is_empty() {
+            filtered
+                .symbols
+                .retain(|item| symbols.iter().any(|symbol| symbol == &item.symbol));
+        }
+        Ok(filtered)
+    }
+
+    async fn place_order(&self, request: lightfee::OrderRequest) -> Result<lightfee::OrderFill> {
+        let snapshot = self
+            .snapshots
+            .lock()
+            .expect("lock")
+            .first()
+            .cloned()
+            .expect("snapshot");
+        let symbol = snapshot
+            .symbols
+            .iter()
+            .find(|item| item.symbol == request.symbol)
+            .expect("symbol snapshot");
+        let mut positions = self.positions.lock().expect("lock");
+        let position = positions.entry(request.symbol.clone()).or_default();
+        *position += request.side.signed_qty(request.quantity);
+        Ok(lightfee::OrderFill {
+            venue: self.venue,
+            symbol: request.symbol,
+            side: request.side,
+            quantity: request.quantity,
+            average_price: match request.side {
+                lightfee::Side::Buy => symbol.best_ask,
+                lightfee::Side::Sell => symbol.best_bid,
+            },
+            fee_quote: 0.0,
+            order_id: format!("{}-selective", self.venue),
+            filled_at_ms: snapshot.observed_at_ms,
+            timing: None,
+        })
+    }
+
+    async fn fetch_position(&self, symbol: &str) -> Result<lightfee::PositionSnapshot> {
+        Ok(lightfee::PositionSnapshot {
+            venue: self.venue,
+            symbol: symbol.to_string(),
+            size: self.position_size(symbol),
+            updated_at_ms: 0,
+        })
+    }
+
+    async fn normalize_quantity(&self, symbol: &str, quantity: f64) -> Result<f64> {
+        if symbol == "FETUSDT" {
+            Ok(0.0)
+        } else {
+            Ok(quantity)
+        }
     }
 }
 
