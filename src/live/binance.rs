@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
 };
 
@@ -10,7 +10,7 @@ use reqwest::{
     header::{HeaderMap, HeaderValue},
     Client,
 };
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use tokio::time::{sleep, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tracing::{debug, warn};
@@ -26,11 +26,14 @@ use crate::{
 };
 
 use super::{
-    base_asset, build_http_client, build_query, enrich_fill_from_private, estimate_fee_quote,
-    floor_to_step, format_decimal, hinted_fill, hmac_sha256_hex, lookup_or_wait_private_order,
-    now_ms, parse_f64, parse_i64, parse_text_message, quote_fill, spawn_ws_loop, venue_symbol,
-    PrivateOrderUpdate, WsMarketState, WsPrivateState,
+    base_asset, build_http_client, build_query, cache_is_fresh, enrich_fill_from_private,
+    estimate_fee_quote, floor_to_step, format_decimal, hinted_fill, hmac_sha256_hex,
+    load_json_cache, lookup_or_wait_private_order, now_ms, parse_f64, parse_i64,
+    parse_text_message, quote_fill, spawn_ws_loop, store_json_cache, venue_symbol,
+    PrivateOrderUpdate, WsMarketState, WsPrivateState, SYMBOL_CACHE_TTL_MS,
 };
+
+const BINANCE_MAX_SUBSCRIBE_STREAMS_PER_MESSAGE: usize = 150;
 
 pub struct BinanceLiveAdapter {
     config: VenueConfig,
@@ -39,6 +42,7 @@ pub struct BinanceLiveAdapter {
     base_url: String,
     wallet_base_url: String,
     metadata: Mutex<HashMap<String, BinanceSymbolMeta>>,
+    supported_symbols: Mutex<HashSet<String>>,
     position_mode: Mutex<Option<BinancePositionMode>>,
     time_offset_ms: Mutex<Option<i64>>,
     market_ws: Arc<WsMarketState>,
@@ -46,7 +50,11 @@ pub struct BinanceLiveAdapter {
 }
 
 impl BinanceLiveAdapter {
-    pub fn new(config: &VenueConfig, runtime: &RuntimeConfig, symbols: &[String]) -> Result<Self> {
+    pub async fn new(
+        config: &VenueConfig,
+        runtime: &RuntimeConfig,
+        symbols: &[String],
+    ) -> Result<Self> {
         if config.venue != Venue::Binance {
             return Err(anyhow!("binance live adapter requires binance config"));
         }
@@ -63,21 +71,57 @@ impl BinanceLiveAdapter {
             .unwrap_or_else(|| "https://api.binance.com".to_string());
 
         let market_ws = WsMarketState::new();
+        let persisted_catalog = load_json_cache::<BinanceSymbolCatalogCache>("binance-symbols.json");
+        let mut metadata = HashMap::new();
+        let mut supported_symbols = HashSet::new();
+        if let Some(cache) = persisted_catalog {
+            if !cache_is_fresh(cache.updated_at_ms, now_ms(), SYMBOL_CACHE_TTL_MS) {
+                debug!("binance symbol catalog cache is stale; using as fallback seed");
+            }
+            metadata.extend(cache.metadata);
+            supported_symbols.extend(cache.supported_symbols);
+        }
+
         let adapter = Self {
             config: config.clone(),
             runtime: runtime.clone(),
-            client: build_http_client(runtime.chillybot_timeout_ms)?,
+            client: build_http_client(runtime.exchange_http_timeout_ms)?,
             base_url,
             wallet_base_url,
-            metadata: Mutex::new(HashMap::new()),
+            metadata: Mutex::new(metadata),
+            supported_symbols: Mutex::new(supported_symbols),
             position_mode: Mutex::new(None),
             time_offset_ms: Mutex::new(None),
             market_ws,
             private_ws: WsPrivateState::new(),
         };
-        adapter.start_market_ws(symbols);
-        adapter.start_private_ws(symbols);
+        if let Err(error) = adapter.refresh_symbol_catalog().await {
+            if adapter.supported_symbols.lock().expect("lock").is_empty() {
+                return Err(error);
+            }
+            warn!(?error, "binance symbol catalog refresh failed; using persisted cache");
+        }
+        let tracked_symbols = adapter.tracked_symbols(symbols);
+        adapter.start_market_ws(&tracked_symbols);
+        adapter.start_private_ws(&tracked_symbols);
         Ok(adapter)
+    }
+
+    fn tracked_symbols(&self, requested_symbols: &[String]) -> Vec<String> {
+        requested_symbols
+            .iter()
+            .filter(|symbol| {
+                self.supported_symbols
+                    .lock()
+                    .expect("lock")
+                    .contains(symbol.as_str())
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn supports_symbol(&self, symbol: &str) -> bool {
+        self.supported_symbols.lock().expect("lock").contains(symbol)
     }
 
     fn start_market_ws(&self, symbols: &[String]) {
@@ -99,16 +143,13 @@ impl BinanceLiveAdapter {
             .iter()
             .map(|symbol| (venue_symbol(&self.config, symbol), symbol.clone()))
             .collect::<HashMap<_, _>>();
-        let url = format!(
-            "{}/stream?streams={}",
-            binance_ws_base_url(&self.base_url),
-            stream_names.join("/")
-        );
+        let subscribe_messages = build_binance_subscribe_messages(&stream_names);
+        let url = format!("{}/ws", binance_ws_base_url(&self.base_url));
         let state = self.market_ws.clone();
         spawn_ws_loop(
             "binance",
             url,
-            Vec::new(),
+            subscribe_messages,
             state,
             self.runtime.ws_reconnect_initial_ms,
             self.runtime.ws_reconnect_max_ms,
@@ -319,6 +360,9 @@ impl BinanceLiveAdapter {
     }
 
     async fn fetch_symbol_snapshot(&self, symbol: &str) -> Result<SymbolMarketSnapshot> {
+        if !self.supports_symbol(symbol) {
+            return Err(anyhow!("binance symbol not supported for {}", symbol));
+        }
         let venue_symbol = venue_symbol(&self.config, symbol);
         let book = self
             .client
@@ -360,8 +404,16 @@ impl BinanceLiveAdapter {
         if let Some(meta) = self.metadata.lock().expect("lock").get(symbol).cloned() {
             return Ok(meta);
         }
+        self.refresh_symbol_catalog().await?;
+        self.metadata
+            .lock()
+            .expect("lock")
+            .get(symbol)
+            .cloned()
+            .with_context(|| format!("binance exchange info missing symbol {}", venue_symbol(&self.config, symbol)))
+    }
 
-        let venue_symbol = venue_symbol(&self.config, symbol);
+    async fn refresh_symbol_catalog(&self) -> Result<()> {
         let response = self
             .client
             .get(format!("{}/fapi/v1/exchangeInfo", self.base_url))
@@ -373,42 +425,31 @@ impl BinanceLiveAdapter {
             .json::<BinanceExchangeInfo>()
             .await
             .context("failed to decode binance exchange info")?;
-        let symbol_info = response
-            .symbols
-            .into_iter()
-            .find(|item| item.symbol == venue_symbol)
-            .with_context(|| format!("binance exchange info missing symbol {venue_symbol}"))?;
 
-        let lot_size = symbol_info
-            .filters
-            .iter()
-            .find(|filter| filter.filter_type == "MARKET_LOT_SIZE")
-            .or_else(|| {
-                symbol_info
-                    .filters
-                    .iter()
-                    .find(|filter| filter.filter_type == "LOT_SIZE")
-            })
-            .ok_or_else(|| anyhow!("binance lot size filter missing for {venue_symbol}"))?;
-        let meta = BinanceSymbolMeta {
-            min_qty: parse_f64(
-                lot_size
-                    .min_qty
-                    .as_deref()
-                    .ok_or_else(|| anyhow!("binance minQty missing for {venue_symbol}"))?,
-            )?,
-            step_size: parse_f64(
-                lot_size
-                    .step_size
-                    .as_deref()
-                    .ok_or_else(|| anyhow!("binance stepSize missing for {venue_symbol}"))?,
-            )?,
-        };
-        self.metadata
-            .lock()
-            .expect("lock")
-            .insert(symbol.to_string(), meta.clone());
-        Ok(meta)
+        let mut metadata = HashMap::new();
+        let mut supported_symbols = HashSet::new();
+        for symbol_info in response.symbols {
+            if !binance_symbol_is_supported(&symbol_info) {
+                continue;
+            }
+            let Some(meta) = binance_symbol_meta_from_exchange_symbol(&symbol_info)? else {
+                continue;
+            };
+            supported_symbols.insert(symbol_info.symbol.clone());
+            metadata.insert(symbol_info.symbol, meta);
+        }
+
+        store_json_cache(
+            "binance-symbols.json",
+            &BinanceSymbolCatalogCache {
+                updated_at_ms: now_ms(),
+                supported_symbols: supported_symbols.iter().cloned().collect(),
+                metadata: metadata.clone(),
+            },
+        );
+        *self.metadata.lock().expect("lock") = metadata;
+        *self.supported_symbols.lock().expect("lock") = supported_symbols;
+        Ok(())
     }
 
     async fn signed_request(
@@ -514,7 +555,8 @@ impl VenueAdapter for BinanceLiveAdapter {
     async fn fetch_market_snapshot(&self, symbols: &[String]) -> Result<VenueMarketSnapshot> {
         let mut quotes = Vec::new();
         let mut observed_at_ms = 0_i64;
-        for symbol in symbols {
+        let allow_direct_fallback = symbols.len() == 1;
+        for symbol in symbols.iter().filter(|symbol| self.supports_symbol(symbol)) {
             if let Some(snapshot) = self.cached_snapshot(symbol) {
                 observed_at_ms = observed_at_ms.max(
                     self.market_ws
@@ -523,11 +565,16 @@ impl VenueAdapter for BinanceLiveAdapter {
                         .unwrap_or_default(),
                 );
                 quotes.push(snapshot);
-            } else {
+            } else if allow_direct_fallback {
                 let snapshot = self.fetch_symbol_snapshot(symbol).await?;
                 observed_at_ms = observed_at_ms.max(snapshot.funding_timestamp_ms.min(now_ms()));
                 quotes.push(snapshot);
             }
+        }
+        if quotes.is_empty() {
+            return Err(anyhow!(
+                "binance market snapshot unavailable for requested symbols"
+            ));
         }
 
         Ok(VenueMarketSnapshot {
@@ -759,10 +806,17 @@ impl VenueAdapter for BinanceLiveAdapter {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct BinanceSymbolMeta {
     min_qty: f64,
     step_size: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct BinanceSymbolCatalogCache {
+    updated_at_ms: i64,
+    supported_symbols: Vec<String>,
+    metadata: HashMap<String, BinanceSymbolMeta>,
 }
 
 #[derive(Clone, Debug)]
@@ -837,6 +891,11 @@ struct BinanceExchangeInfo {
 #[derive(Debug, Deserialize)]
 struct BinanceExchangeSymbol {
     symbol: String,
+    status: Option<String>,
+    #[serde(rename = "contractType")]
+    contract_type: Option<String>,
+    #[serde(rename = "quoteAsset")]
+    quote_asset: Option<String>,
     filters: Vec<BinanceFilter>,
 }
 
@@ -868,6 +927,54 @@ struct BinanceListenKeyResponse {
     listen_key: String,
 }
 
+fn binance_symbol_is_supported(symbol: &BinanceExchangeSymbol) -> bool {
+    let is_trading = symbol
+        .status
+        .as_deref()
+        .is_none_or(|status| status.eq_ignore_ascii_case("TRADING"));
+    let is_perpetual = symbol
+        .contract_type
+        .as_deref()
+        .is_none_or(|value| value.eq_ignore_ascii_case("PERPETUAL"));
+    let is_quote_supported = symbol
+        .quote_asset
+        .as_deref()
+        .is_none_or(|quote| matches!(quote, "USDT" | "USDC"));
+    is_trading && is_perpetual && is_quote_supported
+}
+
+fn binance_symbol_meta_from_exchange_symbol(
+    symbol_info: &BinanceExchangeSymbol,
+) -> Result<Option<BinanceSymbolMeta>> {
+    let lot_size = symbol_info
+        .filters
+        .iter()
+        .find(|filter| filter.filter_type == "MARKET_LOT_SIZE")
+        .or_else(|| {
+            symbol_info
+                .filters
+                .iter()
+                .find(|filter| filter.filter_type == "LOT_SIZE")
+        });
+    let Some(lot_size) = lot_size else {
+        return Ok(None);
+    };
+    Ok(Some(BinanceSymbolMeta {
+        min_qty: parse_f64(
+            lot_size
+                .min_qty
+                .as_deref()
+                .ok_or_else(|| anyhow!("binance minQty missing for {}", symbol_info.symbol))?,
+        )?,
+        step_size: parse_f64(
+            lot_size
+                .step_size
+                .as_deref()
+                .ok_or_else(|| anyhow!("binance stepSize missing for {}", symbol_info.symbol))?,
+        )?,
+    }))
+}
+
 fn binance_position_side(mode: BinancePositionMode, side: Side, reduce_only: bool) -> &'static str {
     match mode {
         BinancePositionMode::OneWay => "BOTH",
@@ -886,6 +993,21 @@ fn binance_ws_base_url(base_url: &str) -> &'static str {
     } else {
         "wss://fstream.binance.com"
     }
+}
+
+fn build_binance_subscribe_messages(stream_names: &[String]) -> Vec<String> {
+    stream_names
+        .chunks(BINANCE_MAX_SUBSCRIBE_STREAMS_PER_MESSAGE)
+        .enumerate()
+        .map(|(index, chunk)| {
+            serde_json::json!({
+                "method": "SUBSCRIBE",
+                "params": chunk,
+                "id": index + 1,
+            })
+            .to_string()
+        })
+        .collect()
 }
 
 async fn start_binance_listen_key(
@@ -1081,7 +1203,10 @@ fn handle_binance_private_message(
 
 #[cfg(test)]
 mod tests {
-    use super::{binance_position_side, BinancePositionMode, BinancePremiumIndex};
+    use super::{
+        binance_position_side, build_binance_subscribe_messages, BinancePositionMode,
+        BinancePremiumIndex, BINANCE_MAX_SUBSCRIBE_STREAMS_PER_MESSAGE,
+    };
     use crate::models::Side;
 
     #[test]
@@ -1113,6 +1238,21 @@ mod tests {
             binance_position_side(BinancePositionMode::Hedge, Side::Buy, true),
             "SHORT"
         );
+    }
+
+    #[test]
+    fn market_subscribe_messages_are_chunked_for_large_symbol_sets() {
+        let streams = (0..400)
+            .map(|index| format!("symbol{index}@bookTicker"))
+            .collect::<Vec<_>>();
+        let messages = build_binance_subscribe_messages(&streams);
+        assert!(messages.len() > 1);
+        for message in messages {
+            let payload: serde_json::Value =
+                serde_json::from_str(&message).expect("decode subscribe payload");
+            let params = payload["params"].as_array().expect("params");
+            assert!(params.len() <= BINANCE_MAX_SUBSCRIBE_STREAMS_PER_MESSAGE);
+        }
     }
 }
 

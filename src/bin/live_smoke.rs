@@ -280,21 +280,15 @@ async fn build_live_adapters(config: &AppConfig) -> Result<Vec<Arc<dyn VenueAdap
     let mut adapters: Vec<Arc<dyn VenueAdapter>> = Vec::new();
     for venue_config in config.enabled_venues() {
         let adapter: Arc<dyn VenueAdapter> = match venue_config.venue {
-            Venue::Binance => Arc::new(BinanceLiveAdapter::new(
-                venue_config,
-                &config.runtime,
-                &config.symbols,
-            )?),
-            Venue::Okx => Arc::new(OkxLiveAdapter::new(
-                venue_config,
-                &config.runtime,
-                &config.symbols,
-            )?),
-            Venue::Bybit => Arc::new(BybitLiveAdapter::new(
-                venue_config,
-                &config.runtime,
-                &config.symbols,
-            )?),
+            Venue::Binance => Arc::new(
+                BinanceLiveAdapter::new(venue_config, &config.runtime, &config.symbols).await?,
+            ),
+            Venue::Okx => {
+                Arc::new(OkxLiveAdapter::new(venue_config, &config.runtime, &config.symbols).await?)
+            }
+            Venue::Bybit => Arc::new(
+                BybitLiveAdapter::new(venue_config, &config.runtime, &config.symbols).await?,
+            ),
             Venue::Hyperliquid => Arc::new(
                 lightfee::HyperliquidLiveAdapter::new(
                     venue_config,

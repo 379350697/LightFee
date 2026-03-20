@@ -1,5 +1,6 @@
 mod binance;
 mod bybit;
+mod cache;
 mod common;
 mod hyperliquid;
 mod okx;
@@ -15,6 +16,9 @@ pub(crate) use common::{
     base_asset, build_http_client, build_query, estimate_fee_quote, floor_to_step, format_decimal,
     hinted_fill, hmac_sha256_base64, hmac_sha256_hex, iso8601_from_ms, now_ms, parse_bool_flag,
     parse_f64, parse_i64, quote_fill, venue_symbol,
+};
+pub(crate) use cache::{
+    cache_is_fresh, load_json_cache, store_json_cache, SYMBOL_CACHE_TTL_MS, TRANSFER_CACHE_TTL_MS,
 };
 pub(crate) use private_ws::{
     enrich_fill_from_private, lookup_or_wait_private_order, PrivateOrderUpdate, WsPrivateState,

@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
 };
 
@@ -10,7 +10,7 @@ use reqwest::{
     header::{HeaderMap, HeaderValue},
     Client,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::time::{interval, sleep, Duration, MissedTickBehavior};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tracing::{debug, warn};
@@ -26,12 +26,15 @@ use crate::{
 };
 
 use super::{
-    base_asset, build_http_client, build_query, enrich_fill_from_private, estimate_fee_quote,
-    floor_to_step, format_decimal, hinted_fill, hmac_sha256_base64, iso8601_from_ms,
-    lookup_or_wait_private_order, merged_quote_snapshot, now_ms, parse_f64, parse_i64,
-    parse_text_message, quote_fill, spawn_ws_loop, venue_symbol, PrivateOrderUpdate, WsMarketState,
-    WsPrivateState,
+    base_asset, build_http_client, build_query, cache_is_fresh, enrich_fill_from_private,
+    estimate_fee_quote, floor_to_step, format_decimal, hinted_fill, hmac_sha256_base64,
+    iso8601_from_ms, load_json_cache, lookup_or_wait_private_order, merged_quote_snapshot,
+    now_ms, parse_f64, parse_i64, parse_text_message, quote_fill, spawn_ws_loop,
+    store_json_cache, venue_symbol, PrivateOrderUpdate, WsMarketState, WsPrivateState,
+    SYMBOL_CACHE_TTL_MS,
 };
+
+const OKX_MAX_SUBSCRIBE_ARGS_PER_MESSAGE: usize = 100;
 
 pub struct OkxLiveAdapter {
     config: VenueConfig,
@@ -39,6 +42,7 @@ pub struct OkxLiveAdapter {
     client: Client,
     base_url: String,
     metadata: Mutex<HashMap<String, OkxInstrumentMeta>>,
+    supported_symbols: Mutex<HashSet<String>>,
     position_mode: Mutex<Option<OkxPositionMode>>,
     time_offset_ms: Mutex<Option<i64>>,
     market_ws: Arc<WsMarketState>,
@@ -46,30 +50,69 @@ pub struct OkxLiveAdapter {
 }
 
 impl OkxLiveAdapter {
-    pub fn new(config: &VenueConfig, runtime: &RuntimeConfig, symbols: &[String]) -> Result<Self> {
+    pub async fn new(
+        config: &VenueConfig,
+        runtime: &RuntimeConfig,
+        symbols: &[String],
+    ) -> Result<Self> {
         if config.venue != Venue::Okx {
             return Err(anyhow!("okx live adapter requires okx config"));
         }
 
         let market_ws = WsMarketState::new();
+        let persisted_catalog = load_json_cache::<OkxSymbolCatalogCache>("okx-symbols.json");
+        let mut metadata = HashMap::new();
+        let mut supported_symbols = HashSet::new();
+        if let Some(cache) = persisted_catalog {
+            if !cache_is_fresh(cache.updated_at_ms, now_ms(), SYMBOL_CACHE_TTL_MS) {
+                debug!("okx symbol catalog cache is stale; using as fallback seed");
+            }
+            metadata.extend(cache.metadata);
+            supported_symbols.extend(cache.supported_symbols);
+        }
         let adapter = Self {
             config: config.clone(),
             runtime: runtime.clone(),
-            client: build_http_client(runtime.chillybot_timeout_ms)?,
+            client: build_http_client(runtime.exchange_http_timeout_ms)?,
             base_url: config
                 .live
                 .base_url
                 .clone()
                 .unwrap_or_else(|| "https://www.okx.com".to_string()),
-            metadata: Mutex::new(HashMap::new()),
+            metadata: Mutex::new(metadata),
+            supported_symbols: Mutex::new(supported_symbols),
             position_mode: Mutex::new(None),
             time_offset_ms: Mutex::new(None),
             market_ws,
             private_ws: WsPrivateState::new(),
         };
-        adapter.start_market_ws(symbols);
-        adapter.start_private_ws(symbols);
+        if let Err(error) = adapter.refresh_symbol_catalog().await {
+            if adapter.supported_symbols.lock().expect("lock").is_empty() {
+                return Err(error);
+            }
+            warn!(?error, "okx symbol catalog refresh failed; using persisted cache");
+        }
+        let tracked_symbols = adapter.tracked_symbols(symbols);
+        adapter.start_market_ws(&tracked_symbols);
+        adapter.start_private_ws(&tracked_symbols);
         Ok(adapter)
+    }
+
+    fn tracked_symbols(&self, requested_symbols: &[String]) -> Vec<String> {
+        requested_symbols
+            .iter()
+            .filter(|symbol| {
+                self.supported_symbols
+                    .lock()
+                    .expect("lock")
+                    .contains(symbol.as_str())
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn supports_symbol(&self, symbol: &str) -> bool {
+        self.supported_symbols.lock().expect("lock").contains(symbol)
     }
 
     fn start_market_ws(&self, symbols: &[String]) {
@@ -93,16 +136,12 @@ impl OkxLiveAdapter {
                 "instId": inst_id,
             }));
         }
-        let subscribe = serde_json::json!({
-            "op": "subscribe",
-            "args": args,
-        })
-        .to_string();
+        let subscribe_messages = build_okx_subscribe_messages(&args);
         let state = self.market_ws.clone();
         spawn_ws_loop(
             "okx",
             okx_public_ws_url(&self.base_url).to_string(),
-            vec![subscribe],
+            subscribe_messages,
             state,
             self.runtime.ws_reconnect_initial_ms,
             self.runtime.ws_reconnect_max_ms,
@@ -191,7 +230,11 @@ impl OkxLiveAdapter {
         let Some((funding_rate, funding_timestamp_ms)) = self.market_ws.funding(symbol) else {
             return Ok(None);
         };
-        let meta = self.symbol_meta(symbol).await?;
+        let meta = match self.symbol_meta(symbol).await {
+            Ok(meta) => meta,
+            Err(error) if is_missing_okx_instrument_meta(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        };
         Ok(Some((
             merged_quote_snapshot(
                 symbol,
@@ -231,17 +274,15 @@ impl OkxLiveAdapter {
             .iter()
             .map(|symbol| (venue_symbol(&self.config, symbol), symbol.clone()))
             .collect::<HashMap<_, _>>();
+        let subscribe_messages = build_okx_private_subscribe_messages(&symbol_map);
         let url = okx_private_ws_url(&self.base_url).to_string();
+        let ct_val_map = okx_ct_val_map_from_cached_metadata(
+            &self.metadata.lock().expect("lock"),
+            &symbol_map,
+        );
         let task = tokio::spawn(async move {
             let mut reconnect_backoff =
                 FailureBackoff::new(reconnect_initial_ms, reconnect_max_ms, Venue::Okx as u64);
-            let ct_val_map = match fetch_okx_ct_val_map(&client, &base_url, &symbol_map).await {
-                Ok(map) => map,
-                Err(error) => {
-                    warn!(?error, "okx private websocket metadata bootstrap failed");
-                    HashMap::new()
-                }
-            };
             loop {
                 match connect_async(url.as_str()).await {
                     Ok((mut socket, _)) => {
@@ -331,18 +372,21 @@ impl OkxLiveAdapter {
                                                 &private_state,
                                                 &symbol_map,
                                                 &ct_val_map,
+                                                &subscribe_messages,
                                                 text.as_ref(),
                                                 &mut subscribed,
                                             ) {
-                                                Ok(Some(subscribe_payload)) => {
-                                                    if let Err(error) = socket.send(Message::Text(subscribe_payload.into())).await {
-                                                        private_state.record_connection_failure(
-                                                            now_ms(),
-                                                            unhealthy_after_failures,
-                                                            error.to_string(),
-                                                        );
-                                                        warn!(?error, "okx private websocket subscribe send failed");
-                                                        break;
+                                                Ok(Some(subscribe_payloads)) => {
+                                                    for subscribe_payload in subscribe_payloads {
+                                                        if let Err(error) = socket.send(Message::Text(subscribe_payload.into())).await {
+                                                            private_state.record_connection_failure(
+                                                                now_ms(),
+                                                                unhealthy_after_failures,
+                                                                error.to_string(),
+                                                            );
+                                                            warn!(?error, "okx private websocket subscribe send failed");
+                                                            break;
+                                                        }
                                                     }
                                                 }
                                                 Ok(None) => {}
@@ -409,34 +453,35 @@ impl OkxLiveAdapter {
         if let Some(meta) = self.metadata.lock().expect("lock").get(symbol).cloned() {
             return Ok(meta);
         }
-
-        let inst_id = venue_symbol(&self.config, symbol);
-        let response = self
-            .client
-            .get(format!("{}/api/v5/public/instruments", self.base_url))
-            .query(&[("instType", "SWAP"), ("instId", inst_id.as_str())])
-            .send()
-            .await
-            .context("failed to request okx instruments")?
-            .error_for_status()
-            .context("okx instruments returned non-success status")?
-            .json::<OkxApiResponse<OkxInstrument>>()
-            .await
-            .context("failed to decode okx instruments")?;
-        let instrument = response
-            .data
-            .into_iter()
-            .next()
-            .with_context(|| format!("okx instrument metadata missing for {inst_id}"))?;
-        let meta = OkxInstrumentMeta {
-            ct_val: parse_f64(&instrument.ct_val)?,
-            lot_sz: parse_f64(&instrument.lot_sz)?,
-        };
+        self.refresh_symbol_catalog().await?;
         self.metadata
             .lock()
             .expect("lock")
-            .insert(symbol.to_string(), meta.clone());
-        Ok(meta)
+            .get(symbol)
+            .cloned()
+            .with_context(|| format!("okx instrument metadata missing for {}", venue_symbol(&self.config, symbol)))
+    }
+
+    async fn refresh_symbol_catalog(&self) -> Result<()> {
+        let instrument_map = fetch_okx_instrument_meta_map(&self.client, &self.base_url).await?;
+        let mut metadata = HashMap::new();
+        let mut supported_symbols = HashSet::new();
+        for (instrument_id, meta) in instrument_map {
+            let symbol_key = okx_symbol_key(&instrument_id);
+            supported_symbols.insert(symbol_key.clone());
+            metadata.insert(symbol_key, meta);
+        }
+        store_json_cache(
+            "okx-symbols.json",
+            &OkxSymbolCatalogCache {
+                updated_at_ms: now_ms(),
+                supported_symbols: supported_symbols.iter().cloned().collect(),
+                metadata: metadata.clone(),
+            },
+        );
+        *self.metadata.lock().expect("lock") = metadata;
+        *self.supported_symbols.lock().expect("lock") = supported_symbols;
+        Ok(())
     }
 
     async fn position_mode(&self) -> Result<OkxPositionMode> {
@@ -470,6 +515,9 @@ impl OkxLiveAdapter {
     }
 
     async fn fetch_symbol_snapshot(&self, symbol: &str) -> Result<SymbolMarketSnapshot> {
+        if !self.supports_symbol(symbol) {
+            return Err(anyhow!("okx symbol not supported for {}", symbol));
+        }
         let inst_id = venue_symbol(&self.config, symbol);
         let meta = self.symbol_meta(symbol).await?;
         let book = self
@@ -602,6 +650,12 @@ impl OkxLiveAdapter {
     }
 }
 
+fn is_missing_okx_instrument_meta(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().contains("okx instrument metadata missing"))
+}
+
 #[async_trait]
 impl VenueAdapter for OkxLiveAdapter {
     fn venue(&self) -> Venue {
@@ -611,15 +665,21 @@ impl VenueAdapter for OkxLiveAdapter {
     async fn fetch_market_snapshot(&self, symbols: &[String]) -> Result<VenueMarketSnapshot> {
         let mut quotes = Vec::new();
         let mut observed_at_ms = 0_i64;
-        for symbol in symbols {
+        let allow_direct_fallback = symbols.len() == 1;
+        for symbol in symbols.iter().filter(|symbol| self.supports_symbol(symbol)) {
             if let Some((snapshot, snapshot_observed_at_ms)) = self.cached_snapshot(symbol).await? {
                 observed_at_ms = observed_at_ms.max(snapshot_observed_at_ms);
                 quotes.push(snapshot);
-            } else {
+            } else if allow_direct_fallback {
                 let snapshot = self.fetch_symbol_snapshot(symbol).await?;
                 observed_at_ms = observed_at_ms.max(snapshot.funding_timestamp_ms.min(now_ms()));
                 quotes.push(snapshot);
             }
+        }
+        if quotes.is_empty() {
+            return Err(anyhow!(
+                "okx market snapshot unavailable for requested symbols"
+            ));
         }
 
         Ok(VenueMarketSnapshot {
@@ -767,6 +827,43 @@ impl VenueAdapter for OkxLiveAdapter {
         })
     }
 
+    async fn fetch_all_positions(&self) -> Result<Option<Vec<PositionSnapshot>>> {
+        let response = self
+            .signed_request(reqwest::Method::GET, "/api/v5/account/positions", None, None)
+            .await?
+            .json::<OkxApiResponse<OkxPosition>>()
+            .await
+            .context("failed to decode okx positions")?;
+
+        let metadata = self.metadata.lock().expect("lock").clone();
+        let mut positions_by_symbol = HashMap::new();
+        for position in response.data {
+            let symbol = okx_symbol_key(&position.inst_id);
+            let Some(meta) = metadata.get(&symbol) else {
+                continue;
+            };
+            let contracts = parse_f64(&position.pos)?;
+            let signed = match position.pos_side.as_deref() {
+                Some("long") => contracts.abs(),
+                Some("short") => -contracts.abs(),
+                _ => contracts,
+            };
+            *positions_by_symbol.entry(symbol).or_insert(0.0) += signed * meta.ct_val;
+        }
+
+        Ok(Some(
+            positions_by_symbol
+                .into_iter()
+                .map(|(symbol, size)| PositionSnapshot {
+                    venue: Venue::Okx,
+                    symbol,
+                    size,
+                    updated_at_ms: now_ms(),
+                })
+                .collect(),
+        ))
+    }
+
     async fn normalize_quantity(&self, symbol: &str, quantity: f64) -> Result<f64> {
         let meta = self.symbol_meta(symbol).await?;
         let contracts = floor_to_step(quantity / meta.ct_val, meta.lot_sz);
@@ -830,10 +927,17 @@ impl VenueAdapter for OkxLiveAdapter {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct OkxInstrumentMeta {
     ct_val: f64,
     lot_sz: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct OkxSymbolCatalogCache {
+    updated_at_ms: i64,
+    supported_symbols: Vec<String>,
+    metadata: HashMap<String, OkxInstrumentMeta>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -843,6 +947,8 @@ struct OkxApiResponse<T> {
 
 #[derive(Debug, Deserialize)]
 struct OkxInstrument {
+    #[serde(rename = "instId")]
+    inst_id: String,
     #[serde(rename = "ctVal")]
     ct_val: String,
     #[serde(rename = "lotSz")]
@@ -882,6 +988,8 @@ struct OkxOrderAck {
 
 #[derive(Debug, Deserialize)]
 struct OkxPosition {
+    #[serde(rename = "instId")]
+    inst_id: String,
     pos: String,
     #[serde(rename = "posSide")]
     pos_side: Option<String>,
@@ -947,43 +1055,62 @@ async fn fetch_okx_server_timestamp_ms(client: &Client, base_url: &str) -> Resul
     parse_i64(&server_time)
 }
 
-async fn fetch_okx_ct_val_map(
+fn okx_ct_val_map_from_cached_metadata(
+    metadata: &HashMap<String, OkxInstrumentMeta>,
+    symbol_map: &HashMap<String, String>,
+) -> HashMap<String, f64> {
+    let mut map = HashMap::new();
+    for (inst_id, symbol) in symbol_map {
+        if let Some(meta) = metadata.get(symbol) {
+            map.insert(inst_id.clone(), meta.ct_val);
+        }
+    }
+    for inst_id in symbol_map.keys() {
+        map.entry(inst_id.clone()).or_insert(1.0);
+    }
+    map
+}
+
+async fn fetch_okx_instrument_meta_map(
     client: &Client,
     base_url: &str,
-    symbol_map: &HashMap<String, String>,
-) -> Result<HashMap<String, f64>> {
+) -> Result<HashMap<String, OkxInstrumentMeta>> {
+    let response = client
+        .get(format!("{base_url}/api/v5/public/instruments"))
+        .query(&[("instType", "SWAP")])
+        .send()
+        .await
+        .context("failed to request okx instruments")?
+        .error_for_status()
+        .context("okx instruments returned non-success status")?
+        .json::<OkxApiResponse<OkxInstrument>>()
+        .await
+        .context("failed to decode okx instruments")?;
     let mut map = HashMap::new();
-    for inst_id in symbol_map.keys() {
-        let response = client
-            .get(format!("{base_url}/api/v5/public/instruments"))
-            .query(&[("instType", "SWAP"), ("instId", inst_id.as_str())])
-            .send()
-            .await
-            .with_context(|| format!("failed to request okx instrument metadata for {inst_id}"))?
-            .error_for_status()
-            .context("okx instrument metadata returned non-success status")?
-            .json::<OkxApiResponse<OkxInstrument>>()
-            .await
-            .context("failed to decode okx instrument metadata")?;
-        let ct_val = response
-            .data
-            .into_iter()
-            .next()
-            .map(|instrument| parse_f64(&instrument.ct_val))
-            .transpose()?
-            .unwrap_or(1.0);
-        map.insert(inst_id.clone(), ct_val);
+    for instrument in response.data {
+        map.insert(
+            instrument.inst_id,
+            OkxInstrumentMeta {
+                ct_val: parse_f64(&instrument.ct_val)?,
+                lot_sz: parse_f64(&instrument.lot_sz)?,
+            },
+        );
     }
     Ok(map)
+}
+
+fn okx_symbol_key(inst_id: &str) -> String {
+    inst_id.replace('-', "").trim_end_matches("SWAP").to_string()
 }
 
 fn handle_okx_private_message(
     private_state: &Arc<WsPrivateState>,
     symbol_map: &HashMap<String, String>,
     ct_val_map: &HashMap<String, f64>,
+    subscribe_messages: &[String],
     raw: &str,
     subscribed: &mut bool,
-) -> Result<Option<String>> {
+) -> Result<Option<Vec<String>>> {
     let payload = parse_text_message(raw)?;
     if payload
         .get("event")
@@ -995,22 +1122,7 @@ fn handle_okx_private_message(
             .is_some_and(|code| code == "0")
     {
         *subscribed = true;
-        let args = symbol_map
-            .keys()
-            .flat_map(|inst_id| {
-                [
-                    serde_json::json!({ "channel": "orders", "instType": "SWAP", "instId": inst_id }),
-                    serde_json::json!({ "channel": "positions", "instType": "SWAP", "instId": inst_id }),
-                ]
-            })
-            .collect::<Vec<_>>();
-        return Ok(Some(
-            serde_json::json!({
-                "op": "subscribe",
-                "args": args,
-            })
-            .to_string(),
-        ));
+        return Ok(Some(subscribe_messages.to_vec()));
     }
     if payload
         .get("event")
@@ -1139,6 +1251,31 @@ fn handle_okx_private_message(
     Ok(None)
 }
 
+fn build_okx_subscribe_messages(args: &[serde_json::Value]) -> Vec<String> {
+    args.chunks(OKX_MAX_SUBSCRIBE_ARGS_PER_MESSAGE)
+        .map(|chunk| {
+            serde_json::json!({
+                "op": "subscribe",
+                "args": chunk,
+            })
+            .to_string()
+        })
+        .collect()
+}
+
+fn build_okx_private_subscribe_messages(symbol_map: &HashMap<String, String>) -> Vec<String> {
+    let args = symbol_map
+        .keys()
+        .flat_map(|inst_id| {
+            [
+                serde_json::json!({ "channel": "orders", "instType": "SWAP", "instId": inst_id }),
+                serde_json::json!({ "channel": "positions", "instType": "SWAP", "instId": inst_id }),
+            ]
+        })
+        .collect::<Vec<_>>();
+    build_okx_subscribe_messages(&args)
+}
+
 #[derive(Debug, Deserialize)]
 struct OkxCurrency {
     ccy: String,
@@ -1150,7 +1287,12 @@ struct OkxCurrency {
 
 #[cfg(test)]
 mod tests {
-    use super::{okx_pos_side, OkxPositionMode};
+    use std::collections::HashMap;
+
+    use super::{
+        build_okx_private_subscribe_messages, build_okx_subscribe_messages, okx_pos_side,
+        OkxPositionMode, OKX_MAX_SUBSCRIBE_ARGS_PER_MESSAGE,
+    };
     use crate::models::Side;
 
     #[test]
@@ -1177,5 +1319,29 @@ mod tests {
     fn pos_side_maps_net_mode_to_net() {
         assert_eq!(okx_pos_side(OkxPositionMode::Net, Side::Buy, false), "net");
         assert_eq!(okx_pos_side(OkxPositionMode::Net, Side::Sell, true), "net");
+    }
+
+    #[test]
+    fn okx_market_subscriptions_are_chunked() {
+        let args = (0..220)
+            .map(|index| serde_json::json!({"channel": "tickers", "instId": format!("COIN{index}-USDT-SWAP")}))
+            .collect::<Vec<_>>();
+        let messages = build_okx_subscribe_messages(&args);
+        assert!(messages.len() > 1);
+        for message in messages {
+            let payload: serde_json::Value =
+                serde_json::from_str(&message).expect("decode subscribe payload");
+            let args = payload["args"].as_array().expect("args");
+            assert!(args.len() <= OKX_MAX_SUBSCRIBE_ARGS_PER_MESSAGE);
+        }
+    }
+
+    #[test]
+    fn okx_private_subscriptions_are_chunked() {
+        let symbol_map = (0..120)
+            .map(|index| (format!("COIN{index}-USDT-SWAP"), format!("COIN{index}USDT")))
+            .collect::<HashMap<_, _>>();
+        let messages = build_okx_private_subscribe_messages(&symbol_map);
+        assert!(messages.len() > 1);
     }
 }

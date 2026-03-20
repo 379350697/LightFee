@@ -39,6 +39,18 @@ async fn main() -> Result<()> {
     )
     .await?;
 
+    if let Some(warmup_ms) = startup_market_warmup_ms(
+        config.runtime.mode.clone(),
+        engine.state().open_positions.len(),
+        config.runtime.poll_interval_ms,
+    ) {
+        info!(
+            warmup_ms,
+            "waiting for live market warmup before first tick"
+        );
+        time::sleep(Duration::from_millis(warmup_ms)).await;
+    }
+
     info!(
         poll_interval_ms = config.runtime.poll_interval_ms,
         mode = ?config.runtime.mode,
@@ -79,6 +91,17 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn startup_market_warmup_ms(
+    mode: RuntimeMode,
+    active_position_count: usize,
+    poll_interval_ms: u64,
+) -> Option<u64> {
+    if !matches!(mode, RuntimeMode::Live) || active_position_count > 0 {
+        return None;
+    }
+    Some(poll_interval_ms.saturating_mul(3).clamp(3_000, 10_000))
 }
 
 async fn build_adapters(
@@ -129,21 +152,15 @@ async fn build_live_adapters(config: &AppConfig) -> Result<Vec<Arc<dyn VenueAdap
 
     for venue_config in config.enabled_venues() {
         let adapter: Arc<dyn VenueAdapter> = match venue_config.venue {
-            Venue::Binance => Arc::new(BinanceLiveAdapter::new(
-                venue_config,
-                &config.runtime,
-                &config.symbols,
-            )?),
-            Venue::Okx => Arc::new(OkxLiveAdapter::new(
-                venue_config,
-                &config.runtime,
-                &config.symbols,
-            )?),
-            Venue::Bybit => Arc::new(BybitLiveAdapter::new(
-                venue_config,
-                &config.runtime,
-                &config.symbols,
-            )?),
+            Venue::Binance => Arc::new(
+                BinanceLiveAdapter::new(venue_config, &config.runtime, &config.symbols).await?,
+            ),
+            Venue::Okx => {
+                Arc::new(OkxLiveAdapter::new(venue_config, &config.runtime, &config.symbols).await?)
+            }
+            Venue::Bybit => Arc::new(
+                BybitLiveAdapter::new(venue_config, &config.runtime, &config.symbols).await?,
+            ),
             Venue::Hyperliquid => Arc::new(
                 HyperliquidLiveAdapter::new(venue_config, &config.runtime, &config.symbols).await?,
             ),
@@ -180,5 +197,29 @@ fn build_sources(
             let transfer_status_source: Arc<dyn TransferStatusSource> = source;
             Ok((Some(opportunity_source), Some(transfer_status_source)))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::startup_market_warmup_ms;
+    use lightfee::config::RuntimeMode;
+
+    #[test]
+    fn live_startup_warms_up_when_no_positions_are_open() {
+        assert_eq!(
+            startup_market_warmup_ms(RuntimeMode::Live, 0, 1_500),
+            Some(4_500)
+        );
+    }
+
+    #[test]
+    fn live_startup_skips_warmup_when_positions_exist() {
+        assert_eq!(startup_market_warmup_ms(RuntimeMode::Live, 1, 1_500), None);
+    }
+
+    #[test]
+    fn paper_mode_skips_warmup() {
+        assert_eq!(startup_market_warmup_ms(RuntimeMode::Paper, 0, 1_500), None);
     }
 }

@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap, HashSet},
     sync::{Arc, Mutex},
 };
 
@@ -10,7 +10,7 @@ use reqwest::{
     header::{HeaderMap, HeaderValue},
     Client,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::time::{interval, sleep, Duration, MissedTickBehavior};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tracing::{debug, warn};
@@ -26,11 +26,15 @@ use crate::{
 };
 
 use super::{
-    base_asset, build_http_client, build_query, enrich_fill_from_private, estimate_fee_quote,
-    floor_to_step, format_decimal, hinted_fill, hmac_sha256_hex, lookup_or_wait_private_order,
-    now_ms, parse_bool_flag, parse_f64, parse_i64, parse_text_message, quote_fill, spawn_ws_loop,
-    venue_symbol, PrivateOrderUpdate, WsMarketState, WsPrivateState,
+    base_asset, build_http_client, build_query, cache_is_fresh, enrich_fill_from_private,
+    estimate_fee_quote, floor_to_step, format_decimal, hinted_fill, hmac_sha256_hex,
+    load_json_cache, lookup_or_wait_private_order, now_ms, parse_bool_flag, parse_f64,
+    parse_i64, parse_text_message, quote_fill, spawn_ws_loop, store_json_cache, venue_symbol,
+    PrivateOrderUpdate, WsMarketState, WsPrivateState, SYMBOL_CACHE_TTL_MS,
+    TRANSFER_CACHE_TTL_MS,
 };
+
+const BYBIT_MAX_SUBSCRIBE_TOPICS_PER_MESSAGE: usize = 100;
 
 pub struct BybitLiveAdapter {
     config: VenueConfig,
@@ -38,35 +42,86 @@ pub struct BybitLiveAdapter {
     client: Client,
     base_url: String,
     metadata: Mutex<HashMap<String, BybitInstrumentMeta>>,
+    supported_symbols: Mutex<HashSet<String>>,
+    transfer_status_cache: Mutex<Option<BybitTransferStatusCache>>,
     time_offset_ms: Mutex<Option<i64>>,
     market_ws: Arc<WsMarketState>,
     private_ws: Arc<WsPrivateState>,
 }
 
 impl BybitLiveAdapter {
-    pub fn new(config: &VenueConfig, runtime: &RuntimeConfig, symbols: &[String]) -> Result<Self> {
+    pub async fn new(
+        config: &VenueConfig,
+        runtime: &RuntimeConfig,
+        symbols: &[String],
+    ) -> Result<Self> {
         if config.venue != Venue::Bybit {
             return Err(anyhow!("bybit live adapter requires bybit config"));
         }
 
         let market_ws = WsMarketState::new();
+        let persisted_catalog = load_json_cache::<BybitSymbolCatalogCache>("bybit-symbols.json");
+        let persisted_transfer_cache =
+            load_json_cache::<BybitTransferStatusCache>("bybit-transfer-status.json");
+        let mut metadata = HashMap::new();
+        let mut supported_symbols = HashSet::new();
+        if let Some(cache) = persisted_catalog {
+            if !cache_is_fresh(cache.updated_at_ms, now_ms(), SYMBOL_CACHE_TTL_MS) {
+                debug!("bybit symbol catalog cache is stale; using as fallback seed");
+            }
+            metadata.extend(cache.metadata);
+            supported_symbols.extend(cache.supported_symbols);
+        }
+        let transfer_status_cache = persisted_transfer_cache.filter(|cache| {
+            cache_is_fresh(
+                cache.observed_at_ms,
+                now_ms(),
+                (runtime.transfer_status_cache_ms.max(TRANSFER_CACHE_TTL_MS as u64)).min(i64::MAX as u64) as i64,
+            )
+        });
         let adapter = Self {
             config: config.clone(),
             runtime: runtime.clone(),
-            client: build_http_client(runtime.chillybot_timeout_ms)?,
+            client: build_http_client(runtime.exchange_http_timeout_ms)?,
             base_url: config
                 .live
                 .base_url
                 .clone()
                 .unwrap_or_else(|| "https://api.bybit.com".to_string()),
-            metadata: Mutex::new(HashMap::new()),
+            metadata: Mutex::new(metadata),
+            supported_symbols: Mutex::new(supported_symbols),
+            transfer_status_cache: Mutex::new(transfer_status_cache),
             time_offset_ms: Mutex::new(None),
             market_ws,
             private_ws: WsPrivateState::new(),
         };
-        adapter.start_market_ws(symbols);
-        adapter.start_private_ws(symbols);
+        if let Err(error) = adapter.refresh_symbol_catalog().await {
+            if adapter.supported_symbols.lock().expect("lock").is_empty() {
+                return Err(error);
+            }
+            warn!(?error, "bybit symbol catalog refresh failed; using persisted cache");
+        }
+        let tracked_symbols = adapter.tracked_symbols(symbols);
+        adapter.start_market_ws(&tracked_symbols);
+        adapter.start_private_ws(&tracked_symbols);
         Ok(adapter)
+    }
+
+    fn tracked_symbols(&self, requested_symbols: &[String]) -> Vec<String> {
+        requested_symbols
+            .iter()
+            .filter(|symbol| {
+                self.supported_symbols
+                    .lock()
+                    .expect("lock")
+                    .contains(symbol.as_str())
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn supports_symbol(&self, symbol: &str) -> bool {
+        self.supported_symbols.lock().expect("lock").contains(symbol)
     }
 
     fn start_market_ws(&self, symbols: &[String]) {
@@ -82,16 +137,12 @@ impl BybitLiveAdapter {
             .iter()
             .map(|symbol| (venue_symbol(&self.config, symbol), symbol.clone()))
             .collect::<HashMap<_, _>>();
-        let subscribe = serde_json::json!({
-            "op": "subscribe",
-            "args": topics,
-        })
-        .to_string();
+        let subscribe_messages = build_bybit_subscribe_messages(&topics);
         let state = self.market_ws.clone();
         spawn_ws_loop(
             "bybit",
             bybit_public_ws_url(&self.base_url).to_string(),
-            vec![subscribe],
+            subscribe_messages,
             state,
             self.runtime.ws_reconnect_initial_ms,
             self.runtime.ws_reconnect_max_ms,
@@ -155,6 +206,23 @@ impl BybitLiveAdapter {
                 Ok(())
             },
         );
+    }
+
+    fn cached_transfer_statuses(
+        &self,
+        wanted: &BTreeSet<String>,
+        now_ms: i64,
+    ) -> Option<Vec<AssetTransferStatus>> {
+        let cache = self.transfer_status_cache.lock().expect("lock");
+        let cache = cache.as_ref()?;
+        if !bybit_transfer_status_cache_is_fresh(
+            cache,
+            now_ms,
+            self.runtime.transfer_status_cache_ms,
+        ) {
+            return None;
+        }
+        Some(filter_bybit_transfer_statuses(cache, wanted))
     }
 
     fn cached_snapshot(&self, symbol: &str) -> Option<(SymbolMarketSnapshot, i64)> {
@@ -332,41 +400,79 @@ impl BybitLiveAdapter {
         if let Some(meta) = self.metadata.lock().expect("lock").get(symbol).cloned() {
             return Ok(meta);
         }
-
-        let venue_symbol = venue_symbol(&self.config, symbol);
-        let response = self
-            .client
-            .get(format!("{}/v5/market/instruments-info", self.base_url))
-            .query(&[("category", "linear"), ("symbol", venue_symbol.as_str())])
-            .send()
-            .await
-            .context("failed to request bybit instruments info")?
-            .error_for_status()
-            .context("bybit instruments info returned non-success status")?
-            .json::<BybitApiResponse<BybitInstrumentList>>()
-            .await
-            .context("failed to decode bybit instruments info")?;
-        if response.ret_code != 0 {
-            return Err(anyhow!(
-                "bybit instruments info failed: {}",
-                response.ret_msg
-            ));
-        }
-        let instrument = response
-            .result
-            .and_then(|result| result.list.into_iter().next())
-            .with_context(|| format!("bybit instrument metadata missing for {venue_symbol}"))?;
-        let meta = BybitInstrumentMeta {
-            qty_step: parse_f64(&instrument.lot_size_filter.qty_step)?,
-        };
+        self.refresh_symbol_catalog().await?;
         self.metadata
             .lock()
             .expect("lock")
-            .insert(symbol.to_string(), meta.clone());
-        Ok(meta)
+            .get(symbol)
+            .cloned()
+            .with_context(|| format!("bybit instrument metadata missing for {}", venue_symbol(&self.config, symbol)))
+    }
+
+    async fn refresh_symbol_catalog(&self) -> Result<()> {
+        let mut metadata = HashMap::new();
+        let mut supported_symbols = HashSet::new();
+        let mut cursor = None::<String>;
+
+        loop {
+            let mut request = self
+                .client
+                .get(format!("{}/v5/market/instruments-info", self.base_url))
+                .query(&[("category", "linear"), ("limit", "1000")]);
+            if let Some(cursor_value) = cursor.as_deref() {
+                request = request.query(&[("cursor", cursor_value)]);
+            }
+            let response = request
+                .send()
+                .await
+                .context("failed to request bybit instruments info")?
+                .error_for_status()
+                .context("bybit instruments info returned non-success status")?
+                .json::<BybitApiResponse<BybitInstrumentList>>()
+                .await
+                .context("failed to decode bybit instruments info")?;
+            if response.ret_code != 0 {
+                return Err(anyhow!(
+                    "bybit instruments info failed: {}",
+                    response.ret_msg
+                ));
+            }
+            let result = response.result.unwrap_or_default();
+            for instrument in result.list {
+                if !bybit_instrument_is_supported(&instrument) {
+                    continue;
+                }
+                supported_symbols.insert(instrument.symbol.clone());
+                metadata.insert(
+                    instrument.symbol,
+                    BybitInstrumentMeta {
+                        qty_step: parse_f64(&instrument.lot_size_filter.qty_step)?,
+                    },
+                );
+            }
+            cursor = result.next_page_cursor.filter(|value| !value.is_empty());
+            if cursor.is_none() {
+                break;
+            }
+        }
+
+        store_json_cache(
+            "bybit-symbols.json",
+            &BybitSymbolCatalogCache {
+                updated_at_ms: now_ms(),
+                supported_symbols: supported_symbols.iter().cloned().collect(),
+                metadata: metadata.clone(),
+            },
+        );
+        *self.metadata.lock().expect("lock") = metadata;
+        *self.supported_symbols.lock().expect("lock") = supported_symbols;
+        Ok(())
     }
 
     async fn fetch_symbol_snapshot(&self, symbol: &str) -> Result<SymbolMarketSnapshot> {
+        if !self.supports_symbol(symbol) {
+            return Err(anyhow!("bybit symbol not supported for {}", symbol));
+        }
         let venue_symbol = venue_symbol(&self.config, symbol);
         let response = self
             .client
@@ -493,15 +599,21 @@ impl VenueAdapter for BybitLiveAdapter {
     async fn fetch_market_snapshot(&self, symbols: &[String]) -> Result<VenueMarketSnapshot> {
         let mut quotes = Vec::new();
         let mut observed_at_ms = 0_i64;
-        for symbol in symbols {
+        let allow_direct_fallback = symbols.len() == 1;
+        for symbol in symbols.iter().filter(|symbol| self.supports_symbol(symbol)) {
             if let Some((snapshot, snapshot_observed_at_ms)) = self.cached_snapshot(symbol) {
                 observed_at_ms = observed_at_ms.max(snapshot_observed_at_ms);
                 quotes.push(snapshot);
-            } else {
+            } else if allow_direct_fallback {
                 let snapshot = self.fetch_symbol_snapshot(symbol).await?;
                 observed_at_ms = observed_at_ms.max(snapshot.funding_timestamp_ms.min(now_ms()));
                 quotes.push(snapshot);
             }
+        }
+        if quotes.is_empty() {
+            return Err(anyhow!(
+                "bybit market snapshot unavailable for requested symbols"
+            ));
         }
 
         Ok(VenueMarketSnapshot {
@@ -678,55 +790,41 @@ impl VenueAdapter for BybitLiveAdapter {
         let wanted = assets
             .iter()
             .map(|asset| base_asset(asset))
-            .collect::<std::collections::BTreeSet<_>>();
-        let observed_at_ms = now_ms();
-        let mut statuses = Vec::new();
-
-        for asset in wanted {
-            let query = build_query(&[("coin", asset.clone())]);
-            let response = self
-                .signed_request(
-                    reqwest::Method::GET,
-                    "/v5/asset/coin/query-info",
-                    Some(query),
-                    None,
-                )
-                .await?
-                .json::<BybitApiResponse<BybitCoinInfoResult>>()
-                .await
-                .context("failed to decode bybit coin info")?;
-            if response.ret_code != 0 {
-                return Err(anyhow!("bybit coin info failed: {}", response.ret_msg));
-            }
-
-            let mut deposit_enabled = false;
-            let mut withdraw_enabled = false;
-            if let Some(result) = response.result {
-                for row in result.rows {
-                    if base_asset(&row.coin) != asset {
-                        continue;
-                    }
-                    deposit_enabled |= row
-                        .chains
-                        .iter()
-                        .any(|chain| parse_bool_flag(&chain.chain_deposit));
-                    withdraw_enabled |= row
-                        .chains
-                        .iter()
-                        .any(|chain| parse_bool_flag(&chain.chain_withdraw));
-                }
-            }
-
-            statuses.push(AssetTransferStatus {
-                venue: Venue::Bybit,
-                asset,
-                deposit_enabled,
-                withdraw_enabled,
-                observed_at_ms,
-                source: "bybit".to_string(),
-            });
+            .collect::<BTreeSet<_>>();
+        if wanted.is_empty() {
+            return Ok(Vec::new());
         }
 
+        let observed_at_ms = now_ms();
+        if let Some(statuses) = self.cached_transfer_statuses(&wanted, observed_at_ms) {
+            return Ok(statuses);
+        }
+
+        let response = self
+            .signed_request(
+                reqwest::Method::GET,
+                "/v5/asset/coin/query-info",
+                None,
+                None,
+            )
+            .await?
+            .json::<BybitApiResponse<BybitCoinInfoResult>>()
+            .await
+            .context("failed to decode bybit coin info")?;
+        if response.ret_code != 0 {
+            return Err(anyhow!("bybit coin info failed: {}", response.ret_msg));
+        }
+
+        let cache = build_bybit_transfer_status_cache(
+            response.result.map(|result| result.rows).unwrap_or_default(),
+            observed_at_ms,
+        );
+        let statuses = filter_bybit_transfer_statuses(&cache, &wanted);
+        store_json_cache("bybit-transfer-status.json", &cache);
+        self.transfer_status_cache
+            .lock()
+            .expect("lock")
+            .replace(cache);
         Ok(statuses)
     }
 
@@ -751,6 +849,19 @@ fn bybit_private_ws_url(base_url: &str) -> &'static str {
     } else {
         "wss://stream.bybit.com/v5/private"
     }
+}
+
+fn build_bybit_subscribe_messages(topics: &[String]) -> Vec<String> {
+    topics
+        .chunks(BYBIT_MAX_SUBSCRIBE_TOPICS_PER_MESSAGE)
+        .map(|chunk| {
+            serde_json::json!({
+                "op": "subscribe",
+                "args": chunk,
+            })
+            .to_string()
+        })
+        .collect()
 }
 
 fn handle_bybit_private_message(
@@ -934,9 +1045,16 @@ fn extract_bybit_quote_fee(value: Option<&serde_json::Value>) -> Option<f64> {
     })
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct BybitInstrumentMeta {
     qty_step: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct BybitSymbolCatalogCache {
+    updated_at_ms: i64,
+    supported_symbols: Vec<String>,
+    metadata: HashMap<String, BybitInstrumentMeta>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -955,14 +1073,18 @@ struct BybitServerTimeResult {
     time_nano: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 struct BybitInstrumentList {
     #[serde(default)]
     list: Vec<BybitInstrument>,
+    #[serde(rename = "nextPageCursor")]
+    next_page_cursor: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct BybitInstrument {
+    symbol: String,
+    status: Option<String>,
     #[serde(rename = "lotSizeFilter")]
     lot_size_filter: BybitLotSizeFilter,
 }
@@ -1032,4 +1154,140 @@ struct BybitCoinChain {
     chain_deposit: String,
     #[serde(rename = "chainWithdraw")]
     chain_withdraw: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct BybitTransferStatusCache {
+    observed_at_ms: i64,
+    by_asset: HashMap<String, AssetTransferStatus>,
+}
+
+fn bybit_instrument_is_supported(instrument: &BybitInstrument) -> bool {
+    instrument
+        .status
+        .as_deref()
+        .map_or(true, |status| status.eq_ignore_ascii_case("Trading"))
+}
+
+fn build_bybit_transfer_status_cache(
+    rows: Vec<BybitCoinInfo>,
+    observed_at_ms: i64,
+) -> BybitTransferStatusCache {
+    let mut by_asset = HashMap::new();
+    for row in rows {
+        let asset = base_asset(&row.coin);
+        let entry = by_asset.entry(asset.clone()).or_insert(AssetTransferStatus {
+            venue: Venue::Bybit,
+            asset: asset.clone(),
+            deposit_enabled: false,
+            withdraw_enabled: false,
+            observed_at_ms,
+            source: "bybit".to_string(),
+        });
+        entry.deposit_enabled |= row
+            .chains
+            .iter()
+            .any(|chain| parse_bool_flag(&chain.chain_deposit));
+        entry.withdraw_enabled |= row
+            .chains
+            .iter()
+            .any(|chain| parse_bool_flag(&chain.chain_withdraw));
+    }
+
+    BybitTransferStatusCache {
+        observed_at_ms,
+        by_asset,
+    }
+}
+
+fn filter_bybit_transfer_statuses(
+    cache: &BybitTransferStatusCache,
+    wanted: &BTreeSet<String>,
+) -> Vec<AssetTransferStatus> {
+    wanted
+        .iter()
+        .map(|asset| {
+            cache
+                .by_asset
+                .get(asset)
+                .cloned()
+                .unwrap_or_else(|| AssetTransferStatus {
+                    venue: Venue::Bybit,
+                    asset: asset.clone(),
+                    deposit_enabled: false,
+                    withdraw_enabled: false,
+                    observed_at_ms: cache.observed_at_ms,
+                    source: "bybit".to_string(),
+                })
+        })
+        .collect()
+}
+
+fn bybit_transfer_status_cache_is_fresh(
+    cache: &BybitTransferStatusCache,
+    now_ms: i64,
+    ttl_ms: u64,
+) -> bool {
+    let ttl_ms = ttl_ms.min(i64::MAX as u64) as i64;
+    now_ms.saturating_sub(cache.observed_at_ms) <= ttl_ms
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use crate::models::Venue;
+
+    use super::{
+        build_bybit_transfer_status_cache, bybit_transfer_status_cache_is_fresh,
+        filter_bybit_transfer_statuses, BybitCoinChain, BybitCoinInfo,
+    };
+
+    #[test]
+    fn transfer_status_cache_filters_requested_assets_and_marks_missing_assets_closed() {
+        let cache = build_bybit_transfer_status_cache(
+            vec![
+                BybitCoinInfo {
+                    coin: "BTC".to_string(),
+                    chains: vec![BybitCoinChain {
+                        chain_deposit: "1".to_string(),
+                        chain_withdraw: "1".to_string(),
+                    }],
+                },
+                BybitCoinInfo {
+                    coin: "ETH".to_string(),
+                    chains: vec![BybitCoinChain {
+                        chain_deposit: "0".to_string(),
+                        chain_withdraw: "1".to_string(),
+                    }],
+                },
+            ],
+            12_345,
+        );
+
+        let wanted = ["BTC".to_string(), "DOGE".to_string()]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let statuses = filter_bybit_transfer_statuses(&cache, &wanted);
+
+        assert_eq!(statuses.len(), 2);
+        let btc = statuses.iter().find(|item| item.asset == "BTC").unwrap();
+        assert_eq!(btc.venue, Venue::Bybit);
+        assert!(btc.deposit_enabled);
+        assert!(btc.withdraw_enabled);
+
+        let doge = statuses.iter().find(|item| item.asset == "DOGE").unwrap();
+        assert_eq!(doge.venue, Venue::Bybit);
+        assert!(!doge.deposit_enabled);
+        assert!(!doge.withdraw_enabled);
+        assert_eq!(doge.observed_at_ms, 12_345);
+    }
+
+    #[test]
+    fn transfer_status_cache_expires_after_ttl() {
+        let cache = build_bybit_transfer_status_cache(Vec::new(), 10_000);
+
+        assert!(bybit_transfer_status_cache_is_fresh(&cache, 10_250, 500));
+        assert!(!bybit_transfer_status_cache_is_fresh(&cache, 10_501, 500));
+    }
 }

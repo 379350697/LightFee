@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     sync::Arc,
     time::Instant,
 };
@@ -2191,10 +2191,34 @@ impl Engine {
     async fn discover_live_open_position(&mut self, market: &MarketView) -> Result<()> {
         let mut recovered = Vec::new();
         let mut mismatches = Vec::new();
+        let mut venue_positions = HashMap::new();
+
+        for venue in self.adapters.keys().copied() {
+            if let Some(positions) = self.adapter(venue)?.fetch_all_positions().await? {
+                let positions_by_symbol = positions
+                    .into_iter()
+                    .map(|position| (position.symbol.clone(), position))
+                    .collect::<HashMap<_, _>>();
+                venue_positions.insert(venue, positions_by_symbol);
+            }
+        }
 
         for symbol in &self.config.symbols {
             let mut active_positions = Vec::new();
             for venue in self.adapters.keys().copied() {
+                if let Some(positions_by_symbol) = venue_positions.get(&venue) {
+                    if let Some(position) = positions_by_symbol.get(symbol) {
+                        if !approx_zero(position.size) {
+                            active_positions.push(position.clone());
+                        }
+                    }
+                    continue;
+                }
+                if market.symbol(venue, symbol).is_none()
+                    && self.cached_position(venue, symbol).is_none()
+                {
+                    continue;
+                }
                 let position = self.adapter(venue)?.fetch_position(symbol).await?;
                 if !approx_zero(position.size) {
                     active_positions.push(position);

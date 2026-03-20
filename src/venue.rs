@@ -19,6 +19,10 @@ pub trait VenueAdapter: Send + Sync {
 
     async fn fetch_position(&self, symbol: &str) -> Result<PositionSnapshot>;
 
+    async fn fetch_all_positions(&self) -> Result<Option<Vec<PositionSnapshot>>> {
+        Ok(None)
+    }
+
     async fn normalize_quantity(&self, _symbol: &str, quantity: f64) -> Result<f64> {
         Ok(quantity)
     }

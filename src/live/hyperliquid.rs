@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, Mutex},
     time::Instant,
@@ -47,8 +47,9 @@ use crate::{
 };
 
 use super::{
-    enrich_fill_from_private, estimate_fee_quote, hinted_fill, lookup_or_wait_private_order,
-    now_ms, parse_f64, quote_fill, venue_symbol, PrivateOrderUpdate, WsMarketState, WsPrivateState,
+    cache_is_fresh, enrich_fill_from_private, estimate_fee_quote, hinted_fill, load_json_cache,
+    lookup_or_wait_private_order, now_ms, parse_f64, quote_fill, store_json_cache, venue_symbol,
+    PrivateOrderUpdate, WsMarketState, WsPrivateState, SYMBOL_CACHE_TTL_MS,
 };
 
 pub struct HyperliquidLiveAdapter {
@@ -58,6 +59,7 @@ pub struct HyperliquidLiveAdapter {
     exchange_client: ExchangeClient,
     account_address: H160,
     meta_cache: Mutex<HashMap<String, HyperliquidAssetMeta>>,
+    supported_symbols: HashSet<String>,
     market_ws: Arc<WsMarketState>,
     private_ws: Arc<WsPrivateState>,
     order_ws: HyperliquidWsPostClient,
@@ -100,21 +102,87 @@ impl HyperliquidLiveAdapter {
             .await
             .context("failed to build hyperliquid exchange client")?;
 
+        let persisted_catalog =
+            load_json_cache::<HyperliquidSymbolCatalogCache>("hyperliquid-symbols.json");
+        let mut meta_cache = HashMap::new();
+        let mut supported_symbols = HashSet::new();
+        if let Some(cache) = persisted_catalog {
+            if !cache_is_fresh(cache.updated_at_ms, now_ms(), SYMBOL_CACHE_TTL_MS) {
+                tracing::debug!("hyperliquid symbol catalog cache is stale; using as fallback seed");
+            }
+            meta_cache.extend(cache.metadata);
+            supported_symbols.extend(cache.supported_symbols);
+        }
+
         let market_ws = WsMarketState::new();
-        let adapter = Self {
+        let mut adapter = Self {
             config: config.clone(),
             runtime: runtime.clone(),
             info_client,
             exchange_client,
             account_address,
-            meta_cache: Mutex::new(HashMap::new()),
+            meta_cache: Mutex::new(meta_cache),
+            supported_symbols,
             market_ws,
             private_ws: WsPrivateState::new(),
             order_ws: HyperliquidWsPostClient::new(hyperliquid_ws_url(base_url)),
         };
-        adapter.start_market_ws(symbols, base_url).await?;
-        adapter.start_private_ws(symbols, base_url).await?;
+        if let Err(error) = adapter.refresh_symbol_catalog().await {
+            if adapter.supported_symbols.is_empty() {
+                return Err(error);
+            }
+            tracing::warn!(?error, "hyperliquid symbol catalog refresh failed; using persisted cache");
+        }
+        let tracked_symbols = adapter.tracked_symbols(symbols);
+        adapter.start_market_ws(&tracked_symbols, base_url).await?;
+        adapter.start_private_ws(&tracked_symbols, base_url).await?;
         Ok(adapter)
+    }
+
+    fn tracked_symbols(&self, symbols: &[String]) -> Vec<String> {
+        symbols
+            .iter()
+            .filter(|symbol| {
+                self.supported_symbols
+                    .contains(venue_symbol(&self.config, symbol).as_str())
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn supports_symbol(&self, symbol: &str) -> bool {
+        self.supported_symbols
+            .contains(venue_symbol(&self.config, symbol).as_str())
+    }
+
+    async fn refresh_symbol_catalog(&mut self) -> Result<()> {
+        let meta = self
+            .info_client
+            .meta()
+            .await
+            .context("failed to request hyperliquid meta")?;
+        let mut metadata = HashMap::new();
+        let mut supported_symbols = HashSet::new();
+        for row in meta.universe {
+            supported_symbols.insert(row.name.clone());
+            metadata.insert(
+                row.name.clone(),
+                HyperliquidAssetMeta {
+                    sz_decimals: row.sz_decimals,
+                },
+            );
+        }
+        store_json_cache(
+            "hyperliquid-symbols.json",
+            &HyperliquidSymbolCatalogCache {
+                updated_at_ms: now_ms(),
+                supported_symbols: supported_symbols.iter().cloned().collect(),
+                metadata: metadata.clone(),
+            },
+        );
+        *self.meta_cache.lock().expect("lock") = metadata;
+        self.supported_symbols = supported_symbols;
+        Ok(())
     }
 
     async fn start_market_ws(&self, symbols: &[String], base_url: BaseUrl) -> Result<()> {
@@ -330,6 +398,9 @@ impl HyperliquidLiveAdapter {
     }
 
     async fn fetch_symbol_snapshot(&self, symbol: &str) -> Result<SymbolMarketSnapshot> {
+        if !self.supports_symbol(symbol) {
+            return Err(anyhow!("hyperliquid symbol not supported for {}", symbol));
+        }
         let asset = venue_symbol(&self.config, symbol);
         let book = self
             .info_client
@@ -408,33 +479,12 @@ impl HyperliquidLiveAdapter {
     }
 
     async fn asset_meta(&self, asset: &str) -> Result<HyperliquidAssetMeta> {
-        if let Some(meta) = self.meta_cache.lock().expect("lock").get(asset).cloned() {
-            return Ok(meta);
-        }
-
-        let meta = self
-            .info_client
-            .meta()
-            .await
-            .context("failed to request hyperliquid meta")?;
-        let cache = meta
-            .universe
-            .into_iter()
-            .map(|row| {
-                (
-                    row.name.clone(),
-                    HyperliquidAssetMeta {
-                        sz_decimals: row.sz_decimals,
-                    },
-                )
-            })
-            .collect::<HashMap<_, _>>();
-        let asset_meta = cache
+        self.meta_cache
+            .lock()
+            .expect("lock")
             .get(asset)
             .cloned()
-            .ok_or_else(|| anyhow!("hyperliquid asset metadata missing for {asset}"))?;
-        self.meta_cache.lock().expect("lock").extend(cache);
-        Ok(asset_meta)
+            .ok_or_else(|| anyhow!("hyperliquid asset metadata missing for {asset}"))
     }
 
     async fn ioc_order_params(
@@ -524,15 +574,21 @@ impl VenueAdapter for HyperliquidLiveAdapter {
     async fn fetch_market_snapshot(&self, symbols: &[String]) -> Result<VenueMarketSnapshot> {
         let mut quotes = Vec::new();
         let mut observed_at_ms = 0_i64;
-        for symbol in symbols {
+        let allow_direct_fallback = symbols.len() == 1;
+        for symbol in symbols.iter().filter(|symbol| self.supports_symbol(symbol)) {
             if let Some((snapshot, snapshot_observed_at_ms)) = self.cached_snapshot(symbol) {
                 observed_at_ms = observed_at_ms.max(snapshot_observed_at_ms);
                 quotes.push(snapshot);
-            } else {
+            } else if allow_direct_fallback {
                 let quote = self.fetch_symbol_snapshot(symbol).await?;
                 observed_at_ms = observed_at_ms.max(quote.funding_timestamp_ms.min(now_ms()));
                 quotes.push(quote);
             }
+        }
+        if quotes.is_empty() {
+            return Err(anyhow!(
+                "hyperliquid market snapshot unavailable for requested symbols"
+            ));
         }
 
         Ok(VenueMarketSnapshot {
@@ -699,9 +755,16 @@ impl VenueAdapter for HyperliquidLiveAdapter {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct HyperliquidAssetMeta {
     sz_decimals: u32,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct HyperliquidSymbolCatalogCache {
+    updated_at_ms: i64,
+    supported_symbols: Vec<String>,
+    metadata: HashMap<String, HyperliquidAssetMeta>,
 }
 
 enum HyperliquidOrderOutcome {

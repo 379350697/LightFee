@@ -82,6 +82,8 @@ pub struct RuntimeConfig {
     pub chillybot_api_base: String,
     #[serde(default = "default_chillybot_timeout_ms")]
     pub chillybot_timeout_ms: u64,
+    #[serde(default = "default_exchange_http_timeout_ms")]
+    pub exchange_http_timeout_ms: u64,
     #[serde(default = "default_poll_interval_ms")]
     pub poll_interval_ms: u64,
     #[serde(default = "default_market_age_ms")]
@@ -92,6 +94,8 @@ pub struct RuntimeConfig {
     pub max_order_quote_age_ms: i64,
     #[serde(default = "default_uncertain_order_cooldown_ms")]
     pub uncertain_order_cooldown_ms: i64,
+    #[serde(default = "default_transfer_status_cache_ms")]
+    pub transfer_status_cache_ms: u64,
     #[serde(default = "default_tick_failure_backoff_initial_ms")]
     pub tick_failure_backoff_initial_ms: u64,
     #[serde(default = "default_tick_failure_backoff_max_ms")]
@@ -115,11 +119,13 @@ impl Default for RuntimeConfig {
             opportunity_source: default_opportunity_source(),
             chillybot_api_base: default_chillybot_api_base(),
             chillybot_timeout_ms: default_chillybot_timeout_ms(),
+            exchange_http_timeout_ms: default_exchange_http_timeout_ms(),
             poll_interval_ms: default_poll_interval_ms(),
             max_market_age_ms: default_market_age_ms(),
             private_position_max_age_ms: default_private_position_max_age_ms(),
             max_order_quote_age_ms: default_order_quote_age_ms(),
             uncertain_order_cooldown_ms: default_uncertain_order_cooldown_ms(),
+            transfer_status_cache_ms: default_transfer_status_cache_ms(),
             tick_failure_backoff_initial_ms: default_tick_failure_backoff_initial_ms(),
             tick_failure_backoff_max_ms: default_tick_failure_backoff_max_ms(),
             ws_reconnect_initial_ms: default_ws_reconnect_initial_ms(),
@@ -353,6 +359,10 @@ fn default_chillybot_timeout_ms() -> u64 {
     2_000
 }
 
+fn default_exchange_http_timeout_ms() -> u64 {
+    10_000
+}
+
 fn default_poll_interval_ms() -> u64 {
     1_000
 }
@@ -371,6 +381,10 @@ fn default_order_quote_age_ms() -> i64 {
 
 fn default_uncertain_order_cooldown_ms() -> i64 {
     30_000
+}
+
+fn default_transfer_status_cache_ms() -> u64 {
+    300_000
 }
 
 fn default_tick_failure_backoff_initial_ms() -> u64 {

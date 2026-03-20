@@ -82,7 +82,10 @@ impl FeedgrabChillybotSource {
     async fn fetch_jina_json<T: DeserializeOwned>(&self, endpoint: &str) -> Result<T> {
         let endpoint = endpoint.trim_start_matches('/');
         let target = format!("{}/{}", self.base_url, endpoint);
-        let jina_url = format!("https://r.jina.ai/http://{}", target.trim_start_matches("https://"));
+        let jina_url = format!(
+            "https://r.jina.ai/http://{}",
+            target.trim_start_matches("https://")
+        );
         let body = self
             .client
             .get(jina_url)
@@ -95,8 +98,12 @@ impl FeedgrabChillybotSource {
             .await
             .context("failed to read feedgrab-jina payload")?;
 
-        let start = body.find('{').context("feedgrab-jina payload missing json start")?;
-        let end = body.rfind('}').context("feedgrab-jina payload missing json end")?;
+        let start = body
+            .find('{')
+            .context("feedgrab-jina payload missing json start")?;
+        let end = body
+            .rfind('}')
+            .context("feedgrab-jina payload missing json end")?;
         let json_slice = &body[start..=end];
         serde_json::from_str::<T>(json_slice).context("failed to decode feedgrab-jina json payload")
     }
