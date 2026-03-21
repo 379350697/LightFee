@@ -346,16 +346,6 @@ impl Engine {
             state.open_positions = recover_open_positions_from_journal(&journal)?;
             normalize_engine_state_positions(&mut state);
         }
-        if state.open_positions.len() > config.strategy.max_concurrent_positions.max(1) {
-            state.mode = EngineMode::FailClosed;
-            state.last_error = Some(format!(
-                "open positions exceed configured max: {}>{}",
-                state.open_positions.len(),
-                config.strategy.max_concurrent_positions.max(1)
-            ));
-        } else if !state.open_positions.is_empty() {
-            state.mode = EngineMode::Recovering;
-        }
         let (recent_submit_ack_ms, recent_order_health, venue_health_updated_at_ms) =
             restore_venue_health_from_state(&state);
         let cached_scan_symbol_state = load_persisted_scan_symbol_cache(&config);
@@ -383,6 +373,7 @@ impl Engine {
             cached_transfer_status_view: None,
             scan_symbols: initial_scan_symbols,
         };
+        engine.finalize_startup_position_recovery().await?;
         engine.initialize_scan_symbols(cached_scan_symbol_state.as_ref());
         Ok(engine)
     }
@@ -477,6 +468,54 @@ impl Engine {
         let removed = self.state.open_positions.remove(index);
         self.sync_open_position_mirror();
         Some(removed)
+    }
+
+    async fn finalize_startup_position_recovery(&mut self) -> Result<()> {
+        if self.active_positions().is_empty() {
+            self.state.mode = EngineMode::Running;
+            self.state.last_error = None;
+            self.persist_state()?;
+            return Ok(());
+        }
+
+        match self.reconcile_open_positions_internal(true).await {
+            Ok(()) => {}
+            Err(error) => {
+                self.state.mode = EngineMode::FailClosed;
+                self.state.last_error =
+                    Some(format!("startup recovery validation failed: {error:#}"));
+                self.log_critical_event(
+                    "recovery.blocked",
+                    &json!({
+                        "reason": "startup_recovery_validation_failed",
+                        "error": error.to_string(),
+                    }),
+                )?;
+                self.persist_state()?;
+                return Ok(());
+            }
+        }
+
+        let max_positions = self.config.strategy.max_concurrent_positions.max(1);
+        if self.active_position_count() > max_positions {
+            self.state.mode = EngineMode::FailClosed;
+            self.state.last_error = Some(format!(
+                "open positions exceed configured max: {}>{}",
+                self.active_position_count(),
+                max_positions
+            ));
+            self.log_critical_event(
+                "recovery.blocked",
+                &json!({
+                    "reason": "open_positions_exceed_configured_max",
+                    "open_position_count": self.active_position_count(),
+                    "max_concurrent_positions": max_positions,
+                }),
+            )?;
+        }
+
+        self.persist_state()?;
+        Ok(())
     }
 
     pub async fn tick(&mut self) -> Result<()> {

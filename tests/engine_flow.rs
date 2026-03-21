@@ -675,6 +675,59 @@ async fn restart_recovers_open_position_from_journal_when_snapshot_missing() {
 }
 
 #[tokio::test]
+async fn startup_prunes_flat_snapshot_positions_before_first_tick() {
+    let temp = TempDir::new().expect("tempdir");
+    let config = test_config(&temp, true);
+    let adapters = adapters_for_capture();
+    let mut engine = Engine::new(config.clone(), to_dyn(adapters.clone()))
+        .await
+        .expect("engine");
+
+    engine.tick().await.expect("entry tick");
+    assert!(engine.state().open_position.is_some());
+    adapters.0.set_position_size("BTCUSDT", 0.0);
+    adapters.1.set_position_size("BTCUSDT", 0.0);
+    drop(engine);
+
+    let restarted = Engine::new(config.clone(), to_dyn(adapters))
+        .await
+        .expect("restart");
+
+    assert_eq!(restarted.state().mode, EngineMode::Running);
+    assert!(restarted.state().open_position.is_none());
+    assert!(restarted.state().open_positions.is_empty());
+    let events = fs::read_to_string(config.persistence.event_log_path).expect("events");
+    assert!(events.contains("\"recovery.flat\""));
+}
+
+#[tokio::test]
+async fn startup_prunes_flat_journal_positions_before_first_tick() {
+    let temp = TempDir::new().expect("tempdir");
+    let config = test_config(&temp, true);
+    let adapters = adapters_for_capture();
+    let mut engine = Engine::new(config.clone(), to_dyn(adapters.clone()))
+        .await
+        .expect("engine");
+
+    engine.tick().await.expect("entry tick");
+    assert!(engine.state().open_position.is_some());
+    adapters.0.set_position_size("BTCUSDT", 0.0);
+    adapters.1.set_position_size("BTCUSDT", 0.0);
+    fs::remove_file(&config.persistence.snapshot_path).expect("remove snapshot");
+    drop(engine);
+
+    let restarted = Engine::new(config.clone(), to_dyn(adapters))
+        .await
+        .expect("restart");
+
+    assert_eq!(restarted.state().mode, EngineMode::Running);
+    assert!(restarted.state().open_position.is_none());
+    assert!(restarted.state().open_positions.is_empty());
+    let events = fs::read_to_string(config.persistence.event_log_path).expect("events");
+    assert!(events.contains("\"recovery.flat\""));
+}
+
+#[tokio::test]
 async fn restart_with_more_positions_than_limit_goes_fail_closed() {
     let temp = TempDir::new().expect("tempdir");
     let mut config = test_config(&temp, true);
@@ -734,6 +787,7 @@ async fn restart_with_more_positions_than_limit_goes_fail_closed() {
     .await
     .expect("engine");
     engine.tick().await.expect("entry tick");
+    let recovered_positions = engine.state().open_positions.clone();
     assert_eq!(
         event_count(
             &read_event_records(&config.persistence.event_log_path),
@@ -745,33 +799,39 @@ async fn restart_with_more_positions_than_limit_goes_fail_closed() {
 
     let mut restart_config = config;
     restart_config.strategy.max_concurrent_positions = 1;
-    let mut restarted = Engine::new(
+    let restart_binance = Arc::new(ScriptedVenueAdapter::new(
+        Venue::Binance,
+        0.5,
+        vec![venue_snapshot(
+            Venue::Binance,
+            0,
+            vec![
+                symbol_snapshot("BTCUSDT", 100.0, 100.0, 500.0, 500.0, -0.0005, 600_000),
+                symbol_snapshot("ETHUSDT", 110.0, 110.0, 500.0, 500.0, -0.0006, 600_000),
+            ],
+        )],
+    ));
+    let restart_okx = Arc::new(ScriptedVenueAdapter::new(
+        Venue::Okx,
+        0.5,
+        vec![venue_snapshot(
+            Venue::Okx,
+            0,
+            vec![
+                symbol_snapshot("BTCUSDT", 100.0, 100.0, 500.0, 500.0, 0.0018, 600_000),
+                symbol_snapshot("ETHUSDT", 110.0, 110.0, 500.0, 500.0, 0.0016, 600_000),
+            ],
+        )],
+    ));
+    for position in &recovered_positions {
+        restart_binance.set_position_size(&position.symbol, position.quantity);
+        restart_okx.set_position_size(&position.symbol, -position.quantity);
+    }
+    let restarted = Engine::new(
         restart_config.clone(),
         vec![
-            Arc::new(ScriptedVenueAdapter::new(
-                Venue::Binance,
-                0.5,
-                vec![venue_snapshot(
-                    Venue::Binance,
-                    0,
-                    vec![
-                        symbol_snapshot("BTCUSDT", 100.0, 100.0, 500.0, 500.0, -0.0005, 600_000),
-                        symbol_snapshot("ETHUSDT", 110.0, 110.0, 500.0, 500.0, -0.0006, 600_000),
-                    ],
-                )],
-            )) as Arc<dyn VenueAdapter>,
-            Arc::new(ScriptedVenueAdapter::new(
-                Venue::Okx,
-                0.5,
-                vec![venue_snapshot(
-                    Venue::Okx,
-                    0,
-                    vec![
-                        symbol_snapshot("BTCUSDT", 100.0, 100.0, 500.0, 500.0, 0.0018, 600_000),
-                        symbol_snapshot("ETHUSDT", 110.0, 110.0, 500.0, 500.0, 0.0016, 600_000),
-                    ],
-                )],
-            )) as Arc<dyn VenueAdapter>,
+            restart_binance as Arc<dyn VenueAdapter>,
+            restart_okx as Arc<dyn VenueAdapter>,
             Arc::new(ScriptedVenueAdapter::new(
                 Venue::Bybit,
                 0.6,
@@ -786,8 +846,6 @@ async fn restart_with_more_positions_than_limit_goes_fail_closed() {
     )
     .await
     .expect("restart");
-
-    restarted.tick().await.expect("reconcile tick");
 
     assert_eq!(restarted.state().mode, EngineMode::FailClosed);
     assert!(restarted
