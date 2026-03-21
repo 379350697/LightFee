@@ -126,6 +126,7 @@ pub struct Engine {
     store: FileStateStore,
     state: EngineState,
     last_live_recovery_probe_ms: Option<i64>,
+    last_running_slot_reconcile_probe_ms: Option<i64>,
     last_persisted_state: Option<EngineState>,
     recent_submit_ack_ms: BTreeMap<Venue, VecDeque<u64>>,
     venue_entry_cooldowns: BTreeMap<Venue, VenueEntryCooldown>,
@@ -303,6 +304,7 @@ struct NoEntryDiagnostics {
 }
 
 const FLAT_RECOVERY_PROBE_INTERVAL_MS: i64 = 30_000;
+const RUNNING_SLOT_RECONCILE_INTERVAL_MS: i64 = 10_000;
 const ORDER_HEALTH_WINDOW_SIZE: usize = 20;
 
 fn default_exit_after_first_stage() -> bool {
@@ -372,6 +374,7 @@ impl Engine {
             transfer_status_source,
             state,
             last_live_recovery_probe_ms: None,
+            last_running_slot_reconcile_probe_ms: None,
             last_persisted_state: loaded_state.as_ref().map(persistent_state_view),
             recent_submit_ack_ms,
             venue_entry_cooldowns: BTreeMap::new(),
@@ -536,7 +539,7 @@ impl Engine {
                 self.persist_state()?;
                 return Ok(());
             }
-            self.reconcile_open_positions().await?;
+            self.reconcile_open_positions_internal(true).await?;
             self.persist_state()?;
             if self.state.mode != EngineMode::Running {
                 return Ok(());
@@ -561,6 +564,12 @@ impl Engine {
             );
             self.apply_runtime_entry_guards(&mut candidates);
             sort_candidates(&mut candidates);
+            self.reconcile_running_slots_if_needed(now_ms, &candidates)
+                .await?;
+            if self.state.mode != EngineMode::Running {
+                self.persist_state()?;
+                return Ok(());
+            }
             let tradeable_count = candidates
                 .iter()
                 .filter(|candidate| candidate.is_tradeable())
@@ -1215,7 +1224,48 @@ impl Engine {
         candidate.ranking_edge_bps / (1.0 + risk)
     }
 
-    async fn reconcile_open_positions(&mut self) -> Result<()> {
+    async fn reconcile_running_slots_if_needed(
+        &mut self,
+        now_ms: i64,
+        candidates: &[CandidateOpportunity],
+    ) -> Result<()> {
+        let capacity = self.config.strategy.max_concurrent_positions.max(1);
+        let has_tradeable_candidate_waiting_for_slot = candidates.iter().any(|candidate| {
+            candidate.is_tradeable() && !self.has_active_symbol(&candidate.symbol)
+        });
+        if self.state.mode != EngineMode::Running
+            || self.active_positions().is_empty()
+            || self.active_position_count() < capacity
+            || !has_tradeable_candidate_waiting_for_slot
+            || !should_probe_live_recovery(
+                self.last_running_slot_reconcile_probe_ms,
+                now_ms,
+                RUNNING_SLOT_RECONCILE_INTERVAL_MS,
+            )
+        {
+            return Ok(());
+        }
+
+        let before = self.active_position_count();
+        self.reconcile_open_positions_internal(false).await?;
+        self.last_running_slot_reconcile_probe_ms = Some(now_ms.max(0));
+        let after = self.active_position_count();
+        if after < before {
+            self.log_event_at(
+                now_ms,
+                "runtime.slot_reconcile",
+                &json!({
+                    "reason": "stale_open_positions_cleared",
+                    "open_position_count_before": before,
+                    "open_position_count_after": after,
+                    "released_slots": before.saturating_sub(after),
+                }),
+            );
+        }
+        Ok(())
+    }
+
+    async fn reconcile_open_positions_internal(&mut self, log_resumed_events: bool) -> Result<()> {
         if self.active_positions().is_empty() {
             self.state.mode = EngineMode::Running;
             return Ok(());
@@ -1245,13 +1295,15 @@ impl Engine {
             }
 
             if approx_eq(long_position.size, target) && approx_eq(short_position.size, -target) {
-                self.log_critical_event(
-                    "recovery.resumed",
-                    &json!({
-                        "symbol": position.symbol,
-                        "position_id": position.position_id,
-                    }),
-                )?;
+                if log_resumed_events {
+                    self.log_critical_event(
+                        "recovery.resumed",
+                        &json!({
+                            "symbol": position.symbol,
+                            "position_id": position.position_id,
+                        }),
+                    )?;
+                }
                 surviving_positions.push(position);
                 continue;
             }
@@ -1461,6 +1513,18 @@ impl Engine {
             )
             .await?;
         let executable_quantity = quantity_plan.executable_quantity;
+        let target_notional_quote = self
+            .config
+            .venue(candidate.long_venue)
+            .map(|item| item.max_notional)
+            .unwrap_or_default()
+            .min(
+                self.config
+                    .venue(candidate.short_venue)
+                    .map(|item| item.max_notional)
+                    .unwrap_or_default(),
+            )
+            .min(crate::strategy::effective_max_entry_notional(&self.config));
         let normalized_entry_notional =
             candidate.entry_notional_quote * (executable_quantity / candidate.quantity.max(1e-9));
         self.log_event(
@@ -1550,6 +1614,7 @@ impl Engine {
             long_leg.request.side,
             executable_quantity,
         );
+        let long_leg_notional_quote = order_request_notional_quote(&long_leg.request);
         let short_risk = self.build_entry_leg_risk(
             market,
             HedgeLeg::Short,
@@ -1558,12 +1623,29 @@ impl Engine {
             short_leg.request.side,
             executable_quantity,
         );
+        let short_leg_notional_quote = order_request_notional_quote(&short_leg.request);
+        let long_leg_trace = self.entry_leg_notional_trace(candidate.long_venue, &long_leg.request);
+        let short_leg_trace =
+            self.entry_leg_notional_trace(candidate.short_venue, &short_leg.request);
         let (first_leg, first_risk, second_leg, second_risk) =
             if long_risk.total_score > short_risk.total_score {
                 (long_leg, long_risk, short_leg, short_risk)
             } else {
                 (short_leg, short_risk, long_leg, long_risk)
             };
+        self.log_event(
+            "execution.entry_notional_trace",
+            &json!({
+                "position_id": &position_id,
+                "pair_id": &candidate.pair_id,
+                "symbol": &candidate.symbol,
+                "target_notional_quote": target_notional_quote,
+                "candidate_entry_notional_quote": candidate.entry_notional_quote,
+                "normalized_quantity": executable_quantity,
+                "long": long_leg_trace,
+                "short": short_leg_trace,
+            }),
+        );
         self.log_event(
             "execution.entry_order_plan",
             &json!({
@@ -1574,6 +1656,29 @@ impl Engine {
                 "second": &second_risk,
             }),
         );
+        if let Some((stage, venue, leg_notional, min_notional)) =
+            self.entry_leg_notional_floor_violation(&[&first_leg, &second_leg])
+        {
+            self.state.last_error = Some(format!(
+                "entry leg notional below minimum: {leg_notional:.6}<{min_notional:.6} on {venue}"
+            ));
+            self.log_event(
+                "execution.entry_blocked",
+                &json!({
+                    "position_id": &position_id,
+                    "pair_id": &candidate.pair_id,
+                    "symbol": &candidate.symbol,
+                    "reason": "entry_leg_notional_below_minimum",
+                    "stage": stage,
+                    "venue": venue,
+                    "leg_notional_quote": leg_notional,
+                    "min_entry_leg_notional_quote": min_notional,
+                    "long_leg_notional_quote": long_leg_notional_quote,
+                    "short_leg_notional_quote": short_leg_notional_quote,
+                }),
+            );
+            return Ok(());
+        }
 
         let (first_fill, first_latency_ms) = match self
             .execute_order_leg(
@@ -1972,6 +2077,41 @@ impl Engine {
             .and_then(|quote| quote.mark_price)
     }
 
+    fn entry_leg_notional_trace(&self, venue: Venue, request: &OrderRequest) -> serde_json::Value {
+        let exchange_min_notional_quote = self.adapters.get(&venue).and_then(|adapter| {
+            adapter.min_entry_notional_quote_hint(&request.symbol, request.price_hint)
+        });
+        let venue_min_notional_quote = exchange_min_notional_quote
+            .unwrap_or_default()
+            .max(self.config.strategy.min_entry_leg_notional_quote.max(0.0));
+        json!({
+            "venue": venue,
+            "normalized_quantity": request.quantity,
+            "price_hint": request.price_hint,
+            "final_leg_notional_quote": order_request_notional_quote(request),
+            "exchange_min_notional_quote": exchange_min_notional_quote,
+            "venue_min_notional_quote": venue_min_notional_quote,
+        })
+    }
+
+    fn entry_leg_notional_floor_violation(
+        &self,
+        legs: &[&EntryLegPlan],
+    ) -> Option<(&'static str, Venue, f64, f64)> {
+        let min_notional = self.config.strategy.min_entry_leg_notional_quote.max(0.0);
+        if min_notional <= 0.0 {
+            return None;
+        }
+
+        legs.iter().find_map(|leg| {
+            let leg_notional = order_request_notional_quote(&leg.request)?;
+            if leg.request.reduce_only || leg_notional + 1e-9 >= min_notional {
+                return None;
+            }
+            Some((leg.leg.entry_stage(), leg.venue, leg_notional, min_notional))
+        })
+    }
+
     fn persist_state(&mut self) -> Result<()> {
         self.state.venue_health = build_persisted_venue_health_state(
             &self.recent_submit_ack_ms,
@@ -2078,6 +2218,29 @@ impl Engine {
                     return Err(anyhow!("order blocked: {reason}"));
                 }
             }
+        }
+        if let Some(reason) = order_notional_floor_reason(
+            self.config.strategy.min_entry_leg_notional_quote,
+            request.price_hint,
+            request.quantity,
+            request.reduce_only,
+        ) {
+            self.log_event(
+                "execution.order_blocked",
+                &json!({
+                    "position_id": context.position_id,
+                    "pair_id": context.pair_id,
+                    "stage": context.stage,
+                    "venue": venue,
+                    "symbol": &request.symbol,
+                    "side": request.side,
+                    "requested_quantity": request.quantity,
+                    "reduce_only": request.reduce_only,
+                    "client_order_id": &request.client_order_id,
+                    "reason": reason,
+                }),
+            );
+            return Err(anyhow!("order blocked: entry_leg_notional_below_minimum"));
         }
         self.log_event(
             "execution.order_submitted",
@@ -2712,6 +2875,33 @@ fn order_quote_expired_reason(
         return Some(format!("quote_expired:{age_ms}>{max_order_quote_age_ms}"));
     }
 
+    None
+}
+
+fn order_request_notional_quote(request: &OrderRequest) -> Option<f64> {
+    request
+        .price_hint
+        .filter(|price| price.is_finite() && *price > 0.0)
+        .map(|price| request.quantity.max(0.0) * price)
+}
+
+fn order_notional_floor_reason(
+    min_entry_leg_notional_quote: f64,
+    price_hint: Option<f64>,
+    quantity: f64,
+    reduce_only: bool,
+) -> Option<String> {
+    if reduce_only || min_entry_leg_notional_quote <= 0.0 {
+        return None;
+    }
+    let price_hint = price_hint.filter(|price| price.is_finite() && *price > 0.0)?;
+    let notional = quantity.max(0.0) * price_hint;
+    if notional + 1e-9 < min_entry_leg_notional_quote {
+        return Some(format!(
+            "entry_leg_notional_below_minimum:{notional:.6}<{}",
+            min_entry_leg_notional_quote
+        ));
+    }
     None
 }
 

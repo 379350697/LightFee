@@ -978,6 +978,14 @@ impl VenueAdapter for BybitLiveAdapter {
         Ok(floor_to_step(quantity, meta.qty_step))
     }
 
+    fn min_entry_notional_quote_hint(&self, symbol: &str, _price_hint: Option<f64>) -> Option<f64> {
+        self.metadata
+            .lock()
+            .expect("lock")
+            .get(symbol)
+            .and_then(|meta| meta.min_notional_value)
+    }
+
     async fn fetch_transfer_statuses(&self, assets: &[String]) -> Result<Vec<AssetTransferStatus>> {
         let wanted = assets
             .iter()

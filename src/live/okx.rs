@@ -1101,6 +1101,13 @@ impl VenueAdapter for OkxLiveAdapter {
         Ok(contracts * meta.ct_val)
     }
 
+    fn min_entry_notional_quote_hint(&self, symbol: &str, price_hint: Option<f64>) -> Option<f64> {
+        let price_hint = price_hint.filter(|price| price.is_finite() && *price > 0.0)?;
+        let metadata = self.metadata.lock().expect("lock");
+        let meta = metadata.get(symbol)?;
+        Some(meta.min_sz.unwrap_or(meta.lot_sz).max(meta.lot_sz) * meta.ct_val * price_hint)
+    }
+
     async fn fetch_transfer_statuses(&self, assets: &[String]) -> Result<Vec<AssetTransferStatus>> {
         let wanted = assets
             .iter()

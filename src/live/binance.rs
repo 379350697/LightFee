@@ -834,6 +834,14 @@ impl VenueAdapter for BinanceLiveAdapter {
         Ok(quantity)
     }
 
+    fn min_entry_notional_quote_hint(&self, symbol: &str, _price_hint: Option<f64>) -> Option<f64> {
+        self.metadata
+            .lock()
+            .expect("lock")
+            .get(symbol)
+            .and_then(|meta| meta.min_notional)
+    }
+
     async fn fetch_transfer_statuses(&self, assets: &[String]) -> Result<Vec<AssetTransferStatus>> {
         if self.wallet_base_url.contains("testnet") {
             return Ok(Vec::new());

@@ -31,6 +31,14 @@ pub trait VenueAdapter: Send + Sync {
         Ok(quantity)
     }
 
+    fn min_entry_notional_quote_hint(
+        &self,
+        _symbol: &str,
+        _price_hint: Option<f64>,
+    ) -> Option<f64> {
+        None
+    }
+
     async fn fetch_transfer_statuses(
         &self,
         _assets: &[String],

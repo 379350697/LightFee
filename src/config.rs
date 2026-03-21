@@ -162,6 +162,8 @@ pub struct StrategyConfig {
     pub max_entry_notional: f64,
     #[serde(default = "default_live_max_entry_notional")]
     pub live_max_entry_notional: f64,
+    #[serde(default = "default_min_entry_leg_notional_quote")]
+    pub min_entry_leg_notional_quote: f64,
     #[serde(default = "default_max_concurrent_positions")]
     pub max_concurrent_positions: usize,
     #[serde(default = "default_max_scan_minutes_before_funding")]
@@ -213,6 +215,7 @@ impl Default for StrategyConfig {
             post_funding_hold_secs: default_post_funding_hold_secs(),
             max_entry_notional: default_max_entry_notional(),
             live_max_entry_notional: default_live_max_entry_notional(),
+            min_entry_leg_notional_quote: default_min_entry_leg_notional_quote(),
             max_concurrent_positions: default_max_concurrent_positions(),
             max_scan_minutes_before_funding: default_max_scan_minutes_before_funding(),
             min_scan_minutes_before_funding: default_min_scan_minutes_before_funding(),
@@ -425,6 +428,10 @@ fn default_max_entry_notional() -> f64 {
 
 fn default_live_max_entry_notional() -> f64 {
     30.0
+}
+
+fn default_min_entry_leg_notional_quote() -> f64 {
+    8.0
 }
 
 fn default_max_concurrent_positions() -> usize {

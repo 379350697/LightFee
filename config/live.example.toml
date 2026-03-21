@@ -23,6 +23,7 @@ entry_window_secs = 180
 post_funding_hold_secs = 0
 max_entry_notional = 1000.0
 live_max_entry_notional = 30.0
+min_entry_leg_notional_quote = 8.0
 max_concurrent_positions = 2
 max_scan_minutes_before_funding = 15
 min_scan_minutes_before_funding = 5
