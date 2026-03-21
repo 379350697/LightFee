@@ -3060,6 +3060,29 @@ async fn entry_market_refresh_unblocks_candidate_stale_gate_before_order_submiss
         records.iter().filter_map(record_kind).collect::<Vec<_>>()
     );
     assert!(has_event(&records, "execution.entry_quote_refreshed"));
+    let verification = records
+        .iter()
+        .find(|record| record_kind(record) == Some("execution.entry_quote_verification"))
+        .expect("entry quote verification");
+    assert_eq!(verification["payload"]["refresh_count"].as_u64(), Some(2));
+    assert!(verification["payload"]["max_pre_refresh_quote_age_ms"]
+        .as_i64()
+        .map(|age_ms| age_ms >= 7_100)
+        .unwrap_or(false));
+    assert!(verification["payload"]["block_reason"].is_null());
+    let legs = verification["payload"]["legs"]
+        .as_array()
+        .expect("verification legs");
+    assert_eq!(legs.len(), 2);
+    assert!(legs.iter().all(|leg| {
+        leg["pre_refresh_age_ms"]
+            .as_i64()
+            .map(|age_ms| age_ms >= 7_100)
+            .unwrap_or(false)
+            && leg["refresh_succeeded"].as_bool() == Some(true)
+            && leg["refreshed_observed_at_ms"].as_i64().is_some()
+            && leg["post_refresh_age_ms"].as_i64().is_some()
+    }));
     assert!(has_event(&records, "execution.entry_prepare_timing"));
     assert!(has_event(&records, "entry.opened"));
     assert!(!records.iter().any(|record| {

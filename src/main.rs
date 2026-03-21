@@ -42,6 +42,7 @@ async fn main() -> Result<()> {
 
     if let Some(warmup_ms) = startup_market_warmup_ms(
         config.runtime.mode.clone(),
+        engine.market_data_active(),
         engine.state().open_positions.len(),
         config.runtime.poll_interval_ms,
     ) {
@@ -114,10 +115,11 @@ async fn prewarm_live_adapters(
 
 fn startup_market_warmup_ms(
     mode: RuntimeMode,
+    market_data_active: bool,
     active_position_count: usize,
     poll_interval_ms: u64,
 ) -> Option<u64> {
-    if !matches!(mode, RuntimeMode::Live) || active_position_count > 0 {
+    if !matches!(mode, RuntimeMode::Live) || !market_data_active || active_position_count > 0 {
         return None;
     }
     Some(poll_interval_ms.saturating_mul(3).clamp(3_000, 10_000))
@@ -238,19 +240,33 @@ mod tests {
     #[test]
     fn live_startup_warms_up_when_no_positions_are_open() {
         assert_eq!(
-            startup_market_warmup_ms(RuntimeMode::Live, 0, 1_500),
+            startup_market_warmup_ms(RuntimeMode::Live, true, 0, 1_500),
             Some(4_500)
         );
     }
 
     #[test]
     fn live_startup_skips_warmup_when_positions_exist() {
-        assert_eq!(startup_market_warmup_ms(RuntimeMode::Live, 1, 1_500), None);
+        assert_eq!(
+            startup_market_warmup_ms(RuntimeMode::Live, true, 1, 1_500),
+            None
+        );
     }
 
     #[test]
     fn paper_mode_skips_warmup() {
-        assert_eq!(startup_market_warmup_ms(RuntimeMode::Paper, 0, 1_500), None);
+        assert_eq!(
+            startup_market_warmup_ms(RuntimeMode::Paper, false, 0, 1_500),
+            None
+        );
+    }
+
+    #[test]
+    fn live_startup_skips_warmup_when_market_data_is_idle() {
+        assert_eq!(
+            startup_market_warmup_ms(RuntimeMode::Live, false, 0, 1_500),
+            None
+        );
     }
 
     struct PrewarmProbeAdapter {

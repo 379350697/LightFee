@@ -48,6 +48,7 @@ pub struct BybitLiveAdapter {
     time_offset_ms: Mutex<Option<i64>>,
     position_mode: Arc<Mutex<Option<BybitPositionMode>>>,
     market_ws: Arc<WsMarketState>,
+    market_subscription_symbols: Mutex<Vec<String>>,
     private_ws: Arc<WsPrivateState>,
 }
 
@@ -99,6 +100,7 @@ impl BybitLiveAdapter {
             time_offset_ms: Mutex::new(None),
             position_mode: Arc::new(Mutex::new(None)),
             market_ws,
+            market_subscription_symbols: Mutex::new(Vec::new()),
             private_ws: WsPrivateState::new(),
         };
         if let Err(error) = adapter.refresh_symbol_catalog().await {
@@ -111,6 +113,7 @@ impl BybitLiveAdapter {
             );
         }
         let tracked_symbols = adapter.tracked_symbols(symbols);
+        *adapter.market_subscription_symbols.lock().expect("lock") = tracked_symbols.clone();
         adapter.start_market_ws(&tracked_symbols);
         adapter.start_private_ws(&tracked_symbols);
         Ok(adapter)
@@ -1214,6 +1217,31 @@ impl VenueAdapter for BybitLiveAdapter {
 
     async fn live_startup_prewarm(&self) -> Result<()> {
         let _ = self.server_timestamp_ms().await?;
+        Ok(())
+    }
+
+    fn supports_market_data_activity_control(&self) -> bool {
+        true
+    }
+
+    async fn set_market_data_active(&self, active: bool, symbols: &[String]) -> Result<()> {
+        let tracked_symbols = self.tracked_symbols(symbols);
+        let mut current_symbols = self.market_subscription_symbols.lock().expect("lock");
+        if !active || tracked_symbols.is_empty() {
+            if self.market_ws.has_worker() || !current_symbols.is_empty() {
+                self.market_ws.abort_worker();
+                self.market_ws.clear();
+                current_symbols.clear();
+            }
+            return Ok(());
+        }
+        if self.market_ws.has_worker() && *current_symbols == tracked_symbols {
+            return Ok(());
+        }
+        self.market_ws.abort_worker();
+        self.market_ws.clear();
+        self.start_market_ws(&tracked_symbols);
+        *current_symbols = tracked_symbols;
         Ok(())
     }
 

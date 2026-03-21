@@ -120,6 +120,10 @@ impl WsMarketState {
         self.worker.lock().expect("lock").replace(worker);
     }
 
+    pub(crate) fn has_worker(&self) -> bool {
+        self.worker.lock().expect("lock").is_some()
+    }
+
     pub(crate) fn record_connection_success(&self, now_ms: i64) {
         self.health.write().expect("lock").record_success(now_ms);
     }
@@ -140,6 +144,11 @@ impl WsMarketState {
         if let Some(worker) = self.worker.lock().expect("lock").take() {
             worker.abort();
         }
+    }
+
+    pub(crate) fn clear(&self) {
+        self.symbols.write().expect("lock").clear();
+        *self.health.write().expect("lock") = ConnectionHealth::default();
     }
 }
 

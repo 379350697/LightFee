@@ -168,6 +168,8 @@ pub struct Engine {
     venue_health_updated_at_ms: BTreeMap<Venue, i64>,
     cached_transfer_status_view: Option<CachedTransferStatusView>,
     scan_symbols: Vec<String>,
+    market_data_active: bool,
+    market_data_activated_at_ms: Option<i64>,
     last_no_entry_diagnostics: Option<NoEntryDiagnosticsLogState>,
     repeated_failure_logs: BTreeMap<String, RepeatedFailureLogState>,
 }
@@ -202,11 +204,27 @@ struct EntryQuoteRefreshLeg {
     age_ms: Option<i64>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct EntryQuoteVerificationLeg {
+    venue: Venue,
+    side: Side,
+    stage: &'static str,
+    expired_reason: String,
+    previous_observed_at_ms: Option<i64>,
+    pre_refresh_age_ms: Option<i64>,
+    refresh_succeeded: bool,
+    refresh_error: Option<String>,
+    refreshed_observed_at_ms: Option<i64>,
+    post_refresh_age_ms: Option<i64>,
+    refreshed_price_hint: Option<f64>,
+}
+
 #[derive(Default)]
 struct EntryQuoteRefreshResult {
     block_reason: Option<String>,
     refreshed_leg_count: usize,
     max_pre_refresh_age_ms: Option<i64>,
+    legs: Vec<EntryQuoteVerificationLeg>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -416,6 +434,16 @@ struct NoEntryDiagnosticsLogState {
     suppressed_count: usize,
 }
 
+fn remap_no_entry_diagnostic_reason(reason: &str) -> (Option<String>, Option<String>) {
+    if reason.starts_with("entry_quote_stale:") {
+        return (
+            None,
+            Some(reason.replacen("entry_quote_stale:", "entry_quote_refresh_needed:", 1)),
+        );
+    }
+    (Some(reason.to_string()), None)
+}
+
 #[derive(Clone, Debug, Default)]
 struct RepeatedFailureLogState {
     last_emitted_cycle: u64,
@@ -497,16 +525,30 @@ impl Engine {
             venue_health_updated_at_ms,
             cached_transfer_status_view: None,
             scan_symbols: initial_scan_symbols,
+            market_data_active: false,
+            market_data_activated_at_ms: None,
             last_no_entry_diagnostics: None,
             repeated_failure_logs: BTreeMap::new(),
         };
         engine.finalize_startup_position_recovery().await?;
         engine.initialize_scan_symbols(cached_scan_symbol_state.as_ref());
+        if matches!(engine.config.runtime.mode, crate::config::RuntimeMode::Live)
+            && engine.supports_windowed_market_data_control()
+        {
+            engine.market_data_active = true;
+            engine
+                .sync_market_data_activity(engine.current_journal_ts_ms())
+                .await?;
+        }
         Ok(engine)
     }
 
     pub fn state(&self) -> &EngineState {
         &self.state
+    }
+
+    pub fn market_data_active(&self) -> bool {
+        self.market_data_active
     }
 
     fn active_positions(&self) -> &[OpenPosition] {
@@ -562,6 +604,71 @@ impl Engine {
                 "symbol_count": self.scan_symbols.len(),
             }),
         );
+    }
+
+    fn supports_windowed_market_data_control(&self) -> bool {
+        self.adapters
+            .values()
+            .any(|adapter| adapter.supports_market_data_activity_control())
+    }
+
+    fn should_activate_market_data(&self, now_ms: i64) -> bool {
+        if !matches!(self.config.runtime.mode, crate::config::RuntimeMode::Live) {
+            return false;
+        }
+        if !self.supports_windowed_market_data_control() {
+            return true;
+        }
+        if !self.active_positions().is_empty() {
+            return true;
+        }
+        if self.active_scan_symbols().is_empty() {
+            return false;
+        }
+        let hour_ms = 60 * 60 * 1_000_i64;
+        let elapsed_in_hour_ms = now_ms.rem_euclid(hour_ms);
+        let remaining_ms = hour_ms.saturating_sub(elapsed_in_hour_ms);
+        is_within_funding_scan_window_ms(&self.config, remaining_ms)
+    }
+
+    fn market_data_warmup_pending(&self, now_ms: i64) -> bool {
+        self.supports_windowed_market_data_control()
+            && self.market_data_active
+            && self.active_positions().is_empty()
+            && self
+                .market_data_activated_at_ms
+                .is_some_and(|activated_at_ms| {
+                    now_ms.saturating_sub(activated_at_ms)
+                        < self.config.runtime.poll_interval_ms.min(i64::MAX as u64) as i64
+                })
+    }
+
+    async fn sync_market_data_activity(&mut self, now_ms: i64) -> Result<bool> {
+        let should_be_active = self.should_activate_market_data(now_ms);
+        let symbols = self.active_scan_symbols().to_vec();
+        if should_be_active {
+            for adapter in self.adapters.values() {
+                adapter.set_market_data_active(true, &symbols).await?;
+            }
+            if !self.market_data_active {
+                self.market_data_active = true;
+                self.market_data_activated_at_ms = Some(now_ms);
+                self.log_event(
+                    "market_data.activated",
+                    &json!({
+                        "symbol_count": symbols.len(),
+                    }),
+                );
+            }
+        } else if self.market_data_active {
+            for adapter in self.adapters.values() {
+                adapter.set_market_data_active(false, &[]).await?;
+            }
+            self.market_data_active = false;
+            self.market_data_activated_at_ms = None;
+            self.log_event("market_data.deactivated", &json!({}));
+        }
+        Ok(should_be_active)
     }
 
     fn active_position_count(&self) -> usize {
@@ -647,6 +754,44 @@ impl Engine {
 
     pub async fn tick(&mut self) -> Result<()> {
         self.state.cycle += 1;
+        let tick_started_at_ms = wall_clock_now_ms();
+        let windowed_market_data =
+            matches!(self.config.runtime.mode, crate::config::RuntimeMode::Live)
+                && self.supports_windowed_market_data_control();
+        if windowed_market_data {
+            let market_data_active = self.sync_market_data_activity(tick_started_at_ms).await?;
+            if !market_data_active && self.active_positions().is_empty() {
+                let market = MarketView::empty(tick_started_at_ms);
+                self.state.last_market_ts_ms = Some(tick_started_at_ms);
+                self.expire_entry_cooldowns();
+                if self.state.mode == EngineMode::Running
+                    && should_probe_live_recovery(
+                        self.last_live_recovery_probe_ms,
+                        tick_started_at_ms,
+                        FLAT_RECOVERY_PROBE_INTERVAL_MS,
+                    )
+                {
+                    self.discover_live_open_position(&market).await?;
+                    self.last_live_recovery_probe_ms = Some(tick_started_at_ms);
+                }
+                if self.active_positions().is_empty() {
+                    self.process_pending_close_reconciliations(tick_started_at_ms, &market)
+                        .await?;
+                    return Ok(());
+                }
+            }
+            if self.market_data_warmup_pending(tick_started_at_ms) {
+                self.state.last_market_ts_ms = Some(tick_started_at_ms);
+                self.log_event(
+                    "market_data.warmup_pending",
+                    &json!({
+                        "activated_at_ms": self.market_data_activated_at_ms,
+                        "warmup_ms": self.config.runtime.poll_interval_ms,
+                    }),
+                );
+                return Ok(());
+            }
+        }
         let market = match self.fetch_market_view().await {
             Ok(market) => market,
             Err(error) => {
@@ -1295,16 +1440,22 @@ impl Engine {
             .iter()
             .map(|candidate| candidate.pair_id.as_str())
             .collect::<Vec<_>>();
-        let blocked_reason_counts = count_strings(
-            candidates
-                .iter()
-                .flat_map(|candidate| candidate.blocked_reasons.iter().cloned()),
-        );
-        let advisory_counts = count_strings(
-            candidates
-                .iter()
-                .flat_map(|candidate| candidate.advisories.iter().cloned()),
-        );
+        let mut diagnostic_blocked_reasons = Vec::new();
+        let mut diagnostic_advisories = Vec::new();
+        for candidate in candidates {
+            for reason in &candidate.blocked_reasons {
+                let (blocked_reason, advisory_reason) = remap_no_entry_diagnostic_reason(reason);
+                if let Some(reason) = blocked_reason {
+                    diagnostic_blocked_reasons.push(reason);
+                }
+                if let Some(reason) = advisory_reason {
+                    diagnostic_advisories.push(reason);
+                }
+            }
+            diagnostic_advisories.extend(candidate.advisories.iter().cloned());
+        }
+        let blocked_reason_counts = count_strings(diagnostic_blocked_reasons.into_iter());
+        let advisory_counts = count_strings(diagnostic_advisories.into_iter());
         let reason = self.no_entry_reason(candidates, selected_candidates, remaining_slots);
         let fingerprint = no_entry_diagnostics_fingerprint(
             &reason,
@@ -1596,6 +1747,17 @@ impl Engine {
             candidate.quantity,
         );
         let selection_score = self.runtime_candidate_selection_score(market, candidate);
+        let mut blocked_reasons = Vec::new();
+        let mut advisories = candidate.advisories.clone();
+        for reason in &candidate.blocked_reasons {
+            let (blocked_reason, advisory_reason) = remap_no_entry_diagnostic_reason(reason);
+            if let Some(reason) = blocked_reason {
+                blocked_reasons.push(reason);
+            }
+            if let Some(reason) = advisory_reason {
+                advisories.push(reason);
+            }
+        }
 
         OpportunityCandidateChecklist {
             pair_id: candidate.pair_id.clone(),
@@ -1622,8 +1784,8 @@ impl Engine {
                 second_stage_incremental_funding_edge_bps: candidate
                     .second_stage_incremental_funding_edge_bps,
             },
-            blocked_reasons: candidate.blocked_reasons.clone(),
-            advisories: candidate.advisories.clone(),
+            blocked_reasons,
+            advisories,
             checklist: vec![
                 checklist_item(
                     "market_fresh_long",
@@ -2617,6 +2779,27 @@ impl Engine {
             .refresh_entry_candidate_quotes_if_needed(&candidate, &position_id, &mut entry_market)
             .await?;
         let proactive_entry_quote_refresh_ms = duration_ms_u64(quote_refresh_started_at.elapsed());
+        if quote_refresh_result.refreshed_leg_count > 0
+            || quote_refresh_result.block_reason.is_some()
+        {
+            self.log_event(
+                "execution.entry_quote_verification",
+                &json!({
+                    "position_id": &position_id,
+                    "pair_id": &candidate.pair_id,
+                    "symbol": &candidate.symbol,
+                    "long_venue": candidate.long_venue,
+                    "short_venue": candidate.short_venue,
+                    "max_order_quote_age_ms": self.config.runtime.max_order_quote_age_ms,
+                    "proactive_refresh_quote_age_ms": self.config.runtime.max_order_quote_age_ms.saturating_mul(PROACTIVE_ENTRY_QUOTE_REFRESH_MULTIPLIER),
+                    "hard_block_quote_age_ms": self.config.runtime.max_order_quote_age_ms.saturating_mul(3),
+                    "refresh_count": quote_refresh_result.refreshed_leg_count,
+                    "max_pre_refresh_quote_age_ms": quote_refresh_result.max_pre_refresh_age_ms,
+                    "block_reason": &quote_refresh_result.block_reason,
+                    "legs": &quote_refresh_result.legs,
+                }),
+            );
+        }
         if let Some(reason) = quote_refresh_result.block_reason {
             self.state.last_error = Some(format!(
                 "entry quote stale after refresh for {} on {} and {}",
@@ -4456,12 +4639,27 @@ impl Engine {
         }
         let max_pre_refresh_age_ms = stale_legs.iter().filter_map(|leg| leg.age_ms).max();
         let mut refreshed_leg_count = 0;
+        let mut verification_legs = Vec::with_capacity(stale_legs.len());
 
         for leg in stale_legs.drain(..) {
             let venue = leg.venue;
             let side = leg.side;
             let stage = leg.stage;
             let expired_reason = leg.expired_reason;
+            let previous_observed_at_ms = market.observed_at_ms(venue);
+            let mut verification_leg = EntryQuoteVerificationLeg {
+                venue,
+                side,
+                stage,
+                expired_reason: expired_reason.clone(),
+                previous_observed_at_ms,
+                pre_refresh_age_ms: leg.age_ms,
+                refresh_succeeded: false,
+                refresh_error: None,
+                refreshed_observed_at_ms: None,
+                post_refresh_age_ms: None,
+                refreshed_price_hint: None,
+            };
             let snapshot = match self
                 .adapter(venue)?
                 .refresh_market_snapshot(&candidate.symbol)
@@ -4469,6 +4667,8 @@ impl Engine {
             {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
+                    verification_leg.refresh_error = Some(error.to_string());
+                    verification_legs.push(verification_leg);
                     self.log_event(
                         "execution.entry_quote_refresh_failed",
                         &json!({
@@ -4479,6 +4679,8 @@ impl Engine {
                             "symbol": &candidate.symbol,
                             "side": side,
                             "expired_reason": expired_reason,
+                            "previous_observed_at_ms": previous_observed_at_ms,
+                            "pre_refresh_age_ms": leg.age_ms,
                             "error": error.to_string(),
                         }),
                     );
@@ -4486,6 +4688,7 @@ impl Engine {
                         block_reason: Some(format!("entry_quote_refresh_failed:{venue}:{error}")),
                         refreshed_leg_count,
                         max_pre_refresh_age_ms,
+                        legs: verification_legs,
                     });
                 }
             };
@@ -4493,6 +4696,8 @@ impl Engine {
                 match quote_fill(&snapshot, &candidate.symbol, side) {
                     Ok(fill) => fill,
                     Err(error) => {
+                        verification_leg.refresh_error = Some(error.to_string());
+                        verification_legs.push(verification_leg);
                         self.log_event(
                             "execution.entry_quote_refresh_failed",
                             &json!({
@@ -4503,6 +4708,8 @@ impl Engine {
                                 "symbol": &candidate.symbol,
                                 "side": side,
                                 "expired_reason": expired_reason,
+                                "previous_observed_at_ms": previous_observed_at_ms,
+                                "pre_refresh_age_ms": leg.age_ms,
                                 "error": error.to_string(),
                             }),
                         );
@@ -4512,11 +4719,18 @@ impl Engine {
                             )),
                             refreshed_leg_count,
                             max_pre_refresh_age_ms,
+                            legs: verification_legs,
                         });
                     }
                 };
-            let previous_observed_at_ms = market.observed_at_ms(venue);
             market.merge_snapshot(snapshot);
+            let post_refresh_age_ms = market
+                .observed_at_ms(venue)
+                .map(|observed_at_ms| wall_clock_now_ms().saturating_sub(observed_at_ms));
+            verification_leg.refresh_succeeded = true;
+            verification_leg.refreshed_observed_at_ms = Some(refreshed_observed_at_ms);
+            verification_leg.post_refresh_age_ms = post_refresh_age_ms;
+            verification_leg.refreshed_price_hint = Some(price_hint);
             refreshed_leg_count += 1;
             self.log_event(
                 "execution.entry_quote_refreshed",
@@ -4529,16 +4743,20 @@ impl Engine {
                     "side": side,
                     "expired_reason": expired_reason,
                     "previous_observed_at_ms": previous_observed_at_ms,
+                    "pre_refresh_age_ms": leg.age_ms,
                     "refreshed_observed_at_ms": refreshed_observed_at_ms,
+                    "post_refresh_age_ms": post_refresh_age_ms,
                     "price_hint": price_hint,
                 }),
             );
+            verification_legs.push(verification_leg);
         }
 
         Ok(EntryQuoteRefreshResult {
             block_reason: self.runtime_entry_quote_freshness_reason(market, candidate),
             refreshed_leg_count,
             max_pre_refresh_age_ms,
+            legs: verification_legs,
         })
     }
 
@@ -4770,6 +4988,7 @@ impl Engine {
     }
 
     async fn discover_live_open_position(&mut self, market: &MarketView) -> Result<()> {
+        let mut recovery_market = market.clone();
         let mut recovered = Vec::new();
         let mut mismatches = Vec::new();
         let mut venue_positions = HashMap::new();
@@ -4795,7 +5014,7 @@ impl Engine {
                     }
                     continue;
                 }
-                if market.symbol(venue, symbol).is_none()
+                if recovery_market.symbol(venue, symbol).is_none()
                     && self.cached_position(venue, symbol).is_none()
                 {
                     continue;
@@ -4839,11 +5058,30 @@ impl Engine {
                 continue;
             }
 
-            let Some(long_quote) = market.symbol(long_leg.venue, symbol) else {
+            if recovery_market.symbol(long_leg.venue, symbol).is_none() {
+                if let Ok(snapshot) = self
+                    .adapter(long_leg.venue)?
+                    .refresh_market_snapshot(symbol)
+                    .await
+                {
+                    recovery_market.merge_snapshot(snapshot);
+                }
+            }
+            if recovery_market.symbol(short_leg.venue, symbol).is_none() {
+                if let Ok(snapshot) = self
+                    .adapter(short_leg.venue)?
+                    .refresh_market_snapshot(symbol)
+                    .await
+                {
+                    recovery_market.merge_snapshot(snapshot);
+                }
+            }
+
+            let Some(long_quote) = recovery_market.symbol(long_leg.venue, symbol) else {
                 mismatches.push(format!("{symbol}:missing_market:{}", long_leg.venue));
                 continue;
             };
-            let Some(short_quote) = market.symbol(short_leg.venue, symbol) else {
+            let Some(short_quote) = recovery_market.symbol(short_leg.venue, symbol) else {
                 mismatches.push(format!("{symbol}:missing_market:{}", short_leg.venue));
                 continue;
             };
@@ -4880,7 +5118,7 @@ impl Engine {
             recovered.push(OpenPosition {
                 position_id: format!(
                     "live-recovered-{}-{}-{}",
-                    market.now_ms(),
+                    recovery_market.now_ms(),
                     symbol.to_ascii_lowercase(),
                     long_leg.venue
                 ),
@@ -4909,7 +5147,7 @@ impl Engine {
                 total_entry_fee_quote: 0.0,
                 realized_price_pnl_quote: 0.0,
                 realized_exit_fee_quote: 0.0,
-                entered_at_ms: market.now_ms(),
+                entered_at_ms: recovery_market.now_ms(),
                 current_net_quote: 0.0,
                 peak_net_quote: 0.0,
                 funding_captured: false,
@@ -5582,8 +5820,9 @@ mod tests {
     use super::{
         cached_flat_guard_reason, compact_client_order_id, effective_entry_leg_notional_floor,
         hyperliquid_entry_gate_reason, order_error_may_have_created_exposure,
-        order_quote_expired_reason, persistent_state_view, should_probe_live_recovery,
-        venue_order_health_risk_score, EngineMode, EngineState, VenueOrderHealthSample,
+        order_quote_expired_reason, persistent_state_view, remap_no_entry_diagnostic_reason,
+        should_probe_live_recovery, venue_order_health_risk_score, EngineMode, EngineState,
+        VenueOrderHealthSample,
     };
     use crate::models::{PositionSnapshot, Venue};
 
@@ -5684,6 +5923,22 @@ mod tests {
         assert_eq!(effective_entry_leg_notional_floor(8.0, None), 8.0);
         assert_eq!(effective_entry_leg_notional_floor(8.0, Some(5.0)), 8.0);
         assert_eq!(effective_entry_leg_notional_floor(8.0, Some(10.0)), 10.0);
+    }
+
+    #[test]
+    fn no_entry_diagnostics_demotes_entry_quote_stale_to_refresh_advisory() {
+        let (blocked_reason, advisory_reason) =
+            remap_no_entry_diagnostic_reason("entry_quote_stale:binance:48683>30000");
+        assert!(blocked_reason.is_none());
+        assert_eq!(
+            advisory_reason,
+            Some("entry_quote_refresh_needed:binance:48683>30000".to_string())
+        );
+
+        let (blocked_reason, advisory_reason) =
+            remap_no_entry_diagnostic_reason("outside_entry_window");
+        assert_eq!(blocked_reason, Some("outside_entry_window".to_string()));
+        assert!(advisory_reason.is_none());
     }
 
     #[test]

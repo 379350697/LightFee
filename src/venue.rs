@@ -64,6 +64,14 @@ pub trait VenueAdapter: Send + Sync {
         None
     }
 
+    fn supports_market_data_activity_control(&self) -> bool {
+        false
+    }
+
+    async fn set_market_data_active(&self, _active: bool, _symbols: &[String]) -> Result<()> {
+        Ok(())
+    }
+
     async fn live_startup_prewarm(&self) -> Result<()> {
         Ok(())
     }

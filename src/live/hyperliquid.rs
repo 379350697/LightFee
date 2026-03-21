@@ -64,6 +64,7 @@ pub struct HyperliquidLiveAdapter {
     meta_cache: Mutex<HashMap<String, HyperliquidAssetMeta>>,
     supported_symbols: Mutex<HashSet<String>>,
     market_ws: Arc<WsMarketState>,
+    market_subscription_symbols: Mutex<Vec<String>>,
     private_ws: Arc<WsPrivateState>,
     order_ws: HyperliquidWsPostClient,
 }
@@ -129,6 +130,7 @@ impl HyperliquidLiveAdapter {
             meta_cache: Mutex::new(meta_cache),
             supported_symbols: Mutex::new(supported_symbols),
             market_ws,
+            market_subscription_symbols: Mutex::new(Vec::new()),
             private_ws: WsPrivateState::new(),
             order_ws: HyperliquidWsPostClient::new(hyperliquid_ws_url(base_url)),
         };
@@ -142,6 +144,7 @@ impl HyperliquidLiveAdapter {
             );
         }
         let tracked_symbols = adapter.tracked_symbols(symbols);
+        *adapter.market_subscription_symbols.lock().expect("lock") = tracked_symbols.clone();
         adapter.start_market_ws(&tracked_symbols, base_url).await?;
         adapter.start_private_ws(&tracked_symbols, base_url).await?;
         Ok(adapter)
@@ -1020,6 +1023,43 @@ impl VenueAdapter for HyperliquidLiveAdapter {
 
     async fn live_startup_prewarm(&self) -> Result<()> {
         self.order_ws.prewarm().await
+    }
+
+    fn supports_market_data_activity_control(&self) -> bool {
+        true
+    }
+
+    async fn set_market_data_active(&self, active: bool, symbols: &[String]) -> Result<()> {
+        let tracked_symbols = self.tracked_symbols(symbols);
+        let current_symbols = self
+            .market_subscription_symbols
+            .lock()
+            .expect("lock")
+            .clone();
+        if !active || tracked_symbols.is_empty() {
+            if self.market_ws.has_worker() || !current_symbols.is_empty() {
+                self.market_ws.abort_worker();
+                self.market_ws.clear();
+                self.market_subscription_symbols
+                    .lock()
+                    .expect("lock")
+                    .clear();
+            }
+            return Ok(());
+        }
+        if self.market_ws.has_worker() && current_symbols == tracked_symbols {
+            return Ok(());
+        }
+        self.market_ws.abort_worker();
+        self.market_ws.clear();
+        let base_url = if self.config.live.is_testnet {
+            BaseUrl::Testnet
+        } else {
+            BaseUrl::Mainnet
+        };
+        self.start_market_ws(&tracked_symbols, base_url).await?;
+        *self.market_subscription_symbols.lock().expect("lock") = tracked_symbols;
+        Ok(())
     }
 
     async fn shutdown(&self) -> Result<()> {
