@@ -5,8 +5,8 @@ use async_trait::async_trait;
 
 use crate::{
     models::{
-        AccountBalanceSnapshot, OrderFill, OrderRequest, PerpLiquiditySnapshot, PositionSnapshot,
-        Side, Venue, VenueMarketSnapshot,
+        AccountBalanceSnapshot, AccountFeeSnapshot, OrderFill, OrderRequest, PerpLiquiditySnapshot,
+        PositionSnapshot, Side, Venue, VenueMarketSnapshot,
     },
     venue::VenueAdapter,
 };
@@ -29,6 +29,7 @@ pub struct ScriptedVenueAdapter {
     venue: Venue,
     taker_fee_bps: f64,
     min_notional_quote_hint: Option<f64>,
+    account_fee_snapshot: Option<AccountFeeSnapshot>,
     balance_snapshot: Option<AccountBalanceSnapshot>,
     balance_fetch_error: Option<String>,
     enforce_entry_balance_gate: bool,
@@ -42,6 +43,7 @@ impl ScriptedVenueAdapter {
             venue,
             taker_fee_bps,
             min_notional_quote_hint: None,
+            account_fee_snapshot: None,
             balance_snapshot: None,
             balance_fetch_error: None,
             enforce_entry_balance_gate: false,
@@ -70,6 +72,22 @@ impl ScriptedVenueAdapter {
 
     pub fn with_min_notional_quote_hint(mut self, min_notional_quote_hint: f64) -> Self {
         self.min_notional_quote_hint = Some(min_notional_quote_hint);
+        self
+    }
+
+    pub fn with_account_fee_snapshot(
+        mut self,
+        taker_fee_bps: f64,
+        maker_fee_bps: f64,
+        source: &str,
+    ) -> Self {
+        self.account_fee_snapshot = Some(AccountFeeSnapshot {
+            venue: self.venue,
+            taker_fee_bps,
+            maker_fee_bps,
+            observed_at_ms: 0,
+            source: source.to_string(),
+        });
         self
     }
 
@@ -284,6 +302,10 @@ impl VenueAdapter for ScriptedVenueAdapter {
             return Err(anyhow!(error.clone()));
         }
         Ok(self.balance_snapshot.clone())
+    }
+
+    fn cached_account_fee_snapshot(&self) -> Option<AccountFeeSnapshot> {
+        self.account_fee_snapshot.clone()
     }
 
     fn enforces_entry_balance_gate(&self) -> bool {

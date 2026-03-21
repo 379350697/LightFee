@@ -2,8 +2,9 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use crate::models::{
-    AccountBalanceSnapshot, AssetTransferStatus, OrderFill, OrderFillReconciliation, OrderRequest,
-    PerpLiquiditySnapshot, PositionSnapshot, Venue, VenueMarketSnapshot,
+    AccountBalanceSnapshot, AccountFeeSnapshot, AssetTransferStatus, OrderFill,
+    OrderFillReconciliation, OrderRequest, PerpLiquiditySnapshot, PositionSnapshot, Venue,
+    VenueMarketSnapshot,
 };
 
 #[async_trait]
@@ -30,6 +31,10 @@ pub trait VenueAdapter: Send + Sync {
 
     async fn fetch_account_balance_snapshot(&self) -> Result<Option<AccountBalanceSnapshot>> {
         Ok(None)
+    }
+
+    fn cached_account_fee_snapshot(&self) -> Option<AccountFeeSnapshot> {
+        None
     }
 
     fn enforces_entry_balance_gate(&self) -> bool {

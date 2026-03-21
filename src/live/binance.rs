@@ -19,9 +19,9 @@ use tracing::{debug, warn};
 use crate::{
     config::{RuntimeConfig, VenueConfig},
     models::{
-        AccountBalanceSnapshot, AssetTransferStatus, OrderExecutionTiming, OrderFill,
-        OrderFillReconciliation, OrderRequest, PerpLiquiditySnapshot, PositionSnapshot, Side,
-        SymbolMarketSnapshot, Venue, VenueMarketSnapshot,
+        AccountBalanceSnapshot, AccountFeeSnapshot, AssetTransferStatus, OrderExecutionTiming,
+        OrderFill, OrderFillReconciliation, OrderRequest, PerpLiquiditySnapshot, PositionSnapshot,
+        Side, SymbolMarketSnapshot, Venue, VenueMarketSnapshot,
     },
     resilience::FailureBackoff,
     venue::VenueAdapter,
@@ -53,6 +53,7 @@ pub struct BinanceLiveAdapter {
     market_ws: Arc<WsMarketState>,
     market_subscription_symbols: Mutex<Vec<String>>,
     private_ws: Arc<WsPrivateState>,
+    account_fee_snapshot: Mutex<Option<AccountFeeSnapshot>>,
     transfer_status_cache: Mutex<Option<VenueTransferStatusCache>>,
     perp_liquidity_cache: Mutex<HashMap<String, PerpLiquiditySnapshot>>,
     configured_leverage: Mutex<HashMap<String, u32>>,
@@ -84,6 +85,7 @@ impl BinanceLiveAdapter {
             load_json_cache::<BinanceSymbolCatalogCache>("binance-symbols.json");
         let persisted_transfer_cache =
             load_json_cache::<VenueTransferStatusCache>("binance-transfer-status.json");
+        let account_fee_snapshot = load_json_cache::<AccountFeeSnapshot>("binance-fees.json");
         let mut metadata = HashMap::new();
         let mut supported_symbols = HashSet::new();
         if let Some(cache) = persisted_catalog {
@@ -114,6 +116,7 @@ impl BinanceLiveAdapter {
             market_ws,
             market_subscription_symbols: Mutex::new(Vec::new()),
             private_ws: WsPrivateState::new(),
+            account_fee_snapshot: Mutex::new(account_fee_snapshot),
             transfer_status_cache: Mutex::new(transfer_status_cache),
             perp_liquidity_cache: Mutex::new(HashMap::new()),
             configured_leverage: Mutex::new(HashMap::new()),
@@ -169,6 +172,63 @@ impl BinanceLiveAdapter {
             return None;
         }
         Some(filter_transfer_statuses(cache, wanted))
+    }
+
+    fn fee_reference_symbol(&self) -> Option<String> {
+        self.market_subscription_symbols
+            .lock()
+            .expect("lock")
+            .first()
+            .cloned()
+            .or_else(|| {
+                self.supported_symbols
+                    .lock()
+                    .expect("lock")
+                    .iter()
+                    .next()
+                    .cloned()
+            })
+    }
+
+    fn store_account_fee_snapshot(&self, snapshot: &AccountFeeSnapshot) {
+        self.account_fee_snapshot
+            .lock()
+            .expect("lock")
+            .replace(snapshot.clone());
+        store_json_cache("binance-fees.json", snapshot);
+    }
+
+    async fn refresh_account_fee_snapshot(&self) -> Result<Option<AccountFeeSnapshot>> {
+        let Some(symbol) = self.fee_reference_symbol() else {
+            return Ok(self.cached_account_fee_snapshot());
+        };
+        let params = vec![
+            ("symbol", venue_symbol(&self.config, &symbol)),
+            ("recvWindow", BINANCE_RECV_WINDOW_MS.to_string()),
+            ("timestamp", self.server_timestamp_ms().await?.to_string()),
+        ];
+        let response = self
+            .signed_request(
+                reqwest::Method::GET,
+                "/fapi/v1/commissionRate",
+                params,
+                None,
+                &self.base_url,
+            )
+            .await?;
+        let snapshot = response
+            .json::<BinanceCommissionRateResponse>()
+            .await
+            .context("failed to decode binance commission rate")?;
+        let fee_snapshot = AccountFeeSnapshot {
+            venue: Venue::Binance,
+            taker_fee_bps: parse_f64(&snapshot.taker_commission_rate)? * 10_000.0,
+            maker_fee_bps: parse_f64(&snapshot.maker_commission_rate)? * 10_000.0,
+            observed_at_ms: now_ms(),
+            source: format!("binance_commission_rate:{}", symbol),
+        };
+        self.store_account_fee_snapshot(&fee_snapshot);
+        Ok(Some(fee_snapshot))
     }
 
     fn cached_perp_liquidity_snapshot(
@@ -1011,6 +1071,10 @@ impl VenueAdapter for BinanceLiveAdapter {
         }))
     }
 
+    fn cached_account_fee_snapshot(&self) -> Option<AccountFeeSnapshot> {
+        self.account_fee_snapshot.lock().expect("lock").clone()
+    }
+
     async fn ensure_entry_leverage(&self, symbol: &str, leverage: u32) -> Result<()> {
         if self
             .configured_leverage
@@ -1269,6 +1333,9 @@ impl VenueAdapter for BinanceLiveAdapter {
     async fn live_startup_prewarm(&self) -> Result<()> {
         let _ = self.server_timestamp_ms().await?;
         let _ = self.position_mode().await?;
+        if let Err(error) = self.refresh_account_fee_snapshot().await {
+            warn!(?error, "binance account fee snapshot prewarm failed");
+        }
         Ok(())
     }
 
@@ -2065,6 +2132,14 @@ struct BinanceAccountInfo {
     total_wallet_balance: String,
     #[serde(rename = "availableBalance")]
     available_balance: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BinanceCommissionRateResponse {
+    #[serde(rename = "makerCommissionRate")]
+    maker_commission_rate: String,
+    #[serde(rename = "takerCommissionRate")]
+    taker_commission_rate: String,
 }
 
 #[derive(Debug, Deserialize)]

@@ -18,8 +18,8 @@ use crate::{
     },
     market::MarketView,
     models::{
-        CandidateOpportunity, FundingLeg, FundingOpportunityType, OrderFillReconciliation,
-        OrderRequest, PerpLiquiditySnapshot, Side, Venue,
+        AccountFeeSnapshot, CandidateOpportunity, FundingLeg, FundingOpportunityType,
+        OrderFillReconciliation, OrderRequest, PerpLiquiditySnapshot, Side, Venue,
     },
     opportunity_source::{
         normalize_symbol_key, OpportunityHint, OpportunityHintSource, TransferStatusSource,
@@ -122,6 +122,82 @@ const CLOSE_RECONCILIATION_RETRY_MAX_MS: i64 = 5 * 60 * 1_000;
 const CEX_MIN_PERP_VOLUME_24H_QUOTE: f64 = 5_000_000.0;
 const HYPERLIQUID_MIN_PERP_VOLUME_24H_QUOTE: f64 = 1_000_000.0;
 const MIN_PERP_OPEN_INTEREST_QUOTE: f64 = 1_000_000.0;
+
+pub fn apply_cached_fee_snapshots_to_candidates(
+    config: &AppConfig,
+    candidates: &mut [CandidateOpportunity],
+    fee_snapshots: &BTreeMap<Venue, AccountFeeSnapshot>,
+) -> BTreeMap<Venue, f64> {
+    let mut fallback_venues = BTreeMap::new();
+
+    for candidate in candidates {
+        let (long_fee_bps, long_fallback) =
+            resolved_taker_fee_bps(config, fee_snapshots, candidate.long_venue);
+        if long_fallback {
+            fallback_venues
+                .entry(candidate.long_venue)
+                .or_insert(long_fee_bps);
+        }
+        let (short_fee_bps, short_fallback) =
+            resolved_taker_fee_bps(config, fee_snapshots, candidate.short_venue);
+        if short_fallback {
+            fallback_venues
+                .entry(candidate.short_venue)
+                .or_insert(short_fee_bps);
+        }
+
+        candidate.fee_bps = long_fee_bps + short_fee_bps;
+        candidate.expected_edge_bps = candidate.funding_edge_bps
+            - candidate.fee_bps
+            - candidate.entry_slippage_bps
+            - config.strategy.exit_slippage_reserve_bps
+            - config.strategy.capital_buffer_bps;
+        candidate.worst_case_edge_bps =
+            candidate.expected_edge_bps - config.strategy.execution_buffer_bps;
+        candidate.first_stage_expected_edge_bps = candidate.first_stage_funding_edge_bps
+            - candidate.fee_bps
+            - candidate.entry_slippage_bps
+            - config.strategy.exit_slippage_reserve_bps
+            - config.strategy.capital_buffer_bps;
+        candidate.ranking_edge_bps = candidate.worst_case_edge_bps + candidate.transfer_bias_bps;
+
+        candidate.blocked_reasons.retain(|reason| {
+            reason != "expected_edge_below_floor" && reason != "worst_case_edge_below_floor"
+        });
+        if candidate.expected_edge_bps < config.strategy.min_expected_edge_bps {
+            candidate
+                .blocked_reasons
+                .push("expected_edge_below_floor".to_string());
+        }
+        if candidate.worst_case_edge_bps < config.strategy.min_worst_case_edge_bps {
+            candidate
+                .blocked_reasons
+                .push("worst_case_edge_below_floor".to_string());
+        }
+        candidate.blocked_reasons.sort();
+        candidate.blocked_reasons.dedup();
+    }
+
+    fallback_venues
+}
+
+fn resolved_taker_fee_bps(
+    config: &AppConfig,
+    fee_snapshots: &BTreeMap<Venue, AccountFeeSnapshot>,
+    venue: Venue,
+) -> (f64, bool) {
+    if let Some(snapshot) = fee_snapshots.get(&venue) {
+        return (snapshot.taker_fee_bps, false);
+    }
+
+    (
+        config
+            .venue(venue)
+            .map(|venue_config| venue_config.taker_fee_bps)
+            .unwrap_or_default(),
+        true,
+    )
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EngineState {
@@ -916,6 +992,8 @@ impl Engine {
         }
 
         if !self.active_positions().is_empty() {
+            self.process_pending_close_reconciliations(now_ms, &market)
+                .await?;
             self.manage_open_positions(&market).await?;
         }
 
@@ -941,6 +1019,25 @@ impl Engine {
                 hints.as_deref(),
                 transfer_statuses.as_ref(),
             );
+            if matches!(self.config.runtime.mode, RuntimeMode::Live) {
+                let fee_snapshots = self.cached_live_fee_snapshots();
+                let fallback_venues = apply_cached_fee_snapshots_to_candidates(
+                    &scan_config,
+                    &mut candidates,
+                    &fee_snapshots,
+                );
+                for (venue, configured_taker_fee_bps) in fallback_venues {
+                    self.log_repeated_failure_event(
+                        "runtime.account_fee_snapshot_fallback",
+                        format!("account_fee_snapshot_fallback:{venue}"),
+                        &json!({
+                            "venue": venue,
+                            "configured_taker_fee_bps": configured_taker_fee_bps,
+                            "reason": "cached_account_fee_snapshot_unavailable",
+                        }),
+                    );
+                }
+            }
             self.apply_runtime_entry_guards(&market, &mut candidates);
             sort_candidates(&mut candidates);
             self.reconcile_running_slots_if_needed(now_ms, &candidates)
@@ -1111,6 +1208,17 @@ impl Engine {
         scan_config.directed_pairs.retain(|pair| {
             eligible_venues.contains(&pair.long) && eligible_venues.contains(&pair.short)
         });
+    }
+
+    fn cached_live_fee_snapshots(&self) -> BTreeMap<Venue, AccountFeeSnapshot> {
+        self.adapters
+            .iter()
+            .filter_map(|(venue, adapter)| {
+                adapter
+                    .cached_account_fee_snapshot()
+                    .map(|snapshot| (*venue, snapshot))
+            })
+            .collect()
     }
 
     async fn live_entry_venue_filter(&mut self, now_ms: i64) -> CachedLiveEntryVenueFilter {
@@ -1389,12 +1497,18 @@ impl Engine {
         }
 
         let mut changed = false;
+        let allow_final_reconciliations = self.active_positions().is_empty();
         while let Some(task) = self
             .state
             .pending_close_reconciliations
             .iter()
             .cloned()
-            .filter(|item| item.created_cycle < self.state.cycle && now_ms >= item.next_attempt_ms)
+            .filter(|item| {
+                item.created_cycle < self.state.cycle
+                    && now_ms >= item.next_attempt_ms
+                    && (matches!(item.kind, CloseReconciliationKind::Partial)
+                        || allow_final_reconciliations)
+            })
             .min_by(|left, right| {
                 left.closed_at_ms
                     .cmp(&right.closed_at_ms)
@@ -1538,6 +1652,13 @@ impl Engine {
         task: &PendingCloseReconciliation,
         payload: &serde_json::Value,
     ) {
+        let reconciled_quantity = payload.get("quantity").and_then(|value| value.as_f64());
+        let reconciled_settlement_half_closed_quantity = payload
+            .get("settlement_half_closed_quantity")
+            .and_then(|value| value.as_f64());
+        let reconciled_settlement_half_closed_at_ms = payload
+            .get("settlement_half_closed_at_ms")
+            .and_then(|value| value.as_i64());
         let reconciled_realized_price_pnl_quote = payload
             .get("reconciled_realized_price_pnl_quote")
             .and_then(|value| value.as_f64());
@@ -1551,6 +1672,15 @@ impl Engine {
                 || !matches!(pending.kind, CloseReconciliationKind::Final)
             {
                 continue;
+            }
+            if let Some(value) = reconciled_quantity {
+                pending.position_snapshot.quantity = value;
+            }
+            if let Some(value) = reconciled_settlement_half_closed_quantity {
+                pending.position_snapshot.settlement_half_closed_quantity = value;
+            }
+            if let Some(value) = reconciled_settlement_half_closed_at_ms {
+                pending.position_snapshot.settlement_half_closed_at_ms = value;
             }
             if let Some(value) = reconciled_realized_price_pnl_quote {
                 pending.position_snapshot.realized_price_pnl_quote = value;
@@ -1567,6 +1697,39 @@ impl Engine {
                 }
             }
         }
+        for position in &mut self.state.open_positions {
+            if position.position_id != task.position_id {
+                continue;
+            }
+            if let Some(value) = reconciled_quantity {
+                position.quantity = value;
+            }
+            if let Some(value) = reconciled_settlement_half_closed_quantity {
+                position.settlement_half_closed_quantity = value;
+            }
+            if let Some(value) = reconciled_settlement_half_closed_at_ms {
+                position.settlement_half_closed_at_ms = value;
+            }
+            if let Some(value) = reconciled_realized_price_pnl_quote {
+                position.realized_price_pnl_quote = value;
+            }
+            if let Some(value) = reconciled_realized_exit_fee_quote {
+                position.realized_exit_fee_quote = value;
+            }
+            if let Some(value) = payload
+                .get("current_net_quote")
+                .and_then(|value| value.as_f64())
+            {
+                position.current_net_quote = value;
+            }
+            if let Some(value) = payload
+                .get("peak_net_quote")
+                .and_then(|value| value.as_f64())
+            {
+                position.peak_net_quote = value;
+            }
+        }
+        self.sync_open_position_mirror();
     }
 
     fn select_entry_candidates(
@@ -4096,7 +4259,16 @@ impl Engine {
         short_leg: &OrderFillReconciliation,
     ) -> Result<serde_json::Value> {
         let mut corrected_position = task.position_snapshot.clone();
-        let closed_quantity = long_leg.quantity.min(short_leg.quantity);
+        let original_total_quantity = (task.position_snapshot.quantity
+            + task.position_snapshot.settlement_half_closed_quantity)
+            .max(task.position_snapshot.initial_quantity)
+            .max(0.0);
+        let closed_quantity = long_leg
+            .quantity
+            .min(short_leg.quantity)
+            .clamp(0.0, original_total_quantity);
+        corrected_position.settlement_half_closed_quantity = closed_quantity;
+        corrected_position.quantity = (original_total_quantity - closed_quantity).max(0.0);
         let reconciled_segment_realized_price_pnl_quote =
             realized_price_pnl_quote_from_reconciled_legs(
                 &task.position_snapshot,
@@ -4164,11 +4336,21 @@ impl Engine {
             .and_then(|value| value.as_f64())
             .unwrap_or_default();
         let reconciled_closed_at_ms = long_leg.filled_at_ms.max(short_leg.filled_at_ms);
+        corrected_position.settlement_half_closed_at_ms = reconciled_closed_at_ms;
 
         let mut payload = task.original_payload.clone();
         let object = payload
             .as_object_mut()
             .ok_or_else(|| anyhow!("partial close reconciliation payload is not an object"))?;
+        object.insert("quantity".to_string(), json!(corrected_position.quantity));
+        object.insert(
+            "settlement_half_closed_quantity".to_string(),
+            json!(corrected_position.settlement_half_closed_quantity),
+        );
+        object.insert(
+            "settlement_half_closed_at_ms".to_string(),
+            json!(corrected_position.settlement_half_closed_at_ms),
+        );
         object.insert(
             "realized_price_pnl_quote".to_string(),
             json!(corrected_position.realized_price_pnl_quote),
@@ -4195,6 +4377,10 @@ impl Engine {
         );
         object.insert("closed_quantity".to_string(), json!(closed_quantity));
         object.insert("closed_at_ms".to_string(), json!(reconciled_closed_at_ms));
+        object.insert(
+            "remaining_quantity".to_string(),
+            json!(corrected_position.quantity),
+        );
         object.insert(
             "long_exit_average_price".to_string(),
             json!(long_leg.average_price),
@@ -6140,12 +6326,16 @@ fn recover_open_positions_from_journal(journal: &JsonlJournal) -> Result<Vec<Ope
             "entry.opened",
             "recovery.live_detected",
             "exit.partial_closed",
+            "exit.partial_reconciled",
             "exit.closed",
             "recovery.flat",
         ],
         |record| {
             match record.kind.as_str() {
-                "entry.opened" | "recovery.live_detected" | "exit.partial_closed" => {
+                "entry.opened"
+                | "recovery.live_detected"
+                | "exit.partial_closed"
+                | "exit.partial_reconciled" => {
                     if let Ok(position) =
                         serde_json::from_value::<OpenPosition>(record.payload.clone())
                     {
@@ -6309,17 +6499,219 @@ fn checklist_item(key: &'static str, ok: bool, detail: String) -> OpportunityChe
 mod tests {
     use std::collections::{BTreeMap, VecDeque};
 
-    use crate::config::StrategyConfig;
+    use crate::config::{AppConfig, PersistenceConfig, RuntimeConfig, StrategyConfig, VenueConfig};
+    use crate::models::{
+        AccountFeeSnapshot, CandidateOpportunity, FundingLeg, FundingOpportunityType,
+    };
     use anyhow::anyhow;
 
     use super::{
-        cached_flat_guard_reason, compact_client_order_id, effective_entry_leg_notional_floor,
-        hyperliquid_entry_gate_reason, order_error_may_have_created_exposure,
-        order_quote_expired_reason, persistent_state_view, remap_no_entry_diagnostic_reason,
-        should_probe_live_recovery, venue_order_health_risk_score, EngineMode, EngineState,
-        VenueOrderHealthSample,
+        apply_cached_fee_snapshots_to_candidates, cached_flat_guard_reason,
+        compact_client_order_id, effective_entry_leg_notional_floor, hyperliquid_entry_gate_reason,
+        order_error_may_have_created_exposure, order_quote_expired_reason, persistent_state_view,
+        remap_no_entry_diagnostic_reason, should_probe_live_recovery,
+        venue_order_health_risk_score, EngineMode, EngineState, VenueOrderHealthSample,
     };
     use crate::models::{PositionSnapshot, Venue};
+
+    #[test]
+    fn cached_fee_snapshots_can_unblock_candidates() {
+        let mut config = AppConfig {
+            runtime: RuntimeConfig::default(),
+            strategy: StrategyConfig {
+                min_expected_edge_bps: 5.0,
+                min_worst_case_edge_bps: 4.0,
+                exit_slippage_reserve_bps: 0.5,
+                execution_buffer_bps: 0.5,
+                capital_buffer_bps: 0.25,
+                ..StrategyConfig::default()
+            },
+            persistence: PersistenceConfig {
+                event_log_path: "runtime/test-events.jsonl".to_string(),
+                snapshot_path: "runtime/test-state.json".to_string(),
+            },
+            venues: vec![
+                VenueConfig {
+                    venue: Venue::Binance,
+                    enabled: true,
+                    taker_fee_bps: 4.0,
+                    max_notional: 1_000.0,
+                    market_data_file: None,
+                    live: Default::default(),
+                },
+                VenueConfig {
+                    venue: Venue::Okx,
+                    enabled: true,
+                    taker_fee_bps: 4.0,
+                    max_notional: 1_000.0,
+                    market_data_file: None,
+                    live: Default::default(),
+                },
+            ],
+            symbols: vec!["BTCUSDT".to_string()],
+            directed_pairs: Vec::new(),
+        };
+        let mut candidates = vec![CandidateOpportunity {
+            pair_id: "btcusdt:binance->okx".to_string(),
+            symbol: "BTCUSDT".to_string(),
+            long_venue: Venue::Binance,
+            short_venue: Venue::Okx,
+            quantity: 1.0,
+            entry_notional_quote: 100.0,
+            funding_timestamp_ms: 1_000,
+            long_funding_timestamp_ms: 1_000,
+            short_funding_timestamp_ms: 1_000,
+            opportunity_type: FundingOpportunityType::Aligned,
+            first_funding_leg: FundingLeg::Short,
+            first_funding_timestamp_ms: 1_000,
+            second_funding_timestamp_ms: 1_000,
+            funding_edge_bps: 12.0,
+            total_funding_edge_bps: 12.0,
+            first_stage_funding_edge_bps: 12.0,
+            first_stage_expected_edge_bps: 2.25,
+            second_stage_incremental_funding_edge_bps: 0.0,
+            stagger_gap_ms: 0,
+            entry_cross_bps: 0.0,
+            fee_bps: 8.0,
+            entry_slippage_bps: 1.0,
+            expected_edge_bps: 2.25,
+            worst_case_edge_bps: 1.75,
+            ranking_edge_bps: 2.0,
+            transfer_bias_bps: 0.25,
+            transfer_state: None,
+            advisories: Vec::new(),
+            blocked_reasons: vec![
+                "expected_edge_below_floor".to_string(),
+                "worst_case_edge_below_floor".to_string(),
+            ],
+        }];
+        let fee_snapshots = BTreeMap::from([
+            (
+                Venue::Binance,
+                AccountFeeSnapshot {
+                    venue: Venue::Binance,
+                    taker_fee_bps: 1.0,
+                    maker_fee_bps: 0.5,
+                    observed_at_ms: 1,
+                    source: "test".to_string(),
+                },
+            ),
+            (
+                Venue::Okx,
+                AccountFeeSnapshot {
+                    venue: Venue::Okx,
+                    taker_fee_bps: 1.0,
+                    maker_fee_bps: 0.2,
+                    observed_at_ms: 1,
+                    source: "test".to_string(),
+                },
+            ),
+        ]);
+
+        let fallback_venues =
+            apply_cached_fee_snapshots_to_candidates(&config, &mut candidates, &fee_snapshots);
+        let candidate = &candidates[0];
+
+        assert!(fallback_venues.is_empty());
+        assert_eq!(candidate.fee_bps, 2.0);
+        assert_eq!(candidate.expected_edge_bps, 8.25);
+        assert_eq!(candidate.worst_case_edge_bps, 7.75);
+        assert_eq!(candidate.first_stage_expected_edge_bps, 8.25);
+        assert_eq!(candidate.ranking_edge_bps, 8.0);
+        assert!(candidate.blocked_reasons.is_empty());
+
+        config.strategy.min_expected_edge_bps = 0.0;
+    }
+
+    #[test]
+    fn cached_fee_snapshots_fall_back_to_config_when_missing() {
+        let config = AppConfig {
+            runtime: RuntimeConfig::default(),
+            strategy: StrategyConfig {
+                min_expected_edge_bps: -1_000.0,
+                min_worst_case_edge_bps: -1_000.0,
+                exit_slippage_reserve_bps: 0.5,
+                execution_buffer_bps: 0.5,
+                capital_buffer_bps: 0.25,
+                ..StrategyConfig::default()
+            },
+            persistence: PersistenceConfig {
+                event_log_path: "runtime/test-events.jsonl".to_string(),
+                snapshot_path: "runtime/test-state.json".to_string(),
+            },
+            venues: vec![
+                VenueConfig {
+                    venue: Venue::Binance,
+                    enabled: true,
+                    taker_fee_bps: 3.0,
+                    max_notional: 1_000.0,
+                    market_data_file: None,
+                    live: Default::default(),
+                },
+                VenueConfig {
+                    venue: Venue::Okx,
+                    enabled: true,
+                    taker_fee_bps: 2.0,
+                    max_notional: 1_000.0,
+                    market_data_file: None,
+                    live: Default::default(),
+                },
+            ],
+            symbols: vec!["BTCUSDT".to_string()],
+            directed_pairs: Vec::new(),
+        };
+        let mut candidates = vec![CandidateOpportunity {
+            pair_id: "btcusdt:binance->okx".to_string(),
+            symbol: "BTCUSDT".to_string(),
+            long_venue: Venue::Binance,
+            short_venue: Venue::Okx,
+            quantity: 1.0,
+            entry_notional_quote: 100.0,
+            funding_timestamp_ms: 1_000,
+            long_funding_timestamp_ms: 1_000,
+            short_funding_timestamp_ms: 1_000,
+            opportunity_type: FundingOpportunityType::Aligned,
+            first_funding_leg: FundingLeg::Short,
+            first_funding_timestamp_ms: 1_000,
+            second_funding_timestamp_ms: 1_000,
+            funding_edge_bps: 10.0,
+            total_funding_edge_bps: 10.0,
+            first_stage_funding_edge_bps: 10.0,
+            first_stage_expected_edge_bps: 0.0,
+            second_stage_incremental_funding_edge_bps: 0.0,
+            stagger_gap_ms: 0,
+            entry_cross_bps: 0.0,
+            fee_bps: 5.0,
+            entry_slippage_bps: 1.0,
+            expected_edge_bps: 3.25,
+            worst_case_edge_bps: 2.75,
+            ranking_edge_bps: 2.75,
+            transfer_bias_bps: 0.0,
+            transfer_state: None,
+            advisories: Vec::new(),
+            blocked_reasons: Vec::new(),
+        }];
+        let fee_snapshots = BTreeMap::from([(
+            Venue::Binance,
+            AccountFeeSnapshot {
+                venue: Venue::Binance,
+                taker_fee_bps: 0.8,
+                maker_fee_bps: 0.4,
+                observed_at_ms: 1,
+                source: "test".to_string(),
+            },
+        )]);
+
+        let fallback_venues =
+            apply_cached_fee_snapshots_to_candidates(&config, &mut candidates, &fee_snapshots);
+        let candidate = &candidates[0];
+
+        assert_eq!(fallback_venues, BTreeMap::from([(Venue::Okx, 2.0)]));
+        assert!((candidate.fee_bps - 2.8).abs() < 1e-9);
+        assert!((candidate.expected_edge_bps - 5.45).abs() < 1e-9);
+        assert!((candidate.worst_case_edge_bps - 4.95).abs() < 1e-9);
+        assert!((candidate.first_stage_expected_edge_bps - 5.45).abs() < 1e-9);
+    }
 
     #[test]
     fn flat_recovery_probe_is_throttled_between_intervals() {

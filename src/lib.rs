@@ -24,7 +24,10 @@ pub use config::{
     AppConfig, DirectedPairConfig, LiveVenueConfig, PersistenceConfig, RuntimeConfig,
     StaggeredExitMode, StrategyConfig, VenueConfig,
 };
-pub use engine::{Engine, EngineMode, EngineState, OpenPosition, ScanSnapshot};
+pub use engine::{
+    apply_cached_fee_snapshots_to_candidates, Engine, EngineMode, EngineState, OpenPosition,
+    ScanSnapshot,
+};
 pub use journal::{scan_path_records, JournalRecord, JournalRuntimeMetricsSnapshot, JsonlJournal};
 pub use live::{
     AsterLiveAdapter, BinanceLiveAdapter, BitgetLiveAdapter, BybitLiveAdapter, GateLiveAdapter,
@@ -32,9 +35,9 @@ pub use live::{
 };
 pub use market::MarketView;
 pub use models::{
-    AccountBalanceSnapshot, AssetTransferStatus, CandidateOpportunity, FundingLeg,
-    FundingOpportunityType, OrderExecutionTiming, OrderFill, OrderFillReconciliation, OrderRequest,
-    PerpLiquiditySnapshot, PositionSnapshot, Side, SymbolMarketSnapshot, Venue,
+    AccountBalanceSnapshot, AccountFeeSnapshot, AssetTransferStatus, CandidateOpportunity,
+    FundingLeg, FundingOpportunityType, OrderExecutionTiming, OrderFill, OrderFillReconciliation,
+    OrderRequest, PerpLiquiditySnapshot, PositionSnapshot, Side, SymbolMarketSnapshot, Venue,
     VenueMarketSnapshot,
 };
 pub use opportunity_source::{

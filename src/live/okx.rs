@@ -19,9 +19,9 @@ use tracing::{debug, warn};
 use crate::{
     config::{RuntimeConfig, VenueConfig},
     models::{
-        AccountBalanceSnapshot, AssetTransferStatus, OrderExecutionTiming, OrderFill,
-        OrderFillReconciliation, OrderRequest, PerpLiquiditySnapshot, PositionSnapshot, Side,
-        SymbolMarketSnapshot, Venue, VenueMarketSnapshot,
+        AccountBalanceSnapshot, AccountFeeSnapshot, AssetTransferStatus, OrderExecutionTiming,
+        OrderFill, OrderFillReconciliation, OrderRequest, PerpLiquiditySnapshot, PositionSnapshot,
+        Side, SymbolMarketSnapshot, Venue, VenueMarketSnapshot,
     },
     resilience::FailureBackoff,
     venue::VenueAdapter,
@@ -51,6 +51,7 @@ pub struct OkxLiveAdapter {
     market_ws: Arc<WsMarketState>,
     market_subscription_symbols: Mutex<Vec<String>>,
     private_ws: Arc<WsPrivateState>,
+    account_fee_snapshot: Mutex<Option<AccountFeeSnapshot>>,
     transfer_status_cache: Mutex<Option<VenueTransferStatusCache>>,
     perp_liquidity_cache: Mutex<HashMap<String, PerpLiquiditySnapshot>>,
     configured_leverage: Mutex<HashMap<String, u32>>,
@@ -70,6 +71,7 @@ impl OkxLiveAdapter {
         let persisted_catalog = load_json_cache::<OkxSymbolCatalogCache>("okx-symbols.json");
         let persisted_transfer_cache =
             load_json_cache::<VenueTransferStatusCache>("okx-transfer-status.json");
+        let account_fee_snapshot = load_json_cache::<AccountFeeSnapshot>("okx-fees.json");
         let mut metadata = HashMap::new();
         let mut supported_symbols = HashSet::new();
         if let Some(cache) = persisted_catalog {
@@ -102,6 +104,7 @@ impl OkxLiveAdapter {
             market_ws,
             market_subscription_symbols: Mutex::new(Vec::new()),
             private_ws: WsPrivateState::new(),
+            account_fee_snapshot: Mutex::new(account_fee_snapshot),
             transfer_status_cache: Mutex::new(transfer_status_cache),
             perp_liquidity_cache: Mutex::new(HashMap::new()),
             configured_leverage: Mutex::new(HashMap::new()),
@@ -133,6 +136,67 @@ impl OkxLiveAdapter {
             })
             .cloned()
             .collect()
+    }
+
+    fn fee_reference_symbol(&self) -> Option<String> {
+        self.market_subscription_symbols
+            .lock()
+            .expect("lock")
+            .first()
+            .cloned()
+            .or_else(|| {
+                self.supported_symbols
+                    .lock()
+                    .expect("lock")
+                    .iter()
+                    .next()
+                    .cloned()
+            })
+    }
+
+    fn store_account_fee_snapshot(&self, snapshot: &AccountFeeSnapshot) {
+        self.account_fee_snapshot
+            .lock()
+            .expect("lock")
+            .replace(snapshot.clone());
+        store_json_cache("okx-fees.json", snapshot);
+    }
+
+    async fn refresh_account_fee_snapshot(&self) -> Result<Option<AccountFeeSnapshot>> {
+        let Some(symbol) = self.fee_reference_symbol() else {
+            return Ok(self.cached_account_fee_snapshot());
+        };
+        let inst_family = venue_symbol(&self.config, &symbol).replace("-SWAP", "");
+        let query = build_query(&[
+            ("instType", "SWAP".to_string()),
+            ("instFamily", inst_family.clone()),
+        ]);
+        let response = self
+            .signed_request(
+                reqwest::Method::GET,
+                "/api/v5/account/trade-fee",
+                Some(query),
+                None,
+            )
+            .await?
+            .json::<OkxApiResponse<OkxTradeFeeRow>>()
+            .await
+            .context("failed to decode okx trade fee response")?;
+        let response = ensure_okx_api_success("okx trade fee failed", response)?;
+        let row = response
+            .data
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("okx trade fee missing row"))?;
+        let snapshot = AccountFeeSnapshot {
+            venue: Venue::Okx,
+            taker_fee_bps: parse_f64(&row.taker)? * 10_000.0,
+            maker_fee_bps: parse_f64(&row.maker)? * 10_000.0,
+            observed_at_ms: now_ms(),
+            source: format!("okx_trade_fee:{}", inst_family),
+        };
+        self.store_account_fee_snapshot(&snapshot);
+        Ok(Some(snapshot))
     }
 
     fn supports_symbol(&self, symbol: &str) -> bool {
@@ -1303,6 +1367,10 @@ impl VenueAdapter for OkxLiveAdapter {
         }))
     }
 
+    fn cached_account_fee_snapshot(&self) -> Option<AccountFeeSnapshot> {
+        self.account_fee_snapshot.lock().expect("lock").clone()
+    }
+
     async fn ensure_entry_leverage(&self, symbol: &str, leverage: u32) -> Result<()> {
         if self
             .configured_leverage
@@ -1503,6 +1571,9 @@ impl VenueAdapter for OkxLiveAdapter {
     async fn live_startup_prewarm(&self) -> Result<()> {
         let _ = self.server_timestamp_ms().await?;
         let _ = self.position_mode().await?;
+        if let Err(error) = self.refresh_account_fee_snapshot().await {
+            warn!(?error, "okx account fee snapshot prewarm failed");
+        }
         Ok(())
     }
 
@@ -2049,6 +2120,12 @@ struct OkxAccountBalance {
     adj_eq: Option<String>,
     #[serde(rename = "availEq")]
     avail_eq: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OkxTradeFeeRow {
+    maker: String,
+    taker: String,
 }
 
 fn ensure_okx_client_order_id(client_order_id: &str) -> Result<()> {

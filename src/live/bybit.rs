@@ -19,9 +19,9 @@ use tracing::{debug, warn};
 use crate::{
     config::{RuntimeConfig, VenueConfig},
     models::{
-        AccountBalanceSnapshot, AssetTransferStatus, OrderExecutionTiming, OrderFill,
-        OrderFillReconciliation, OrderRequest, PerpLiquiditySnapshot, PositionSnapshot, Side,
-        SymbolMarketSnapshot, Venue, VenueMarketSnapshot,
+        AccountBalanceSnapshot, AccountFeeSnapshot, AssetTransferStatus, OrderExecutionTiming,
+        OrderFill, OrderFillReconciliation, OrderRequest, PerpLiquiditySnapshot, PositionSnapshot,
+        Side, SymbolMarketSnapshot, Venue, VenueMarketSnapshot,
     },
     resilience::FailureBackoff,
     venue::VenueAdapter,
@@ -53,6 +53,7 @@ pub struct BybitLiveAdapter {
     market_ws: Arc<WsMarketState>,
     market_subscription_symbols: Mutex<Vec<String>>,
     private_ws: Arc<WsPrivateState>,
+    account_fee_snapshot: Mutex<Option<AccountFeeSnapshot>>,
 }
 
 impl BybitLiveAdapter {
@@ -69,6 +70,7 @@ impl BybitLiveAdapter {
         let persisted_catalog = load_json_cache::<BybitSymbolCatalogCache>("bybit-symbols.json");
         let persisted_transfer_cache =
             load_json_cache::<BybitTransferStatusCache>("bybit-transfer-status.json");
+        let account_fee_snapshot = load_json_cache::<AccountFeeSnapshot>("bybit-fees.json");
         let mut metadata = HashMap::new();
         let mut supported_symbols = HashSet::new();
         if let Some(cache) = persisted_catalog {
@@ -107,6 +109,7 @@ impl BybitLiveAdapter {
             market_ws,
             market_subscription_symbols: Mutex::new(Vec::new()),
             private_ws: WsPrivateState::new(),
+            account_fee_snapshot: Mutex::new(account_fee_snapshot),
         };
         if let Err(error) = adapter.refresh_symbol_catalog().await {
             if adapter.supported_symbols.lock().expect("lock").is_empty() {
@@ -142,6 +145,71 @@ impl BybitLiveAdapter {
             .lock()
             .expect("lock")
             .contains(symbol)
+    }
+
+    fn fee_reference_symbol(&self) -> Option<String> {
+        self.market_subscription_symbols
+            .lock()
+            .expect("lock")
+            .first()
+            .cloned()
+            .or_else(|| {
+                self.supported_symbols
+                    .lock()
+                    .expect("lock")
+                    .iter()
+                    .next()
+                    .cloned()
+            })
+    }
+
+    fn store_account_fee_snapshot(&self, snapshot: &AccountFeeSnapshot) {
+        self.account_fee_snapshot
+            .lock()
+            .expect("lock")
+            .replace(snapshot.clone());
+        store_json_cache("bybit-fees.json", snapshot);
+    }
+
+    async fn refresh_account_fee_snapshot(&self) -> Result<Option<AccountFeeSnapshot>> {
+        let Some(symbol) = self.fee_reference_symbol() else {
+            return Ok(self.cached_account_fee_snapshot());
+        };
+        let query = build_query(&[
+            ("category", "linear".to_string()),
+            ("symbol", venue_symbol(&self.config, &symbol)),
+        ]);
+        let response = self
+            .signed_request(
+                reqwest::Method::GET,
+                "/v5/account/fee-rate",
+                Some(query),
+                None,
+            )
+            .await?
+            .json::<BybitApiResponse<BybitFeeRateResult>>()
+            .await
+            .context("failed to decode bybit fee rate")?;
+        if response.ret_code != 0 {
+            return Err(format_bybit_api_error(
+                "bybit fee rate failed",
+                response.ret_code,
+                &response.ret_msg,
+            ));
+        }
+        let row = response
+            .result
+            .and_then(|result| result.list.into_iter().next())
+            .ok_or_else(|| anyhow!("bybit fee rate missing row"))?;
+        let snapshot = AccountFeeSnapshot {
+            venue: Venue::Bybit,
+            taker_fee_bps: parse_f64(&row.taker_fee_rate)? * 10_000.0,
+            maker_fee_bps: parse_f64(&row.maker_fee_rate)? * 10_000.0,
+            observed_at_ms: now_ms(),
+            source: format!("bybit_fee_rate:{}", symbol),
+        };
+        self.store_account_fee_snapshot(&snapshot);
+        Ok(Some(snapshot))
     }
 
     fn cached_perp_liquidity_snapshot(
@@ -1134,6 +1202,10 @@ impl VenueAdapter for BybitLiveAdapter {
         }))
     }
 
+    fn cached_account_fee_snapshot(&self) -> Option<AccountFeeSnapshot> {
+        self.account_fee_snapshot.lock().expect("lock").clone()
+    }
+
     async fn ensure_entry_leverage(&self, symbol: &str, leverage: u32) -> Result<()> {
         if self
             .configured_leverage
@@ -1309,6 +1381,9 @@ impl VenueAdapter for BybitLiveAdapter {
 
     async fn live_startup_prewarm(&self) -> Result<()> {
         let _ = self.server_timestamp_ms().await?;
+        if let Err(error) = self.refresh_account_fee_snapshot().await {
+            warn!(?error, "bybit account fee snapshot prewarm failed");
+        }
         Ok(())
     }
 
@@ -1935,6 +2010,20 @@ struct BybitCoinChain {
 struct BybitWalletBalanceResult {
     #[serde(default)]
     list: Vec<BybitWalletBalance>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BybitFeeRateResult {
+    #[serde(default)]
+    list: Vec<BybitFeeRateRow>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BybitFeeRateRow {
+    #[serde(rename = "makerFeeRate")]
+    maker_fee_rate: String,
+    #[serde(rename = "takerFeeRate")]
+    taker_fee_rate: String,
 }
 
 #[derive(Debug, Deserialize)]

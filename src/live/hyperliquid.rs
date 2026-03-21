@@ -41,9 +41,9 @@ use tracing::warn;
 use crate::{
     config::{RuntimeConfig, VenueConfig},
     models::{
-        AccountBalanceSnapshot, OrderExecutionTiming, OrderFill, OrderFillReconciliation,
-        OrderRequest, PerpLiquiditySnapshot, PositionSnapshot, Side, SymbolMarketSnapshot, Venue,
-        VenueMarketSnapshot,
+        AccountBalanceSnapshot, AccountFeeSnapshot, OrderExecutionTiming, OrderFill,
+        OrderFillReconciliation, OrderRequest, PerpLiquiditySnapshot, PositionSnapshot, Side,
+        SymbolMarketSnapshot, Venue, VenueMarketSnapshot,
     },
     venue::VenueAdapter,
 };
@@ -68,6 +68,7 @@ pub struct HyperliquidLiveAdapter {
     market_ws: Arc<WsMarketState>,
     market_subscription_symbols: Mutex<Vec<String>>,
     private_ws: Arc<WsPrivateState>,
+    account_fee_snapshot: Mutex<Option<AccountFeeSnapshot>>,
     perp_liquidity_cache: Arc<Mutex<HashMap<String, PerpLiquiditySnapshot>>>,
     configured_leverage: Mutex<HashMap<String, u32>>,
     order_ws: HyperliquidWsPostClient,
@@ -112,6 +113,7 @@ impl HyperliquidLiveAdapter {
 
         let persisted_catalog =
             load_json_cache::<HyperliquidSymbolCatalogCache>("hyperliquid-symbols.json");
+        let account_fee_snapshot = load_json_cache::<AccountFeeSnapshot>("hyperliquid-fees.json");
         let mut meta_cache = HashMap::new();
         let mut supported_symbols = HashSet::new();
         if let Some(cache) = persisted_catalog {
@@ -136,6 +138,7 @@ impl HyperliquidLiveAdapter {
             market_ws,
             market_subscription_symbols: Mutex::new(Vec::new()),
             private_ws: WsPrivateState::new(),
+            account_fee_snapshot: Mutex::new(account_fee_snapshot),
             perp_liquidity_cache: Arc::new(Mutex::new(HashMap::new())),
             configured_leverage: Mutex::new(HashMap::new()),
             order_ws: HyperliquidWsPostClient::new(hyperliquid_ws_url(base_url)),
@@ -210,6 +213,31 @@ impl HyperliquidLiveAdapter {
                 metadata,
             },
         );
+    }
+
+    fn store_account_fee_snapshot(&self, snapshot: &AccountFeeSnapshot) {
+        self.account_fee_snapshot
+            .lock()
+            .expect("lock")
+            .replace(snapshot.clone());
+        store_json_cache("hyperliquid-fees.json", snapshot);
+    }
+
+    async fn refresh_account_fee_snapshot(&self) -> Result<Option<AccountFeeSnapshot>> {
+        let fees = self
+            .info_client
+            .user_fees(self.account_address)
+            .await
+            .context("failed to request hyperliquid user fees")?;
+        let snapshot = AccountFeeSnapshot {
+            venue: Venue::Hyperliquid,
+            taker_fee_bps: parse_f64(&fees.user_cross_rate)? * 10_000.0,
+            maker_fee_bps: parse_f64(&fees.user_add_rate)? * 10_000.0,
+            observed_at_ms: now_ms(),
+            source: "hyperliquid_user_fees".to_string(),
+        };
+        self.store_account_fee_snapshot(&snapshot);
+        Ok(Some(snapshot))
     }
 
     async fn refresh_symbol_catalog(&self) -> Result<()> {
@@ -1002,6 +1030,10 @@ impl VenueAdapter for HyperliquidLiveAdapter {
         }))
     }
 
+    fn cached_account_fee_snapshot(&self) -> Option<AccountFeeSnapshot> {
+        self.account_fee_snapshot.lock().expect("lock").clone()
+    }
+
     async fn ensure_entry_leverage(&self, symbol: &str, leverage: u32) -> Result<()> {
         if self
             .configured_leverage
@@ -1119,7 +1151,11 @@ impl VenueAdapter for HyperliquidLiveAdapter {
     }
 
     async fn live_startup_prewarm(&self) -> Result<()> {
-        self.order_ws.prewarm().await
+        self.order_ws.prewarm().await?;
+        if let Err(error) = self.refresh_account_fee_snapshot().await {
+            warn!(?error, "hyperliquid account fee snapshot prewarm failed");
+        }
+        Ok(())
     }
 
     fn supports_market_data_activity_control(&self) -> bool {

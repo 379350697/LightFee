@@ -6,35 +6,41 @@ use std::{
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
+use futures::{SinkExt, StreamExt};
 use reqwest::{
     header::{HeaderMap, HeaderValue},
     Client, Method, StatusCode,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::time::{sleep, Duration};
+use tokio::time::{interval, sleep, Duration, MissedTickBehavior};
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tracing::{debug, warn};
 
 use crate::{
     config::{RuntimeConfig, VenueConfig},
     models::{
-        AccountBalanceSnapshot, AssetTransferStatus, OrderExecutionTiming, OrderFill,
-        OrderFillReconciliation, OrderRequest, PerpLiquiditySnapshot, PositionSnapshot, Side,
-        SymbolMarketSnapshot, Venue, VenueMarketSnapshot,
+        AccountBalanceSnapshot, AccountFeeSnapshot, AssetTransferStatus, OrderExecutionTiming,
+        OrderFill, OrderFillReconciliation, OrderRequest, PerpLiquiditySnapshot, PositionSnapshot,
+        Side, SymbolMarketSnapshot, Venue, VenueMarketSnapshot,
     },
     venue::VenueAdapter,
 };
 
 use super::{
-    base_asset, build_http_client, build_query, cache_is_fresh, estimate_fee_quote,
-    filter_transfer_statuses, floor_to_step, format_decimal, hinted_fill, hmac_sha256_base64,
-    load_json_cache, now_ms, parse_f64, parse_i64, quote_fill, store_json_cache,
-    transfer_cache_ttl_ms, venue_symbol, VenueTransferStatusCache, SYMBOL_CACHE_TTL_MS,
+    base_asset, build_http_client, build_query, cache_is_fresh, enrich_fill_from_private,
+    estimate_fee_quote, filter_transfer_statuses, floor_to_step, format_decimal, hinted_fill,
+    hmac_sha256_base64, load_json_cache, lookup_or_wait_private_order, now_ms, parse_f64,
+    parse_i64, parse_text_message, quote_fill, spawn_ws_loop, store_json_cache,
+    transfer_cache_ttl_ms, venue_symbol, PrivateOrderUpdate, VenueTransferStatusCache,
+    WsMarketState, WsPrivateState, SYMBOL_CACHE_TTL_MS,
 };
+use crate::resilience::FailureBackoff;
 
 const BITGET_PRODUCT_TYPE: &str = "USDT-FUTURES";
 const BITGET_MARGIN_COIN: &str = "USDT";
 const BITGET_PERP_LIQUIDITY_CACHE_TTL_MS: i64 = 60 * 1_000;
+const BITGET_PRIVATE_FILL_WAIT_MS: u64 = 120;
 
 pub struct BitgetLiveAdapter {
     config: VenueConfig,
@@ -44,6 +50,11 @@ pub struct BitgetLiveAdapter {
     wallet_base_url: String,
     metadata: Mutex<HashMap<String, BitgetSymbolMeta>>,
     supported_symbols: Mutex<HashSet<String>>,
+    position_mode: Mutex<Option<BitgetPositionMode>>,
+    market_ws: std::sync::Arc<WsMarketState>,
+    market_subscription_symbols: Mutex<Vec<String>>,
+    private_ws: std::sync::Arc<WsPrivateState>,
+    account_fee_snapshot: Mutex<Option<AccountFeeSnapshot>>,
     transfer_status_cache: Mutex<Option<VenueTransferStatusCache>>,
     perp_liquidity_cache: Mutex<HashMap<String, PerpLiquiditySnapshot>>,
     configured_leverage: Mutex<HashMap<String, u32>>,
@@ -62,6 +73,7 @@ impl BitgetLiveAdapter {
         let persisted_catalog = load_json_cache::<BitgetSymbolCatalogCache>("bitget-symbols.json");
         let persisted_transfer_cache =
             load_json_cache::<VenueTransferStatusCache>("bitget-transfer-status.json");
+        let account_fee_snapshot = load_json_cache::<AccountFeeSnapshot>("bitget-fees.json");
         let mut metadata = HashMap::new();
         let mut supported_symbols = HashSet::new();
         if let Some(cache) = persisted_catalog {
@@ -95,6 +107,11 @@ impl BitgetLiveAdapter {
                 .unwrap_or_else(|| "https://api.bitget.com".to_string()),
             metadata: Mutex::new(metadata),
             supported_symbols: Mutex::new(supported_symbols),
+            position_mode: Mutex::new(None),
+            market_ws: WsMarketState::new(),
+            market_subscription_symbols: Mutex::new(Vec::new()),
+            private_ws: WsPrivateState::new(),
+            account_fee_snapshot: Mutex::new(account_fee_snapshot),
             transfer_status_cache: Mutex::new(transfer_status_cache),
             perp_liquidity_cache: Mutex::new(HashMap::new()),
             configured_leverage: Mutex::new(HashMap::new()),
@@ -108,6 +125,10 @@ impl BitgetLiveAdapter {
                 "bitget symbol catalog refresh failed; using persisted cache"
             );
         }
+        let tracked_symbols = adapter.tracked_symbols(_symbols);
+        *adapter.market_subscription_symbols.lock().expect("lock") = tracked_symbols.clone();
+        adapter.start_market_ws(&tracked_symbols);
+        adapter.start_private_ws(&tracked_symbols);
         Ok(adapter)
     }
 
@@ -124,11 +145,315 @@ impl BitgetLiveAdapter {
             .collect()
     }
 
+    fn fee_reference_symbol(&self) -> Option<String> {
+        self.market_subscription_symbols
+            .lock()
+            .expect("lock")
+            .first()
+            .cloned()
+            .or_else(|| {
+                self.supported_symbols
+                    .lock()
+                    .expect("lock")
+                    .iter()
+                    .next()
+                    .cloned()
+            })
+    }
+
+    fn store_account_fee_snapshot(&self, snapshot: &AccountFeeSnapshot) {
+        self.account_fee_snapshot
+            .lock()
+            .expect("lock")
+            .replace(snapshot.clone());
+        store_json_cache("bitget-fees.json", snapshot);
+    }
+
+    async fn refresh_account_fee_snapshot(&self) -> Result<Option<AccountFeeSnapshot>> {
+        let Some(symbol) = self.fee_reference_symbol() else {
+            return Ok(self.cached_account_fee_snapshot());
+        };
+        let query = build_query(&[
+            ("symbol", venue_symbol(&self.config, &symbol)),
+            ("category", BITGET_PRODUCT_TYPE.to_string()),
+        ]);
+        let payload = self
+            .signed_request_json(
+                &self.base_url,
+                Method::GET,
+                "/api/v3/account/fee-rate",
+                Some(query),
+                None,
+                "failed to request bitget fee rate",
+            )
+            .await?;
+        let row = bitget_data("bitget fee rate failed", &payload)?;
+        let snapshot = AccountFeeSnapshot {
+            venue: Venue::Bitget,
+            taker_fee_bps: json_required_f64(row, &["takerFeeRate"], "bitget taker fee")?
+                * 10_000.0,
+            maker_fee_bps: json_required_f64(row, &["makerFeeRate"], "bitget maker fee")?
+                * 10_000.0,
+            observed_at_ms: now_ms(),
+            source: format!("bitget_fee_rate:{}", symbol),
+        };
+        self.store_account_fee_snapshot(&snapshot);
+        Ok(Some(snapshot))
+    }
+
     fn supports_symbol(&self, symbol: &str) -> bool {
         self.supported_symbols
             .lock()
             .expect("lock")
             .contains(symbol)
+    }
+
+    fn seed_symbol(&self) -> Result<String> {
+        self.supported_symbols
+            .lock()
+            .expect("lock")
+            .iter()
+            .next()
+            .cloned()
+            .ok_or_else(|| anyhow!("bitget supported symbol set is empty"))
+    }
+
+    fn start_market_ws(&self, symbols: &[String]) {
+        if symbols.is_empty() {
+            return;
+        }
+        let symbol_map = symbols
+            .iter()
+            .map(|symbol| (venue_symbol(&self.config, symbol), symbol.clone()))
+            .collect::<HashMap<_, _>>();
+        let args = symbols
+            .iter()
+            .map(|symbol| {
+                serde_json::json!({
+                    "instType": "USDT-FUTURES",
+                    "channel": "ticker",
+                    "instId": venue_symbol(&self.config, symbol),
+                })
+            })
+            .collect::<Vec<_>>();
+        let subscribe_message = serde_json::json!({
+            "op": "subscribe",
+            "args": args,
+        })
+        .to_string();
+        let state = self.market_ws.clone();
+        spawn_ws_loop(
+            "bitget",
+            bitget_public_ws_url(&self.base_url).to_string(),
+            vec![subscribe_message],
+            state,
+            self.runtime.ws_reconnect_initial_ms,
+            self.runtime.ws_reconnect_max_ms,
+            self.runtime.ws_unhealthy_after_failures,
+            move |cache, raw| {
+                let payload = parse_text_message(raw)?;
+                let arg = match payload.get("arg") {
+                    Some(arg) => arg,
+                    None => return Ok(()),
+                };
+                let channel = arg
+                    .get("channel")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if channel != "ticker" {
+                    return Ok(());
+                }
+                let venue_symbol = arg
+                    .get("instId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("bitget ws ticker missing instId"))?;
+                let Some(symbol) = symbol_map.get(venue_symbol) else {
+                    return Ok(());
+                };
+                let rows = payload
+                    .get("data")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| anyhow!("bitget ws ticker missing data"))?;
+                for row in rows {
+                    cache.update_quote(
+                        symbol,
+                        json_required_f64(row, &["bidPr", "bidPrice"], "bitget ws bidPr")?,
+                        json_required_f64(row, &["askPr", "askPrice"], "bitget ws askPr")?,
+                        json_f64(row, &["bidSz", "bidSize"]).unwrap_or_default(),
+                        json_f64(row, &["askSz", "askSize"]).unwrap_or_default(),
+                        json_i64(row, &["ts", "systemTime"]).unwrap_or_else(now_ms),
+                    );
+                    if let Some(mark_price) = json_f64(row, &["markPrice", "lastPr", "lastPrice"]) {
+                        cache.update_mark_price(symbol, mark_price);
+                    }
+                    if let (Some(funding_rate), Some(funding_ts)) = (
+                        json_f64(row, &["fundingRate"]),
+                        json_i64(row, &["nextFundingTime", "fundingTime"]),
+                    ) {
+                        cache.update_funding(symbol, funding_rate, funding_ts);
+                    }
+                }
+                Ok(())
+            },
+        );
+    }
+
+    fn cached_snapshot(&self, symbol: &str) -> Option<SymbolMarketSnapshot> {
+        self.market_ws.snapshot(symbol)
+    }
+
+    fn start_private_ws(&self, symbols: &[String]) {
+        let (Some(api_key), Some(api_secret), Some(api_passphrase)) = (
+            self.config.live.resolved_api_key(),
+            self.config.live.resolved_api_secret(),
+            self.config.live.resolved_api_passphrase(),
+        ) else {
+            return;
+        };
+        if symbols.is_empty() {
+            return;
+        }
+        let private_state = self.private_ws.clone();
+        let reconnect_initial_ms = self.runtime.ws_reconnect_initial_ms;
+        let reconnect_max_ms = self.runtime.ws_reconnect_max_ms;
+        let unhealthy_after_failures = self.runtime.ws_unhealthy_after_failures;
+        let symbol_map = symbols
+            .iter()
+            .map(|symbol| (venue_symbol(&self.config, symbol), symbol.clone()))
+            .collect::<HashMap<_, _>>();
+        let url = bitget_private_ws_url(&self.base_url).to_string();
+        let task = tokio::spawn(async move {
+            let mut reconnect_backoff =
+                FailureBackoff::new(reconnect_initial_ms, reconnect_max_ms, Venue::Bitget as u64);
+            loop {
+                match connect_async(url.as_str()).await {
+                    Ok((mut socket, _)) => {
+                        reconnect_backoff.on_success();
+                        private_state.record_connection_success(now_ms());
+                        let timestamp = (now_ms() / 1_000).to_string();
+                        let sign = match hmac_sha256_base64(api_secret.as_str(), &timestamp) {
+                            Ok(signature) => signature,
+                            Err(error) => {
+                                private_state.record_connection_failure(
+                                    now_ms(),
+                                    unhealthy_after_failures,
+                                    error.to_string(),
+                                );
+                                warn!(?error, "bitget private websocket auth sign failed");
+                                sleep(Duration::from_millis(
+                                    reconnect_backoff.on_failure_with_jitter(),
+                                ))
+                                .await;
+                                continue;
+                            }
+                        };
+                        let login = serde_json::json!({
+                            "op": "login",
+                            "args": [{
+                                "apiKey": api_key,
+                                "passphrase": api_passphrase,
+                                "timestamp": timestamp,
+                                "sign": sign,
+                            }],
+                        })
+                        .to_string();
+                        if let Err(error) = socket.send(Message::Text(login.into())).await {
+                            private_state.record_connection_failure(
+                                now_ms(),
+                                unhealthy_after_failures,
+                                error.to_string(),
+                            );
+                            warn!(?error, "bitget private websocket login send failed");
+                            sleep(Duration::from_millis(
+                                reconnect_backoff.on_failure_with_jitter(),
+                            ))
+                            .await;
+                            continue;
+                        }
+                        let mut subscribed = false;
+                        let mut ping_interval = interval(Duration::from_secs(20));
+                        ping_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+                        loop {
+                            tokio::select! {
+                                _ = ping_interval.tick() => {
+                                    if let Err(error) = socket.send(Message::Text("ping".to_string().into())).await {
+                                        private_state.record_connection_failure(
+                                            now_ms(),
+                                            unhealthy_after_failures,
+                                            error.to_string(),
+                                        );
+                                        break;
+                                    }
+                                }
+                                message = socket.next() => {
+                                    match message {
+                                        Some(Ok(Message::Text(text))) => {
+                                            match handle_bitget_private_message(&private_state, &symbol_map, text.as_ref(), &mut subscribed) {
+                                                Ok(Some(subscribe_payload)) => {
+                                                    if let Err(error) = socket.send(Message::Text(subscribe_payload.into())).await {
+                                                        private_state.record_connection_failure(
+                                                            now_ms(),
+                                                            unhealthy_after_failures,
+                                                            error.to_string(),
+                                                        );
+                                                        warn!(?error, "bitget private websocket subscribe send failed");
+                                                        break;
+                                                    }
+                                                }
+                                                Ok(None) => {}
+                                                Err(error) => debug!(?error, "bitget private websocket message ignored"),
+                                            }
+                                        }
+                                        Some(Ok(Message::Ping(payload))) => {
+                                            if let Err(error) = socket.send(Message::Pong(payload)).await {
+                                                private_state.record_connection_failure(
+                                                    now_ms(),
+                                                    unhealthy_after_failures,
+                                                    error.to_string(),
+                                                );
+                                                break;
+                                            }
+                                        }
+                                        Some(Ok(Message::Close(frame))) => {
+                                            private_state.record_connection_failure(
+                                                now_ms(),
+                                                unhealthy_after_failures,
+                                                format!("closed:{frame:?}"),
+                                            );
+                                            break;
+                                        }
+                                        Some(Ok(_)) => {}
+                                        Some(Err(error)) => {
+                                            private_state.record_connection_failure(
+                                                now_ms(),
+                                                unhealthy_after_failures,
+                                                error.to_string(),
+                                            );
+                                            warn!(?error, "bitget private websocket receive failed");
+                                            break;
+                                        }
+                                        None => break,
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        private_state.record_connection_failure(
+                            now_ms(),
+                            unhealthy_after_failures,
+                            error.to_string(),
+                        );
+                        warn!(?error, "bitget private websocket connect failed");
+                    }
+                }
+                sleep(Duration::from_millis(
+                    reconnect_backoff.on_failure_with_jitter(),
+                ))
+                .await;
+            }
+        });
+        self.private_ws.push_worker(task);
     }
 
     fn cached_transfer_statuses(
@@ -359,24 +684,28 @@ impl BitgetLiveAdapter {
         request: &OrderRequest,
         quantity: f64,
         step_size: f64,
+        position_mode: BitgetPositionMode,
     ) -> Result<BitgetOrderResponseWithTiming> {
         let sign_started_at = Instant::now();
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "symbol": venue_symbol(&self.config, &request.symbol),
             "productType": BITGET_PRODUCT_TYPE,
             "marginMode": "crossed",
             "marginCoin": BITGET_MARGIN_COIN,
             "size": format_decimal(quantity, step_size),
-            "side": match request.side {
-                Side::Buy => "buy",
-                Side::Sell => "sell",
-            },
+            "side": bitget_order_side(position_mode.clone(), request.side, request.reduce_only),
             "orderType": "market",
             "force": "ioc",
             "clientOid": request.client_order_id,
-            "reduceOnly": if request.reduce_only { "YES" } else { "NO" },
-        })
-        .to_string();
+        });
+        if let Some(trade_side) = bitget_trade_side(position_mode, request.reduce_only) {
+            body["tradeSide"] = serde_json::Value::String(trade_side.to_string());
+        } else {
+            body["reduceOnly"] = serde_json::Value::String(
+                if request.reduce_only { "YES" } else { "NO" }.to_string(),
+            );
+        }
+        let body = body.to_string();
         let request_sign_ms = elapsed_ms(sign_started_at);
         let submit_started_at = Instant::now();
         let payload = self
@@ -399,6 +728,41 @@ impl BitgetLiveAdapter {
             submit_http_ms,
             response_decode_ms,
         })
+    }
+
+    async fn position_mode(&self) -> Result<BitgetPositionMode> {
+        if let Some(mode) = self.position_mode.lock().expect("lock").clone() {
+            return Ok(mode);
+        }
+        let seed_symbol = self.seed_symbol()?;
+        let query = build_query(&[
+            ("symbol", venue_symbol(&self.config, &seed_symbol)),
+            ("productType", BITGET_PRODUCT_TYPE.to_string()),
+            ("marginCoin", BITGET_MARGIN_COIN.to_string()),
+        ]);
+        let payload = self
+            .signed_request_json(
+                &self.base_url,
+                Method::GET,
+                "/api/v2/mix/account/account",
+                Some(query),
+                None,
+                "failed to request bitget account mode",
+            )
+            .await?;
+        let data = bitget_data("bitget account mode failed", &payload)?;
+        let raw_mode = json_string(data, &["posMode", "holdMode"])
+            .unwrap_or_else(|| "one_way_mode".to_string());
+        let mode = parse_bitget_position_mode(&raw_mode);
+        self.position_mode
+            .lock()
+            .expect("lock")
+            .replace(mode.clone());
+        Ok(mode)
+    }
+
+    fn clear_position_mode(&self) {
+        self.position_mode.lock().expect("lock").take();
     }
 
     async fn fetch_order_reconciliation_with_retry(
@@ -440,10 +804,25 @@ impl VenueAdapter for BitgetLiveAdapter {
                 "bitget market snapshot unavailable for requested symbols"
             ));
         }
+        let mut snapshots = Vec::new();
+        let mut missing = Vec::new();
+        for symbol in tracked {
+            if let Some(snapshot) = self.cached_snapshot(&symbol) {
+                snapshots.push(snapshot);
+            } else {
+                missing.push(symbol);
+            }
+        }
+        if missing.is_empty() && !snapshots.is_empty() {
+            return Ok(VenueMarketSnapshot {
+                venue: Venue::Bitget,
+                observed_at_ms: now_ms(),
+                symbols: snapshots,
+            });
+        }
         let rows = self.fetch_tickers_map().await?;
         let observed_at_ms = now_ms();
-        let mut snapshots = Vec::new();
-        for symbol in tracked {
+        for symbol in missing {
             let Some(row) = rows.get(&symbol) else {
                 continue;
             };
@@ -462,8 +841,10 @@ impl VenueAdapter for BitgetLiveAdapter {
     }
 
     async fn place_order(&self, request: OrderRequest) -> Result<OrderFill> {
+        ensure_bitget_client_oid(&request.client_order_id)?;
         let order_prepare_started_at = Instant::now();
         let meta = self.symbol_meta(&request.symbol).await?;
+        let position_mode = self.position_mode().await?;
         let quantity = floor_to_step(request.quantity, meta.step_size);
         if quantity < meta.min_qty {
             return Err(anyhow!(
@@ -494,9 +875,20 @@ impl VenueAdapter for BitgetLiveAdapter {
         }
         let order_prepare_ms = elapsed_ms(order_prepare_started_at);
         let submit_started_at = Instant::now();
-        let response = self
-            .submit_order_once(&request, quantity, meta.step_size)
-            .await?;
+        let response = match self
+            .submit_order_once(&request, quantity, meta.step_size, position_mode)
+            .await
+        {
+            Ok(response) => response,
+            Err(error) if should_retry_bitget_order_error(&error) => {
+                self.clear_position_mode();
+                sleep(Duration::from_millis(100)).await;
+                let retry_mode = self.position_mode().await?;
+                self.submit_order_once(&request, quantity, meta.step_size, retry_mode)
+                    .await?
+            }
+            Err(error) => return Err(error),
+        };
         let submit_ack_ms = elapsed_ms(submit_started_at);
         let response_data = bitget_data("bitget order failed", &response.response)?;
         let order_id = json_string(response_data, &["orderId", "ordId"])
@@ -529,6 +921,17 @@ impl VenueAdapter for BitgetLiveAdapter {
                 submit_ack_ms: Some(submit_ack_ms),
             }),
         };
+        let private_fill_wait_started_at = Instant::now();
+        if let Some(private_fill) = lookup_or_wait_private_order(
+            &self.private_ws,
+            Some(&request.client_order_id),
+            Some(&order_id),
+            BITGET_PRIVATE_FILL_WAIT_MS,
+        )
+        .await
+        {
+            fill = enrich_fill_from_private(fill, &private_fill);
+        }
         let reconciliation_started_at = Instant::now();
         if let Some(reconciliation) = self
             .fetch_order_reconciliation_with_retry(
@@ -546,12 +949,38 @@ impl VenueAdapter for BitgetLiveAdapter {
             fill.filled_at_ms = reconciliation.filled_at_ms;
         }
         if let Some(timing) = fill.timing.as_mut() {
-            timing.private_fill_wait_ms = Some(elapsed_ms(reconciliation_started_at));
+            timing.private_fill_wait_ms = Some(elapsed_ms(private_fill_wait_started_at));
+            if timing.private_fill_wait_ms == Some(0) {
+                timing.private_fill_wait_ms = Some(elapsed_ms(reconciliation_started_at));
+            }
         }
         Ok(fill)
     }
 
+    fn cached_position(&self, symbol: &str) -> Option<PositionSnapshot> {
+        self.private_ws
+            .position_if_fresh(symbol, self.runtime.private_position_max_age_ms, now_ms())
+            .map(|position| PositionSnapshot {
+                venue: Venue::Bitget,
+                symbol: symbol.to_string(),
+                size: position.size,
+                updated_at_ms: position.updated_at_ms,
+            })
+    }
+
     async fn fetch_position(&self, symbol: &str) -> Result<PositionSnapshot> {
+        if let Some(position) = self.private_ws.position_if_fresh(
+            symbol,
+            self.runtime.private_position_max_age_ms,
+            now_ms(),
+        ) {
+            return Ok(PositionSnapshot {
+                venue: Venue::Bitget,
+                symbol: symbol.to_string(),
+                size: position.size,
+                updated_at_ms: position.updated_at_ms,
+            });
+        }
         let positions = self.fetch_all_positions().await?.unwrap_or_default();
         Ok(positions
             .into_iter()
@@ -582,6 +1011,12 @@ impl VenueAdapter for BitgetLiveAdapter {
         let rows = bitget_data_array("bitget positions failed", &payload)?;
         let mut positions = HashMap::<String, f64>::new();
         for row in rows {
+            if let Some(raw_mode) = json_string(row, &["posMode", "holdMode"]) {
+                self.position_mode
+                    .lock()
+                    .expect("lock")
+                    .replace(parse_bitget_position_mode(&raw_mode));
+            }
             let Some(venue_symbol) = json_string(row, &["symbol"]) else {
                 continue;
             };
@@ -652,6 +1087,10 @@ impl VenueAdapter for BitgetLiveAdapter {
             ),
             observed_at_ms: now_ms(),
         }))
+    }
+
+    fn cached_account_fee_snapshot(&self) -> Option<AccountFeeSnapshot> {
+        self.account_fee_snapshot.lock().expect("lock").clone()
     }
 
     fn enforces_entry_balance_gate(&self) -> bool {
@@ -858,6 +1297,45 @@ impl VenueAdapter for BitgetLiveAdapter {
     fn supported_symbols(&self, requested_symbols: &[String]) -> Option<Vec<String>> {
         Some(self.tracked_symbols(requested_symbols))
     }
+
+    fn supports_market_data_activity_control(&self) -> bool {
+        true
+    }
+
+    async fn set_market_data_active(&self, active: bool, symbols: &[String]) -> Result<()> {
+        let tracked_symbols = self.tracked_symbols(symbols);
+        let mut current_symbols = self.market_subscription_symbols.lock().expect("lock");
+        if !active || tracked_symbols.is_empty() {
+            if self.market_ws.has_worker() || !current_symbols.is_empty() {
+                self.market_ws.abort_worker();
+                self.market_ws.clear();
+                current_symbols.clear();
+            }
+            return Ok(());
+        }
+        if self.market_ws.has_worker() && *current_symbols == tracked_symbols {
+            return Ok(());
+        }
+        self.market_ws.abort_worker();
+        self.market_ws.clear();
+        self.start_market_ws(&tracked_symbols);
+        *current_symbols = tracked_symbols;
+        Ok(())
+    }
+
+    async fn live_startup_prewarm(&self) -> Result<()> {
+        let _ = self.position_mode().await?;
+        if let Err(error) = self.refresh_account_fee_snapshot().await {
+            warn!(?error, "bitget account fee snapshot prewarm failed");
+        }
+        Ok(())
+    }
+
+    async fn shutdown(&self) -> Result<()> {
+        self.market_ws.abort_worker();
+        self.private_ws.abort_workers();
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -866,6 +1344,12 @@ struct BitgetSymbolMeta {
     step_size: f64,
     min_notional: Option<f64>,
     max_qty: Option<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum BitgetPositionMode {
+    OneWay,
+    Hedge,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -912,6 +1396,14 @@ fn parse_bitget_contract_meta(row: &Value) -> Result<(String, BitgetSymbolMeta)>
             max_qty,
         },
     ))
+}
+
+fn parse_bitget_position_mode(raw: &str) -> BitgetPositionMode {
+    if raw.trim().to_ascii_lowercase().contains("hedge") {
+        BitgetPositionMode::Hedge
+    } else {
+        BitgetPositionMode::OneWay
+    }
 }
 
 fn parse_bitget_liquidity_snapshot(symbol: &str, row: &Value) -> Result<PerpLiquiditySnapshot> {
@@ -973,6 +1465,165 @@ fn normalize_contract_symbol(raw: &str) -> String {
         .to_ascii_uppercase()
         .replace('_', "")
         .replace('-', "")
+}
+
+fn ensure_bitget_client_oid(client_order_id: &str) -> Result<()> {
+    let len = client_order_id.chars().count();
+    if len == 0 || len > 32 {
+        return Err(anyhow!(
+            "bitget clientOid must be between 1 and 32 characters"
+        ));
+    }
+    if client_order_id
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | ':'))
+    {
+        Ok(())
+    } else {
+        Err(anyhow!("bitget clientOid contains unsupported characters"))
+    }
+}
+
+fn bitget_order_side(
+    position_mode: BitgetPositionMode,
+    side: Side,
+    reduce_only: bool,
+) -> &'static str {
+    match (position_mode, side, reduce_only) {
+        (BitgetPositionMode::OneWay, Side::Buy, _) => "buy",
+        (BitgetPositionMode::OneWay, Side::Sell, _) => "sell",
+        (BitgetPositionMode::Hedge, Side::Buy, false) => "buy",
+        (BitgetPositionMode::Hedge, Side::Sell, false) => "sell",
+        (BitgetPositionMode::Hedge, Side::Buy, true) => "sell",
+        (BitgetPositionMode::Hedge, Side::Sell, true) => "buy",
+    }
+}
+
+fn bitget_trade_side(position_mode: BitgetPositionMode, reduce_only: bool) -> Option<&'static str> {
+    match position_mode {
+        BitgetPositionMode::OneWay => None,
+        BitgetPositionMode::Hedge => Some(if reduce_only { "close" } else { "open" }),
+    }
+}
+
+fn should_retry_bitget_order_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("position mode")
+        || message.contains("posmode")
+        || message.contains("hold mode")
+        || message.contains("tradeside")
+}
+
+fn bitget_public_ws_url(base_url: &str) -> &'static str {
+    if base_url.contains("testnet") {
+        "wss://ws.bitget.com/v2/ws/public"
+    } else {
+        "wss://ws.bitget.com/v2/ws/public"
+    }
+}
+
+fn bitget_private_ws_url(base_url: &str) -> &'static str {
+    if base_url.contains("testnet") {
+        "wss://ws.bitget.com/v2/ws/private"
+    } else {
+        "wss://ws.bitget.com/v2/ws/private"
+    }
+}
+
+fn handle_bitget_private_message(
+    private_state: &std::sync::Arc<WsPrivateState>,
+    symbol_map: &HashMap<String, String>,
+    raw: &str,
+    subscribed: &mut bool,
+) -> Result<Option<String>> {
+    let payload = parse_text_message(raw)?;
+    if payload.get("event").and_then(Value::as_str) == Some("login")
+        && payload.get("code").and_then(Value::as_str).unwrap_or("0") == "0"
+        && !*subscribed
+    {
+        *subscribed = true;
+        return Ok(Some(
+            serde_json::json!({
+                "op": "subscribe",
+                "args": [
+                    {"instType": "USDT-FUTURES", "channel": "positions"},
+                    {"instType": "USDT-FUTURES", "channel": "orders"}
+                ],
+            })
+            .to_string(),
+        ));
+    }
+    let arg = match payload.get("arg") {
+        Some(arg) => arg,
+        None => return Ok(None),
+    };
+    let channel = arg
+        .get("channel")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let rows = match payload.get("data").and_then(Value::as_array) {
+        Some(rows) => rows,
+        None => return Ok(None),
+    };
+    match channel {
+        "orders" => {
+            for row in rows {
+                let venue_symbol = row
+                    .get("instId")
+                    .or_else(|| row.get("symbol"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let symbol = symbol_map
+                    .get(venue_symbol)
+                    .cloned()
+                    .unwrap_or_else(|| normalize_contract_symbol(venue_symbol));
+                private_state.record_order(PrivateOrderUpdate {
+                    symbol,
+                    order_id: json_string(row, &["ordId", "orderId"]).unwrap_or_default(),
+                    client_order_id: json_string(row, &["clientOid", "clOrdId"]),
+                    filled_quantity: json_f64(row, &["baseVolume", "filledQty", "fillQty", "size"]),
+                    average_price: json_f64(
+                        row,
+                        &["priceAvg", "fillPriceAvg", "averagePrice", "avgPrice"],
+                    ),
+                    fee_quote: json_f64(row, &["fee", "totalFee", "filledFee"]).map(f64::abs),
+                    updated_at_ms: json_i64(row, &["uTime", "cTime", "updateTime"])
+                        .unwrap_or_else(now_ms),
+                });
+            }
+        }
+        "positions" => {
+            for row in rows {
+                let venue_symbol = row
+                    .get("instId")
+                    .or_else(|| row.get("symbol"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let symbol = symbol_map
+                    .get(venue_symbol)
+                    .cloned()
+                    .unwrap_or_else(|| normalize_contract_symbol(venue_symbol));
+                let raw_size = json_f64(row, &["total", "available", "holdVolume", "size"])
+                    .unwrap_or_default()
+                    .abs();
+                let hold_side = json_string(row, &["holdSide", "posSide", "hold_mode"])
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                let signed = match hold_side.as_str() {
+                    "long" | "buy" => raw_size,
+                    "short" | "sell" => -raw_size,
+                    _ => raw_size,
+                };
+                private_state.update_position(
+                    &symbol,
+                    signed,
+                    json_i64(row, &["uTime", "cTime", "updateTime"]).unwrap_or_else(now_ms),
+                );
+            }
+        }
+        _ => {}
+    }
+    Ok(None)
 }
 
 fn bitget_data<'a>(context: &str, payload: &'a Value) -> Result<&'a Value> {
@@ -1078,7 +1729,15 @@ fn elapsed_ms(started_at: Instant) -> u64 {
 mod tests {
     use serde_json::json;
 
-    use super::{parse_bitget_contract_meta, parse_bitget_liquidity_snapshot};
+    use crate::models::Side;
+
+    use super::{
+        bitget_order_side, bitget_private_ws_url, bitget_public_ws_url, bitget_trade_side,
+        ensure_bitget_client_oid, handle_bitget_private_message, parse_bitget_contract_meta,
+        parse_bitget_liquidity_snapshot, BitgetPositionMode,
+    };
+    use crate::live::WsPrivateState;
+    use std::collections::HashMap;
 
     #[test]
     fn parses_bitget_contract_meta_from_v2_contracts_row() {
@@ -1114,5 +1773,80 @@ mod tests {
         assert!((snapshot.volume_24h_quote - 1_234_567.8).abs() < 1e-6);
         assert!((snapshot.open_interest_quote - 1_600_000.0).abs() < 1e-6);
         assert_eq!(snapshot.observed_at_ms, 1_710_000_000_000);
+    }
+
+    #[test]
+    fn bitget_ws_urls_follow_bitget_hosts() {
+        assert_eq!(
+            bitget_public_ws_url("https://api.bitget.com"),
+            "wss://ws.bitget.com/v2/ws/public"
+        );
+        assert_eq!(
+            bitget_private_ws_url("https://api.bitget.com"),
+            "wss://ws.bitget.com/v2/ws/private"
+        );
+    }
+
+    #[test]
+    fn bitget_private_order_update_is_recorded() {
+        let state = WsPrivateState::new();
+        let mut symbols = HashMap::new();
+        symbols.insert("BTCUSDT".to_string(), "BTCUSDT".to_string());
+        let payload = json!({
+            "arg": {"channel": "orders"},
+            "data": [{
+                "instId": "BTCUSDT",
+                "ordId": "123",
+                "clientOid": "abc",
+                "baseVolume": "0.5",
+                "priceAvg": "65000",
+                "fee": "-1.2",
+                "uTime": "1710000000000"
+            }]
+        })
+        .to_string();
+        let mut subscribed = true;
+        handle_bitget_private_message(&state, &symbols, &payload, &mut subscribed)
+            .expect("handle private");
+        let update = state
+            .order_by_order_id("123")
+            .expect("order update recorded");
+        assert_eq!(update.client_order_id.as_deref(), Some("abc"));
+        assert_eq!(update.filled_quantity, Some(0.5));
+        assert_eq!(update.average_price, Some(65_000.0));
+        assert_eq!(update.fee_quote, Some(1.2));
+    }
+
+    #[test]
+    fn bitget_client_oid_validation_rejects_invalid_values() {
+        assert!(ensure_bitget_client_oid("abc-123_foo:bar").is_ok());
+        assert!(ensure_bitget_client_oid("").is_err());
+        assert!(ensure_bitget_client_oid(&"x".repeat(33)).is_err());
+        assert!(ensure_bitget_client_oid("bad id").is_err());
+    }
+
+    #[test]
+    fn bitget_hedge_mode_maps_side_and_trade_side() {
+        assert_eq!(
+            bitget_order_side(BitgetPositionMode::OneWay, Side::Buy, false),
+            "buy"
+        );
+        assert_eq!(
+            bitget_order_side(BitgetPositionMode::Hedge, Side::Sell, true),
+            "buy"
+        );
+        assert_eq!(
+            bitget_order_side(BitgetPositionMode::Hedge, Side::Buy, true),
+            "sell"
+        );
+        assert_eq!(bitget_trade_side(BitgetPositionMode::OneWay, false), None);
+        assert_eq!(
+            bitget_trade_side(BitgetPositionMode::Hedge, false),
+            Some("open")
+        );
+        assert_eq!(
+            bitget_trade_side(BitgetPositionMode::Hedge, true),
+            Some("close")
+        );
     }
 }

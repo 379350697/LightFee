@@ -905,7 +905,7 @@ async fn close_reconciliation_runs_after_close_outside_entry_window() {
     config.runtime.mode = RuntimeMode::Live;
     config.runtime.max_order_quote_age_ms = 0;
     config.strategy.max_scan_minutes_before_funding = 25;
-    config.strategy.min_scan_minutes_before_funding = 5;
+    config.strategy.min_scan_minutes_before_funding = 0;
     config.strategy.stop_loss_quote = 1_000.0;
     config.strategy.profit_take_quote = 1_000.0;
     config.strategy.trailing_drawdown_quote = 1_000.0;
@@ -1063,7 +1063,15 @@ async fn close_reconciliation_runs_after_close_outside_entry_window() {
     let exit_closed = records
         .iter()
         .find(|record| record_kind(record) == Some("exit.closed"))
-        .expect("exit closed");
+        .unwrap_or_else(|| {
+            panic!(
+                "exit closed missing; kinds={:?}; no_entry={:?}",
+                records.iter().filter_map(record_kind).collect::<Vec<_>>(),
+                records
+                    .iter()
+                    .find(|record| record_kind(record) == Some("scan.no_entry_diagnostics"))
+            )
+        });
     let long_order_id = exit_closed["payload"]["long_exit_order_id"]
         .as_str()
         .expect("long exit order id");
@@ -1121,13 +1129,163 @@ async fn close_reconciliation_runs_after_close_outside_entry_window() {
 }
 
 #[tokio::test]
+async fn partial_close_reconciliation_updates_remaining_open_quantity() {
+    let temp = TempDir::new().expect("tempdir");
+    let mut config = test_config(&temp, true);
+    config.runtime.mode = RuntimeMode::Live;
+    config.runtime.max_order_quote_age_ms = 0;
+    config.strategy.max_scan_minutes_before_funding = 25;
+    config.strategy.min_scan_minutes_before_funding = 0;
+    config.strategy.stop_loss_quote = 1_000.0;
+    config.strategy.profit_take_quote = 1_000.0;
+    config.strategy.trailing_drawdown_quote = 1_000.0;
+    config.venues = vec![venue(Venue::Binance, 0.0), venue(Venue::Okx, 0.0)];
+    config.directed_pairs = vec![DirectedPairConfig {
+        long: Venue::Binance,
+        short: Venue::Okx,
+        symbols: vec!["BTCUSDT".to_string()],
+    }];
+
+    let binance = Arc::new(TimedFillAdapter::new(
+        Venue::Binance,
+        vec![
+            snapshot(
+                Venue::Binance,
+                0,
+                100.0,
+                100.0,
+                200.0,
+                200.0,
+                -0.0005,
+                360_000,
+            ),
+            snapshot(
+                Venue::Binance,
+                361_000,
+                100.0,
+                100.0,
+                200.0,
+                200.0,
+                -0.0005,
+                360_000,
+            ),
+            snapshot(
+                Venue::Binance,
+                420_000,
+                100.0,
+                100.0,
+                200.0,
+                200.0,
+                -0.0005,
+                360_000,
+            ),
+        ],
+        None,
+    ));
+    let okx = Arc::new(TimedFillAdapter::new(
+        Venue::Okx,
+        vec![
+            snapshot(Venue::Okx, 0, 100.0, 100.0, 200.0, 200.0, 0.0015, 360_000),
+            snapshot(
+                Venue::Okx,
+                361_000,
+                100.0,
+                100.0,
+                200.0,
+                200.0,
+                0.0015,
+                360_000,
+            ),
+            snapshot(
+                Venue::Okx,
+                420_000,
+                100.0,
+                100.0,
+                200.0,
+                200.0,
+                0.0015,
+                360_000,
+            ),
+        ],
+        None,
+    ));
+
+    let mut engine = Engine::new(
+        config.clone(),
+        vec![
+            binance.clone() as Arc<dyn VenueAdapter>,
+            okx.clone() as Arc<dyn VenueAdapter>,
+        ],
+    )
+    .await
+    .expect("engine");
+
+    engine.tick().await.expect("entry tick");
+    let opened_quantity = engine
+        .state()
+        .open_position
+        .as_ref()
+        .expect("open position")
+        .quantity;
+
+    engine.tick().await.expect("settlement half close tick");
+    let partial_closed = read_event_records(&config.persistence.event_log_path)
+        .into_iter()
+        .find(|record| record_kind(record) == Some("exit.partial_closed"))
+        .expect("partial close record");
+    let long_order_id = partial_closed["payload"]["long_exit_order_id"]
+        .as_str()
+        .expect("long exit order id");
+    let short_order_id = partial_closed["payload"]["short_exit_order_id"]
+        .as_str()
+        .expect("short exit order id");
+
+    let reconciled_closed_quantity = opened_quantity * 0.75;
+    binance.set_reconciled_fill(
+        long_order_id,
+        OrderFillReconciliation {
+            order_id: long_order_id.to_string(),
+            client_order_id: Some("partial-long-recon".to_string()),
+            quantity: reconciled_closed_quantity,
+            average_price: 100.0,
+            fee_quote: Some(0.05),
+            filled_at_ms: 361_500,
+        },
+    );
+    okx.set_reconciled_fill(
+        short_order_id,
+        OrderFillReconciliation {
+            order_id: short_order_id.to_string(),
+            client_order_id: Some("partial-short-recon".to_string()),
+            quantity: reconciled_closed_quantity,
+            average_price: 100.0,
+            fee_quote: Some(0.05),
+            filled_at_ms: 361_500,
+        },
+    );
+
+    engine.tick().await.expect("partial reconciliation tick");
+
+    let position = engine
+        .state()
+        .open_position
+        .as_ref()
+        .expect("position remains open");
+    assert!((position.quantity - (opened_quantity - reconciled_closed_quantity)).abs() < 1e-9);
+    assert!((position.settlement_half_closed_quantity - reconciled_closed_quantity).abs() < 1e-9);
+
+    let records = read_event_records(&config.persistence.event_log_path);
+    assert!(has_event(&records, "exit.partial_reconciled"));
+}
+
+#[tokio::test]
 async fn tiny_close_reconciliation_delta_emits_summary_payload() {
     let temp = TempDir::new().expect("tempdir");
     let mut config = test_config(&temp, true);
     config.runtime.mode = RuntimeMode::Live;
     config.runtime.max_order_quote_age_ms = 0;
     config.strategy.max_scan_minutes_before_funding = 25;
-    config.strategy.min_scan_minutes_before_funding = 5;
+    config.strategy.min_scan_minutes_before_funding = 0;
     config.strategy.stop_loss_quote = 1_000.0;
     config.strategy.profit_take_quote = 1_000.0;
     config.strategy.trailing_drawdown_quote = 1_000.0;

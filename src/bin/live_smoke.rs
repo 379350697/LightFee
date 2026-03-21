@@ -9,11 +9,11 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use futures::future::join_all;
 use lightfee::{
-    config::RuntimeMode, strategy::discover_candidates, AppConfig, AsterLiveAdapter,
-    BinanceLiveAdapter, BitgetLiveAdapter, BybitLiveAdapter, CandidateOpportunity,
-    ChillybotOpportunitySource, FeedgrabChillybotSource, FundingOpportunityType, GateLiveAdapter,
-    MarketView, OkxLiveAdapter, OpportunityHintSource, OrderFill, OrderRequest, Side,
-    TransferStatusSource, TransferStatusView, Venue, VenueAdapter,
+    apply_cached_fee_snapshots_to_candidates, config::RuntimeMode, strategy::discover_candidates,
+    AppConfig, AsterLiveAdapter, BinanceLiveAdapter, BitgetLiveAdapter, BybitLiveAdapter,
+    CandidateOpportunity, ChillybotOpportunitySource, FeedgrabChillybotSource,
+    FundingOpportunityType, GateLiveAdapter, MarketView, OkxLiveAdapter, OpportunityHintSource,
+    OrderFill, OrderRequest, Side, TransferStatusSource, TransferStatusView, Venue, VenueAdapter,
 };
 use tokio::time::{sleep, Duration};
 
@@ -63,8 +63,17 @@ async fn main() -> Result<()> {
     let market = fetch_market(&adapters, &symbols).await?;
     let hints = fetch_hints(hint_source.as_ref(), &symbols).await;
     let transfer_view = fetch_transfer_view(transfer_source.as_ref(), &adapters, &symbols).await;
-    let candidates =
+    let mut candidates =
         discover_candidates(&config, &market, hints.as_deref(), transfer_view.as_ref());
+    let fee_snapshots = adapters
+        .iter()
+        .filter_map(|adapter| {
+            adapter
+                .cached_account_fee_snapshot()
+                .map(|snapshot| (adapter.venue(), snapshot))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let _ = apply_cached_fee_snapshots_to_candidates(&config, &mut candidates, &fee_snapshots);
 
     println!("mode=live_smoke execute={execute}");
     println!("symbols={:?}", symbols);
