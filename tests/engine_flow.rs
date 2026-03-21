@@ -654,6 +654,115 @@ async fn settlement_half_close_does_not_fail_closed_on_stale_market_data() {
 }
 
 #[tokio::test]
+async fn settlement_half_close_below_exchange_minimum_skips_partial_and_keeps_full_position() {
+    let temp = TempDir::new().expect("tempdir");
+    let mut config = test_config(&temp, true);
+    config.strategy.max_entry_notional = 12.0;
+    config.strategy.live_max_entry_notional = 12.0;
+    config.strategy.min_funding_edge_bps = -1_000.0;
+    config.strategy.min_expected_edge_bps = -1_000.0;
+    config.strategy.min_worst_case_edge_bps = -1_000.0;
+    config.strategy.stop_loss_quote = 1_000.0;
+    config.strategy.profit_take_quote = 1_000.0;
+    config.strategy.trailing_drawdown_quote = 1_000.0;
+    config.venues = vec![venue(Venue::Binance, 50.0), venue(Venue::Hyperliquid, 50.0)];
+    config.directed_pairs = vec![DirectedPairConfig {
+        long: Venue::Binance,
+        short: Venue::Hyperliquid,
+        symbols: vec!["BTCUSDT".to_string()],
+    }];
+
+    let binance = Arc::new(ScriptedVenueAdapter::new(
+        Venue::Binance,
+        50.0,
+        vec![
+            snapshot(Venue::Binance, 0, 1.0, 1.0, 200.0, 200.0, 0.0, 60_000),
+            snapshot(Venue::Binance, 60_000, 1.0, 1.0, 200.0, 200.0, 0.0, 60_000),
+            snapshot(
+                Venue::Binance,
+                1_260_000,
+                1.0,
+                1.0,
+                200.0,
+                200.0,
+                0.0,
+                60_000,
+            ),
+        ],
+    ));
+    let hyper = Arc::new(
+        ScriptedVenueAdapter::new(
+            Venue::Hyperliquid,
+            50.0,
+            vec![
+                snapshot(Venue::Hyperliquid, 0, 1.0, 1.0, 200.0, 200.0, 0.0, 60_000),
+                snapshot(
+                    Venue::Hyperliquid,
+                    60_000,
+                    1.0,
+                    1.0,
+                    200.0,
+                    200.0,
+                    0.0,
+                    60_000,
+                ),
+                snapshot(
+                    Venue::Hyperliquid,
+                    1_260_000,
+                    1.0,
+                    1.0,
+                    200.0,
+                    200.0,
+                    0.0,
+                    60_000,
+                ),
+            ],
+        )
+        .with_min_notional_quote_hint(10.0),
+    );
+    let mut engine = Engine::new(
+        config.clone(),
+        vec![
+            binance as Arc<dyn VenueAdapter>,
+            hyper as Arc<dyn VenueAdapter>,
+        ],
+    )
+    .await
+    .expect("engine");
+
+    engine.tick().await.expect("entry tick");
+    assert!(engine.state().open_position.is_some());
+
+    engine.tick().await.expect("settlement tick");
+    assert!(engine.state().open_position.is_some());
+
+    sleep(Duration::from_millis(250)).await;
+    let records = read_event_records(&config.persistence.event_log_path);
+    assert!(!has_event(&records, "exit.partial_closed"));
+    assert!(has_event(
+        &records,
+        "execution.partial_exit_quantity_adjusted"
+    ));
+    assert!(has_event(&records, "execution.partial_exit_skipped"));
+
+    assert!(engine.state().open_position.is_some());
+
+    engine.tick().await.expect("force close tick");
+    assert!(engine.state().open_position.is_none());
+
+    let records = read_event_records(&config.persistence.event_log_path);
+    let exit_closed = records
+        .iter()
+        .find(|record| record_kind(record) == Some("exit.closed"))
+        .expect("exit closed");
+    assert_eq!(
+        exit_closed["payload"]["reason"].as_str(),
+        Some("settlement_force_close")
+    );
+    assert!(!has_event(&records, "exit.partial_closed"));
+}
+
+#[tokio::test]
 async fn staggered_position_exits_after_first_stage_capture_by_default() {
     let temp = TempDir::new().expect("tempdir");
     let mut config = test_config(&temp, true);

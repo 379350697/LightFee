@@ -22,6 +22,7 @@ struct Inner {
 pub struct ScriptedVenueAdapter {
     venue: Venue,
     taker_fee_bps: f64,
+    min_notional_quote_hint: Option<f64>,
     inner: Mutex<Inner>,
 }
 
@@ -30,6 +31,7 @@ impl ScriptedVenueAdapter {
         Self {
             venue,
             taker_fee_bps,
+            min_notional_quote_hint: None,
             inner: Mutex::new(Inner {
                 snapshots,
                 cursor: 0,
@@ -47,6 +49,11 @@ impl ScriptedVenueAdapter {
         let snapshots = serde_json::from_str::<Vec<VenueMarketSnapshot>>(&raw)
             .with_context(|| format!("failed to parse scenario {}", path.display()))?;
         Ok(Self::new(venue, taker_fee_bps, snapshots))
+    }
+
+    pub fn with_min_notional_quote_hint(mut self, min_notional_quote_hint: f64) -> Self {
+        self.min_notional_quote_hint = Some(min_notional_quote_hint);
+        self
     }
 
     pub fn fail_next_orders(&self, count: usize) {
@@ -186,6 +193,14 @@ impl VenueAdapter for ScriptedVenueAdapter {
 
     async fn normalize_quantity(&self, _symbol: &str, quantity: f64) -> Result<f64> {
         Ok(quantity)
+    }
+
+    fn min_entry_notional_quote_hint(
+        &self,
+        _symbol: &str,
+        _price_hint: Option<f64>,
+    ) -> Option<f64> {
+        self.min_notional_quote_hint
     }
 
     fn supported_symbols(&self, requested_symbols: &[String]) -> Option<Vec<String>> {

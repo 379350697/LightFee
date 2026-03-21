@@ -53,6 +53,8 @@ use super::{
     PrivateOrderUpdate, WsMarketState, WsPrivateState, SYMBOL_CACHE_TTL_MS,
 };
 
+const HYPERLIQUID_MIN_NOTIONAL_QUOTE: f64 = 10.0;
+
 pub struct HyperliquidLiveAdapter {
     config: VenueConfig,
     runtime: RuntimeConfig,
@@ -869,6 +871,14 @@ impl VenueAdapter for HyperliquidLiveAdapter {
         let asset = venue_symbol(&self.config, symbol);
         let asset_meta = self.asset_meta(&asset).await?;
         Ok(round_to_decimals(quantity, asset_meta.sz_decimals))
+    }
+
+    fn min_entry_notional_quote_hint(
+        &self,
+        _symbol: &str,
+        _price_hint: Option<f64>,
+    ) -> Option<f64> {
+        Some(HYPERLIQUID_MIN_NOTIONAL_QUOTE)
     }
 
     async fn shutdown(&self) -> Result<()> {

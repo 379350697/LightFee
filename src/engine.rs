@@ -181,6 +181,12 @@ struct CloseExecution {
     total_exit_fee_quote: f64,
 }
 
+struct PartialClosePlan {
+    quantity: f64,
+    promoted_to_full_close: bool,
+    min_notional_violation: Option<(Venue, f64, f64)>,
+}
+
 #[derive(Clone, Copy)]
 struct OrderLegContext<'a> {
     stage: &'a str,
@@ -1488,6 +1494,102 @@ impl Engine {
         Ok(plan.executable_quantity.min(position.quantity))
     }
 
+    fn close_leg_exchange_min_notional_violation(
+        &self,
+        venue: Venue,
+        symbol: &str,
+        side: Side,
+        quantity: f64,
+        market: &MarketView,
+    ) -> Option<(Venue, f64, f64)> {
+        if quantity <= 0.0 {
+            return None;
+        }
+        let price_hint = self.order_price_hint(market, venue, symbol, side)?;
+        let min_notional = self
+            .adapters
+            .get(&venue)
+            .and_then(|adapter| adapter.min_entry_notional_quote_hint(symbol, Some(price_hint)))?;
+        let leg_notional = quantity * price_hint;
+        if leg_notional + 1e-9 < min_notional {
+            Some((venue, leg_notional, min_notional))
+        } else {
+            None
+        }
+    }
+
+    async fn settlement_partial_close_plan(
+        &self,
+        position: &OpenPosition,
+        market: &MarketView,
+    ) -> Result<PartialClosePlan> {
+        let half_quantity = self.half_close_quantity(position).await?;
+        if half_quantity <= 0.0 {
+            return Ok(PartialClosePlan {
+                quantity: 0.0,
+                promoted_to_full_close: false,
+                min_notional_violation: None,
+            });
+        }
+
+        let half_violation = self
+            .close_leg_exchange_min_notional_violation(
+                position.short_venue,
+                &position.symbol,
+                Side::Buy,
+                half_quantity,
+                market,
+            )
+            .or_else(|| {
+                self.close_leg_exchange_min_notional_violation(
+                    position.long_venue,
+                    &position.symbol,
+                    Side::Sell,
+                    half_quantity,
+                    market,
+                )
+            });
+        if half_violation.is_none() {
+            return Ok(PartialClosePlan {
+                quantity: half_quantity,
+                promoted_to_full_close: false,
+                min_notional_violation: None,
+            });
+        }
+
+        let full_quantity = position.quantity.max(0.0);
+        let full_violation = self
+            .close_leg_exchange_min_notional_violation(
+                position.short_venue,
+                &position.symbol,
+                Side::Buy,
+                full_quantity,
+                market,
+            )
+            .or_else(|| {
+                self.close_leg_exchange_min_notional_violation(
+                    position.long_venue,
+                    &position.symbol,
+                    Side::Sell,
+                    full_quantity,
+                    market,
+                )
+            });
+        if full_violation.is_none() {
+            return Ok(PartialClosePlan {
+                quantity: full_quantity,
+                promoted_to_full_close: true,
+                min_notional_violation: half_violation,
+            });
+        }
+
+        Ok(PartialClosePlan {
+            quantity: 0.0,
+            promoted_to_full_close: false,
+            min_notional_violation: full_violation.or(half_violation),
+        })
+    }
+
     async fn manage_open_position(&mut self, position_id: &str, market: &MarketView) -> Result<()> {
         let max_market_age_ms = self.config.runtime.max_market_age_ms;
         let post_funding_hold_ms = self
@@ -1598,36 +1700,18 @@ impl Engine {
                     position.peak_net_quote = position.current_net_quote;
                 }
 
-                let reason = if partial_close_due && position.quantity > 0.0 {
-                    Some("settlement_half_close")
-                } else if force_close_due && position.quantity > 0.0 {
+                let standard_close_reason = Self::standard_close_reason(
+                    position,
+                    stop_loss_quote,
+                    profit_take_quote,
+                    trailing_drawdown_quote,
+                );
+                let reason = if force_close_due && position.quantity > 0.0 {
                     Some("settlement_force_close")
-                } else if position.current_net_quote <= -stop_loss_quote {
-                    Some("hard_stop")
-                } else if position.peak_net_quote >= profit_take_quote
-                    && position.peak_net_quote - position.current_net_quote
-                        >= trailing_drawdown_quote
-                {
-                    Some("trailing_exit")
-                } else if position.opportunity_type == FundingOpportunityType::Staggered
-                    && position.funding_captured
-                    && position.exit_after_first_stage
-                {
-                    Some("first_stage_capture")
-                } else if position.opportunity_type == FundingOpportunityType::Staggered
-                    && position.second_stage_enabled_at_entry
-                    && position.second_stage_funding_captured
-                {
-                    Some("second_stage_capture")
-                } else if position.funding_captured
-                    && position.current_net_quote >= 0.0
-                    && !(position.opportunity_type == FundingOpportunityType::Staggered
-                        && position.second_stage_enabled_at_entry
-                        && !position.second_stage_funding_captured)
-                {
-                    Some("funding_capture")
+                } else if partial_close_due && position.quantity > 0.0 {
+                    Some("settlement_half_close")
                 } else {
-                    None
+                    standard_close_reason
                 };
 
                 if let Some(reason) = reason {
@@ -1673,25 +1757,115 @@ impl Engine {
         };
 
         if reason == "settlement_half_close" {
-            let close_quantity = self.half_close_quantity(&position_snapshot).await?;
-            if close_quantity <= 0.0 {
+            let close_plan = self
+                .settlement_partial_close_plan(&position_snapshot, &position_market)
+                .await?;
+            if let Some((venue, leg_notional, min_notional)) = close_plan.min_notional_violation {
+                self.log_event(
+                    "execution.partial_exit_quantity_adjusted",
+                    &json!({
+                        "position_id": position_id,
+                        "symbol": &position_snapshot.symbol,
+                        "reason": "exchange_min_notional",
+                        "requested_half_close_quantity": position_snapshot.initial_quantity.max(position_snapshot.quantity) * SETTLEMENT_HALF_CLOSE_RATIO,
+                        "adjusted_quantity": close_plan.quantity,
+                        "promoted_to_full_close": close_plan.promoted_to_full_close,
+                        "violating_venue": venue,
+                        "violating_leg_notional_quote": leg_notional,
+                        "venue_min_notional_quote": min_notional,
+                    }),
+                );
+            }
+            if close_plan.quantity <= 0.0 {
                 self.log_event(
                     "execution.order_blocked",
                     &json!({
                         "position_id": position_id,
                         "stage": "partial_exit",
-                        "reason": "quantity_rounded_to_zero",
+                        "reason": close_plan
+                            .min_notional_violation
+                            .map(|(venue, leg_notional, min_notional)| format!(
+                                "close_leg_notional_below_exchange_minimum:{leg_notional:.6}<{min_notional:.6} on {venue}"
+                            ))
+                            .unwrap_or_else(|| "quantity_rounded_to_zero".to_string()),
                     }),
                 );
                 return Ok(());
             }
-            self.try_partial_close_position(position_id, &reason, close_quantity, &position_market)
+            if close_plan.promoted_to_full_close {
+                let fallback_reason = self
+                    .active_positions()
+                    .iter()
+                    .find(|position| position.position_id == position_id)
+                    .and_then(|position| {
+                        Self::standard_close_reason(
+                            position,
+                            stop_loss_quote,
+                            profit_take_quote,
+                            trailing_drawdown_quote,
+                        )
+                    });
+                if let Some(fallback_reason) = fallback_reason {
+                    self.try_close_position(position_id, fallback_reason, &position_market)
+                        .await?;
+                } else {
+                    self.log_event(
+                        "execution.partial_exit_skipped",
+                        &json!({
+                            "position_id": position_id,
+                            "symbol": &position_snapshot.symbol,
+                            "reason": "exchange_min_notional_requires_full_position_but_standard_close_not_ready",
+                        }),
+                    );
+                }
+            } else {
+                self.try_partial_close_position(
+                    position_id,
+                    &reason,
+                    close_plan.quantity,
+                    &position_market,
+                )
                 .await?;
+            }
         } else {
             self.try_close_position(position_id, &reason, &position_market)
                 .await?;
         }
         Ok(())
+    }
+
+    fn standard_close_reason(
+        position: &OpenPosition,
+        stop_loss_quote: f64,
+        profit_take_quote: f64,
+        trailing_drawdown_quote: f64,
+    ) -> Option<&'static str> {
+        if position.current_net_quote <= -stop_loss_quote {
+            Some("hard_stop")
+        } else if position.peak_net_quote >= profit_take_quote
+            && position.peak_net_quote - position.current_net_quote >= trailing_drawdown_quote
+        {
+            Some("trailing_exit")
+        } else if position.opportunity_type == FundingOpportunityType::Staggered
+            && position.funding_captured
+            && position.exit_after_first_stage
+        {
+            Some("first_stage_capture")
+        } else if position.opportunity_type == FundingOpportunityType::Staggered
+            && position.second_stage_enabled_at_entry
+            && position.second_stage_funding_captured
+        {
+            Some("second_stage_capture")
+        } else if position.funding_captured
+            && position.current_net_quote >= 0.0
+            && !(position.opportunity_type == FundingOpportunityType::Staggered
+                && position.second_stage_enabled_at_entry
+                && !position.second_stage_funding_captured)
+        {
+            Some("funding_capture")
+        } else {
+            None
+        }
     }
 
     fn build_segment_outcome_diagnostics(
