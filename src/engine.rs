@@ -17,7 +17,10 @@ use crate::{
         cache_is_fresh, load_json_cache, now_ms, quote_fill, store_json_cache, SYMBOL_CACHE_TTL_MS,
     },
     market::MarketView,
-    models::{CandidateOpportunity, FundingLeg, FundingOpportunityType, OrderRequest, Side, Venue},
+    models::{
+        CandidateOpportunity, FundingLeg, FundingOpportunityType, OrderFillReconciliation,
+        OrderRequest, Side, Venue,
+    },
     opportunity_source::{
         normalize_symbol_key, OpportunityHint, OpportunityHintSource, TransferStatusSource,
     },
@@ -110,7 +113,10 @@ pub struct OpenPosition {
 const ENTRY_SELECTION_BUFFER_MULTIPLIER: usize = 4;
 const ENTRY_SELECTION_BUFFER_MAX: usize = 8;
 const SETTLEMENT_HALF_CLOSE_RATIO: f64 = 0.5;
+const SETTLEMENT_REMAINDER_CLOSE_DELAY_MS: i64 = 5 * 60 * 1_000;
 const SETTLEMENT_FORCE_CLOSE_DELAY_MS: i64 = 20 * 60 * 1_000;
+const CLOSE_RECONCILIATION_RETRY_BASE_MS: i64 = 30 * 1_000;
+const CLOSE_RECONCILIATION_RETRY_MAX_MS: i64 = 5 * 60 * 1_000;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EngineState {
@@ -125,6 +131,8 @@ pub struct EngineState {
     pub last_error: Option<String>,
     #[serde(default)]
     pub venue_health: BTreeMap<Venue, PersistedVenueHealthState>,
+    #[serde(default)]
+    pending_close_reconciliations: Vec<PendingCloseReconciliation>,
 }
 
 impl Default for EngineState {
@@ -138,6 +146,7 @@ impl Default for EngineState {
             open_position: None,
             last_error: None,
             venue_health: BTreeMap::new(),
+            pending_close_reconciliations: Vec::new(),
         }
     }
 }
@@ -174,11 +183,48 @@ struct QuantityPlan {
 
 struct CloseExecution {
     short_fill: crate::models::OrderFill,
+    short_client_order_id: String,
     short_latency_ms: u64,
     long_fill: crate::models::OrderFill,
+    long_client_order_id: String,
     long_latency_ms: u64,
     realized_price_pnl_quote: f64,
     total_exit_fee_quote: f64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CloseReconciliationKind {
+    Partial,
+    Final,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct CloseLegRecord {
+    venue: Venue,
+    side: Side,
+    order_id: String,
+    client_order_id: String,
+    quantity: f64,
+    average_price: f64,
+    fee_quote: f64,
+    filled_at_ms: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct PendingCloseReconciliation {
+    position_id: String,
+    symbol: String,
+    kind: CloseReconciliationKind,
+    reason: String,
+    position_snapshot: OpenPosition,
+    original_payload: serde_json::Value,
+    long_leg: CloseLegRecord,
+    short_leg: CloseLegRecord,
+    closed_at_ms: i64,
+    created_cycle: u64,
+    next_attempt_ms: i64,
+    attempt_count: u32,
 }
 
 struct PartialClosePlan {
@@ -338,6 +384,8 @@ struct NoEntryDiagnostics {
     selected_candidate_count: usize,
     active_position_count: usize,
     remaining_slots: usize,
+    candidate_detail_count: usize,
+    omitted_candidate_count: usize,
     blocked_reason_counts: BTreeMap<String, usize>,
     advisory_counts: BTreeMap<String, usize>,
     candidates: Vec<OpportunityCandidateChecklist>,
@@ -346,6 +394,7 @@ struct NoEntryDiagnostics {
 const FLAT_RECOVERY_PROBE_INTERVAL_MS: i64 = 30_000;
 const RUNNING_SLOT_RECONCILE_INTERVAL_MS: i64 = 10_000;
 const ORDER_HEALTH_WINDOW_SIZE: usize = 20;
+const NO_ENTRY_DIAGNOSTIC_CANDIDATE_LIMIT: usize = 8;
 
 fn default_exit_after_first_stage() -> bool {
     true
@@ -630,6 +679,10 @@ impl Engine {
         }
 
         let should_scan = self.should_scan_entries(&market);
+        if self.active_positions().is_empty() && !should_scan {
+            self.process_pending_close_reconciliations(now_ms, &market)
+                .await?;
+        }
         let selected_candidates = if should_scan {
             let hints = self.fetch_hints().await;
             let transfer_statuses = self.fetch_transfer_status_view().await;
@@ -641,7 +694,7 @@ impl Engine {
                 hints.as_deref(),
                 transfer_statuses.as_ref(),
             );
-            self.apply_runtime_entry_guards(&mut candidates);
+            self.apply_runtime_entry_guards(&market, &mut candidates);
             sort_candidates(&mut candidates);
             self.reconcile_running_slots_if_needed(now_ms, &candidates)
                 .await?;
@@ -942,6 +995,192 @@ impl Engine {
         })
     }
 
+    async fn process_pending_close_reconciliations(
+        &mut self,
+        now_ms: i64,
+        market: &MarketView,
+    ) -> Result<()> {
+        if self.state.pending_close_reconciliations.is_empty()
+            || !matches!(self.config.runtime.mode, crate::config::RuntimeMode::Live)
+        {
+            return Ok(());
+        }
+
+        let mut changed = false;
+        while let Some(task) = self
+            .state
+            .pending_close_reconciliations
+            .iter()
+            .cloned()
+            .filter(|item| item.created_cycle < self.state.cycle && now_ms >= item.next_attempt_ms)
+            .min_by(|left, right| {
+                left.closed_at_ms
+                    .cmp(&right.closed_at_ms)
+                    .then_with(|| {
+                        close_reconciliation_kind_rank(left.kind)
+                            .cmp(&close_reconciliation_kind_rank(right.kind))
+                    })
+                    .then_with(|| left.position_id.cmp(&right.position_id))
+            })
+        {
+            match self.reconcile_pending_close(task.clone(), market).await {
+                Ok(Some((event_kind, payload))) => {
+                    self.log_critical_event(event_kind, &payload)?;
+                    self.state.pending_close_reconciliations.retain(|item| {
+                        !(item.position_id == task.position_id
+                            && item.kind == task.kind
+                            && item.closed_at_ms == task.closed_at_ms)
+                    });
+                    if matches!(task.kind, CloseReconciliationKind::Partial) {
+                        self.propagate_partial_close_reconciliation(&task, &payload);
+                    }
+                    changed = true;
+                }
+                Ok(None) => {
+                    self.reschedule_pending_close_reconciliation(
+                        &task,
+                        "close fill reconciliation not yet available",
+                    );
+                    changed = true;
+                }
+                Err(error) => {
+                    self.reschedule_pending_close_reconciliation(&task, &error.to_string());
+                    changed = true;
+                }
+            }
+        }
+
+        if changed {
+            self.persist_state()?;
+        }
+        Ok(())
+    }
+
+    async fn reconcile_pending_close(
+        &self,
+        task: PendingCloseReconciliation,
+        market: &MarketView,
+    ) -> Result<Option<(&'static str, serde_json::Value)>> {
+        let long_leg = self
+            .fetch_close_leg_reconciliation(&task.symbol, &task.long_leg)
+            .await?;
+        let short_leg = self
+            .fetch_close_leg_reconciliation(&task.symbol, &task.short_leg)
+            .await?;
+        let (Some(long_leg), Some(short_leg)) = (long_leg, short_leg) else {
+            return Ok(None);
+        };
+
+        let payload = match task.kind {
+            CloseReconciliationKind::Partial => {
+                self.build_partial_close_reconciled_payload(&task, market, &long_leg, &short_leg)?
+            }
+            CloseReconciliationKind::Final => {
+                self.build_final_close_reconciled_payload(&task, market, &long_leg, &short_leg)?
+            }
+        };
+        let event_kind = match task.kind {
+            CloseReconciliationKind::Partial => "exit.partial_reconciled",
+            CloseReconciliationKind::Final => "exit.reconciled",
+        };
+        Ok(Some((event_kind, payload)))
+    }
+
+    async fn fetch_close_leg_reconciliation(
+        &self,
+        symbol: &str,
+        leg: &CloseLegRecord,
+    ) -> Result<Option<OrderFillReconciliation>> {
+        let adapter = self.adapter(leg.venue)?;
+        adapter
+            .fetch_order_fill_reconciliation(
+                symbol,
+                &leg.order_id,
+                Some(leg.client_order_id.as_str()).filter(|value| !value.is_empty()),
+            )
+            .await
+    }
+
+    fn reschedule_pending_close_reconciliation(
+        &mut self,
+        task: &PendingCloseReconciliation,
+        error: &str,
+    ) {
+        let log_payload = if let Some(pending) = self
+            .state
+            .pending_close_reconciliations
+            .iter_mut()
+            .find(|item| {
+                item.position_id == task.position_id
+                    && item.kind == task.kind
+                    && item.closed_at_ms == task.closed_at_ms
+            }) {
+            pending.attempt_count = pending.attempt_count.saturating_add(1);
+            let base_ts_ms = self
+                .state
+                .last_market_ts_ms
+                .unwrap_or_else(wall_clock_now_ms);
+            pending.next_attempt_ms = base_ts_ms
+                .saturating_add(close_reconciliation_retry_delay_ms(pending.attempt_count));
+            let position_id = pending.position_id.clone();
+            let symbol = pending.symbol.clone();
+            let kind = pending.kind;
+            let attempt_count = pending.attempt_count;
+            let next_attempt_ms = pending.next_attempt_ms;
+            let closed_at_ms = pending.closed_at_ms;
+            Some(json!({
+                "position_id": position_id,
+                "symbol": symbol,
+                "kind": kind,
+                "attempt_count": attempt_count,
+                "next_attempt_ms": next_attempt_ms,
+                "closed_at_ms": closed_at_ms,
+                "error": error,
+            }))
+        } else {
+            None
+        };
+        if let Some(payload) = log_payload {
+            self.log_event("exit.reconciliation_failed", &payload);
+        }
+    }
+
+    fn propagate_partial_close_reconciliation(
+        &mut self,
+        task: &PendingCloseReconciliation,
+        payload: &serde_json::Value,
+    ) {
+        let reconciled_realized_price_pnl_quote = payload
+            .get("reconciled_realized_price_pnl_quote")
+            .and_then(|value| value.as_f64());
+        let reconciled_realized_exit_fee_quote = payload
+            .get("reconciled_realized_exit_fee_quote")
+            .and_then(|value| value.as_f64());
+        let settlement_half_outcome_diagnostics = payload.get("outcome_diagnostics").cloned();
+
+        for pending in &mut self.state.pending_close_reconciliations {
+            if pending.position_id != task.position_id
+                || !matches!(pending.kind, CloseReconciliationKind::Final)
+            {
+                continue;
+            }
+            if let Some(value) = reconciled_realized_price_pnl_quote {
+                pending.position_snapshot.realized_price_pnl_quote = value;
+            }
+            if let Some(value) = reconciled_realized_exit_fee_quote {
+                pending.position_snapshot.realized_exit_fee_quote = value;
+            }
+            if let Some(diagnostics) = settlement_half_outcome_diagnostics.clone() {
+                if let Some(object) = pending.original_payload.as_object_mut() {
+                    object.insert(
+                        "settlement_half_outcome_diagnostics".to_string(),
+                        diagnostics,
+                    );
+                }
+            }
+        }
+    }
+
     fn select_entry_candidates(
         &self,
         market: &MarketView,
@@ -1016,6 +1255,7 @@ impl Engine {
                 .iter()
                 .flat_map(|candidate| candidate.advisories.iter().cloned()),
         );
+        let candidate_detail_count = candidates.len().min(NO_ENTRY_DIAGNOSTIC_CANDIDATE_LIMIT);
         let diagnostics = NoEntryDiagnostics {
             reason: self.no_entry_reason(candidates, selected_candidates, remaining_slots),
             candidate_count: candidates.len(),
@@ -1023,10 +1263,13 @@ impl Engine {
             selected_candidate_count: selected_candidates.len(),
             active_position_count: self.active_position_count(),
             remaining_slots,
+            candidate_detail_count,
+            omitted_candidate_count: candidates.len().saturating_sub(candidate_detail_count),
             blocked_reason_counts,
             advisory_counts,
             candidates: candidates
                 .iter()
+                .take(NO_ENTRY_DIAGNOSTIC_CANDIDATE_LIMIT)
                 .map(|candidate| {
                     self.build_candidate_checklist(
                         market,
@@ -1613,6 +1856,7 @@ impl Engine {
             .await?;
         let evaluation_now_ms = position_market.now_ms().max(market.now_ms());
         let mut guard_failure = None;
+        let mut guard_bypass = None;
         let mut exit_payload = None;
         let mut partial_exit_payload = None;
         let mut close_reason = None;
@@ -1643,41 +1887,88 @@ impl Engine {
                     .funding_timestamp_ms
                     .saturating_add(SETTLEMENT_FORCE_CLOSE_DELAY_MS);
 
-            if !position.funding_captured
-                && evaluation_now_ms >= position.funding_timestamp_ms + post_funding_hold_ms
-            {
-                position.funding_captured = true;
-                position.captured_funding_quote =
-                    position.entry_notional_quote * position.funding_edge_bps_entry / 10_000.0;
-            }
-            if position.funding_captured
-                && position.second_stage_enabled_at_entry
-                && !position.second_stage_funding_captured
-                && position.second_funding_timestamp_ms > position.funding_timestamp_ms
-                && evaluation_now_ms >= position.second_funding_timestamp_ms + post_funding_hold_ms
-            {
-                position.second_stage_funding_captured = true;
-                position.second_stage_funding_quote = position.entry_notional_quote
-                    * (position.total_funding_edge_bps_entry - position.funding_edge_bps_entry)
-                    / 10_000.0;
-            }
+            Self::update_position_funding_capture_state(
+                position,
+                evaluation_now_ms,
+                post_funding_hold_ms,
+            );
 
             if !market_has_quotes && !partial_close_due && !force_close_due {
-                guard_failure = Some(json!({
-                    "position_id": &position.position_id,
-                    "symbol": &position.symbol,
-                    "long_venue": position.long_venue,
-                    "short_venue": position.short_venue,
-                    "reason": "missing_market_data",
-                }));
+                if let Some(reason) =
+                    Self::stale_market_safe_close_reason(position, evaluation_now_ms)
+                {
+                    exit_payload = Some(json!({
+                        "position_id": &position.position_id,
+                        "symbol": &position.symbol,
+                        "long_venue": position.long_venue,
+                        "short_venue": position.short_venue,
+                        "quantity": position.quantity,
+                        "reason": reason,
+                        "current_net_quote": position.current_net_quote,
+                        "peak_net_quote": position.peak_net_quote,
+                        "captured_funding_quote": position.captured_funding_quote,
+                        "second_stage_funding_quote": position.second_stage_funding_quote,
+                        "funding_captured": position.funding_captured,
+                        "second_stage_funding_captured": position.second_stage_funding_captured,
+                        "opportunity_type": position.opportunity_type,
+                        "market_guard_reason": "missing_market_data",
+                    }));
+                    close_reason = Some(reason.to_string());
+                    guard_bypass = Some(json!({
+                        "position_id": &position.position_id,
+                        "symbol": &position.symbol,
+                        "long_venue": position.long_venue,
+                        "short_venue": position.short_venue,
+                        "guard_reason": "missing_market_data",
+                        "close_reason": reason,
+                    }));
+                } else {
+                    guard_failure = Some(json!({
+                        "position_id": &position.position_id,
+                        "symbol": &position.symbol,
+                        "long_venue": position.long_venue,
+                        "short_venue": position.short_venue,
+                        "reason": "missing_market_data",
+                    }));
+                }
             } else if !market_fresh && !partial_close_due && !force_close_due {
-                guard_failure = Some(json!({
-                    "position_id": &position.position_id,
-                    "symbol": &position.symbol,
-                    "long_venue": position.long_venue,
-                    "short_venue": position.short_venue,
-                    "reason": "stale_market_data",
-                }));
+                if let Some(reason) =
+                    Self::stale_market_safe_close_reason(position, evaluation_now_ms)
+                {
+                    exit_payload = Some(json!({
+                        "position_id": &position.position_id,
+                        "symbol": &position.symbol,
+                        "long_venue": position.long_venue,
+                        "short_venue": position.short_venue,
+                        "quantity": position.quantity,
+                        "reason": reason,
+                        "current_net_quote": position.current_net_quote,
+                        "peak_net_quote": position.peak_net_quote,
+                        "captured_funding_quote": position.captured_funding_quote,
+                        "second_stage_funding_quote": position.second_stage_funding_quote,
+                        "funding_captured": position.funding_captured,
+                        "second_stage_funding_captured": position.second_stage_funding_captured,
+                        "opportunity_type": position.opportunity_type,
+                        "market_guard_reason": "stale_market_data",
+                    }));
+                    close_reason = Some(reason.to_string());
+                    guard_bypass = Some(json!({
+                        "position_id": &position.position_id,
+                        "symbol": &position.symbol,
+                        "long_venue": position.long_venue,
+                        "short_venue": position.short_venue,
+                        "guard_reason": "stale_market_data",
+                        "close_reason": reason,
+                    }));
+                } else {
+                    guard_failure = Some(json!({
+                        "position_id": &position.position_id,
+                        "symbol": &position.symbol,
+                        "long_venue": position.long_venue,
+                        "short_venue": position.short_venue,
+                        "reason": "stale_market_data",
+                    }));
+                }
             } else {
                 let unrealized_price_pnl = match (
                     position_market.symbol(position.long_venue, &position.symbol),
@@ -1705,6 +1996,7 @@ impl Engine {
                     stop_loss_quote,
                     profit_take_quote,
                     trailing_drawdown_quote,
+                    evaluation_now_ms,
                 );
                 let reason = if force_close_due && position.quantity > 0.0 {
                     Some("settlement_force_close")
@@ -1743,6 +2035,9 @@ impl Engine {
         if let Some(payload) = guard_failure {
             self.log_event("execution.guard_failed", &payload);
             return Ok(());
+        }
+        if let Some(payload) = guard_bypass {
+            self.log_event("execution.guard_bypassed", &payload);
         }
 
         if let Some(payload) = partial_exit_payload {
@@ -1803,6 +2098,7 @@ impl Engine {
                             stop_loss_quote,
                             profit_take_quote,
                             trailing_drawdown_quote,
+                            evaluation_now_ms,
                         )
                     });
                 if let Some(fallback_reason) = fallback_reason {
@@ -1839,9 +2135,12 @@ impl Engine {
         stop_loss_quote: f64,
         profit_take_quote: f64,
         trailing_drawdown_quote: f64,
+        evaluation_now_ms: i64,
     ) -> Option<&'static str> {
         if position.current_net_quote <= -stop_loss_quote {
             Some("hard_stop")
+        } else if Self::remaining_close_delay_active(position, evaluation_now_ms) {
+            None
         } else if position.peak_net_quote >= profit_take_quote
             && position.peak_net_quote - position.current_net_quote >= trailing_drawdown_quote
         {
@@ -1865,6 +2164,81 @@ impl Engine {
             Some("funding_capture")
         } else {
             None
+        }
+    }
+
+    fn stale_market_safe_close_reason(
+        position: &OpenPosition,
+        evaluation_now_ms: i64,
+    ) -> Option<&'static str> {
+        if Self::remaining_close_delay_active(position, evaluation_now_ms) {
+            return None;
+        }
+        if position.opportunity_type == FundingOpportunityType::Staggered
+            && position.funding_captured
+            && position.exit_after_first_stage
+        {
+            Some("first_stage_capture")
+        } else if position.opportunity_type == FundingOpportunityType::Staggered
+            && position.second_stage_enabled_at_entry
+            && position.second_stage_funding_captured
+        {
+            Some("second_stage_capture")
+        } else if position.funding_captured
+            && position.current_net_quote >= 0.0
+            && !(position.opportunity_type == FundingOpportunityType::Staggered
+                && position.second_stage_enabled_at_entry
+                && !position.second_stage_funding_captured)
+        {
+            Some("funding_capture")
+        } else {
+            None
+        }
+    }
+
+    fn remaining_close_delay_active(position: &OpenPosition, evaluation_now_ms: i64) -> bool {
+        position.settlement_half_closed_at_ms > 0
+            && evaluation_now_ms
+                < position
+                    .funding_timestamp_ms
+                    .saturating_add(SETTLEMENT_REMAINDER_CLOSE_DELAY_MS)
+    }
+
+    fn update_position_funding_capture_state(
+        position: &mut OpenPosition,
+        evaluation_now_ms: i64,
+        post_funding_hold_ms: i64,
+    ) {
+        let previous_total_funding_quote =
+            position.captured_funding_quote + position.second_stage_funding_quote;
+
+        if !position.funding_captured
+            && evaluation_now_ms >= position.funding_timestamp_ms + post_funding_hold_ms
+        {
+            position.funding_captured = true;
+            position.captured_funding_quote =
+                position.entry_notional_quote * position.funding_edge_bps_entry / 10_000.0;
+        }
+        if position.funding_captured
+            && position.second_stage_enabled_at_entry
+            && !position.second_stage_funding_captured
+            && position.second_funding_timestamp_ms > position.funding_timestamp_ms
+            && evaluation_now_ms >= position.second_funding_timestamp_ms + post_funding_hold_ms
+        {
+            position.second_stage_funding_captured = true;
+            position.second_stage_funding_quote = position.entry_notional_quote
+                * (position.total_funding_edge_bps_entry - position.funding_edge_bps_entry)
+                / 10_000.0;
+        }
+
+        let funding_delta_quote = position.captured_funding_quote
+            + position.second_stage_funding_quote
+            - previous_total_funding_quote;
+        if funding_delta_quote.abs() > f64::EPSILON {
+            position.current_net_quote += funding_delta_quote;
+            if position.current_net_quote > position.peak_net_quote {
+                position.peak_net_quote = position.current_net_quote;
+            }
         }
     }
 
@@ -2011,29 +2385,17 @@ impl Engine {
             "outcome": outcome,
             "primary_reason": primary_reason,
             "contributing_reasons": contributing_reasons,
-            "segment_entry_notional_quote": segment_entry_notional_quote,
-            "allocated_entry_fee_quote": allocated_entry_fee_quote,
             "actual_funding_quote": actual_funding_quote,
-            "expected_total_funding_quote": expected_funding_quote,
             "funding_shortfall_quote": funding_shortfall_quote,
-            "funding_realized_quote": actual_funding_quote.max(0.0),
             "realized_price_pnl_quote": realized_price_pnl_quote,
             "adverse_price_move_quote": adverse_price_move_quote,
             "favorable_price_move_quote": favorable_price_move_quote,
             "fee_drag_quote": fee_drag_quote,
-            "estimated_entry_impact_quote": estimated_entry_impact_quote,
             "funding_edge_narrowed_quote": funding_edge_narrowed_quote,
             "funding_edge_widened_quote": funding_edge_widened_quote,
             "entry_depth_capped_at_entry": position.entry_depth_capped_at_entry,
-            "entry_cross_bps_entry": position.entry_cross_bps_entry,
-            "entry_slippage_bps_entry": position.entry_slippage_bps_entry,
-            "fee_bps_entry": position.fee_bps_entry,
-            "expected_edge_bps_entry": position.expected_edge_bps_entry,
-            "worst_case_edge_bps_entry": position.worst_case_edge_bps_entry,
             "entry_total_funding_edge_bps": position.total_funding_edge_bps_entry,
             "current_total_funding_edge_bps": current_total_funding_edge_bps,
-            "funding_captured": position.funding_captured,
-            "second_stage_funding_captured": position.second_stage_funding_captured,
             "exit_reason": reason,
         }))
     }
@@ -2491,6 +2853,7 @@ impl Engine {
             ),
             observed_at_ms: market.observed_at_ms(position.short_venue),
         };
+        let short_client_order_id = short_close.client_order_id.clone();
         let long_close = OrderRequest {
             symbol: position.symbol.clone(),
             side: Side::Sell,
@@ -2510,6 +2873,7 @@ impl Engine {
             ),
             observed_at_ms: market.observed_at_ms(position.long_venue),
         };
+        let long_client_order_id = long_close.client_order_id.clone();
 
         let (short_fill, short_latency_ms) = self
             .execute_order_leg(
@@ -2541,8 +2905,10 @@ impl Engine {
 
         Ok(CloseExecution {
             short_fill,
+            short_client_order_id,
             short_latency_ms,
             long_fill,
+            long_client_order_id,
             long_latency_ms,
             realized_price_pnl_quote,
             total_exit_fee_quote,
@@ -2645,10 +3011,8 @@ impl Engine {
             execution.realized_price_pnl_quote,
             execution.total_exit_fee_quote,
         );
-        let partial_loss_diagnostics = partial_outcome_diagnostics
-            .as_ref()
-            .filter(|diagnostics| diagnostics["outcome"].as_str() == Some("loss"))
-            .cloned();
+        let partial_loss_diagnostics =
+            self.compact_loss_diagnostics(partial_outcome_diagnostics.as_ref());
 
         let mut partial_close_payload = serde_json::to_value(&updated_position)?;
         let payload_object = partial_close_payload
@@ -2670,6 +3034,38 @@ impl Engine {
         );
         payload_object.insert("closed_at_ms".to_string(), json!(closed_at_ms));
         payload_object.insert(
+            "long_exit_order_id".to_string(),
+            json!(&execution.long_fill.order_id),
+        );
+        payload_object.insert(
+            "short_exit_order_id".to_string(),
+            json!(&execution.short_fill.order_id),
+        );
+        payload_object.insert(
+            "long_exit_client_order_id".to_string(),
+            json!(&execution.long_client_order_id),
+        );
+        payload_object.insert(
+            "short_exit_client_order_id".to_string(),
+            json!(&execution.short_client_order_id),
+        );
+        payload_object.insert(
+            "long_exit_average_price".to_string(),
+            json!(execution.long_fill.average_price),
+        );
+        payload_object.insert(
+            "short_exit_average_price".to_string(),
+            json!(execution.short_fill.average_price),
+        );
+        payload_object.insert(
+            "long_exit_quantity".to_string(),
+            json!(execution.long_fill.quantity),
+        );
+        payload_object.insert(
+            "short_exit_quantity".to_string(),
+            json!(execution.short_fill.quantity),
+        );
+        payload_object.insert(
             "outcome_diagnostics".to_string(),
             json!(partial_outcome_diagnostics),
         );
@@ -2679,6 +3075,14 @@ impl Engine {
         );
 
         self.log_critical_event("exit.partial_closed", &partial_close_payload)?;
+        self.schedule_pending_close_reconciliation(
+            CloseReconciliationKind::Partial,
+            updated_position.clone(),
+            partial_close_payload.clone(),
+            &execution,
+            reason,
+            closed_at_ms,
+        );
         self.persist_state()?;
         Ok(())
     }
@@ -2754,14 +3158,9 @@ impl Engine {
             cumulative_exit_fee_quote,
             realized_net_quote,
         );
-        let loss_diagnostics = outcome_diagnostics
-            .as_ref()
-            .filter(|diagnostics| diagnostics["outcome"].as_str() == Some("loss"))
-            .cloned();
-        let remaining_loss_diagnostics = remaining_outcome_diagnostics
-            .as_ref()
-            .filter(|diagnostics| diagnostics["outcome"].as_str() == Some("loss"))
-            .cloned();
+        let loss_diagnostics = self.compact_loss_diagnostics(outcome_diagnostics.as_ref());
+        let remaining_loss_diagnostics =
+            self.compact_loss_diagnostics(remaining_outcome_diagnostics.as_ref());
 
         self.log_event(
             "execution.exit_latency_summary",
@@ -2777,38 +3176,358 @@ impl Engine {
             }),
         );
 
-        self.log_critical_event(
-            "exit.closed",
-            &json!({
-                "position_id": &position.position_id,
-                "symbol": &position.symbol,
-                "reason": reason,
-                "net_quote": realized_net_quote,
-                "mark_to_market_net_quote": position.current_net_quote,
-                "realized_price_pnl_quote": cumulative_realized_price_pnl_quote,
-                "captured_funding_quote": position.captured_funding_quote,
-                "second_stage_funding_quote": position.second_stage_funding_quote,
-                "total_entry_fee_quote": position.total_entry_fee_quote,
-                "total_exit_fee_quote": cumulative_exit_fee_quote,
-                "long_exit_average_price": execution.long_fill.average_price,
-                "short_exit_average_price": execution.short_fill.average_price,
-                "long_exit_quantity": execution.long_fill.quantity,
-                "short_exit_quantity": execution.short_fill.quantity,
-                "settlement_half_closed_quantity": position.settlement_half_closed_quantity,
-                "settlement_half_closed_at_ms": position.settlement_half_closed_at_ms,
-                "settlement_half_outcome_diagnostics": settlement_half_outcome_diagnostics,
-                "remaining_outcome_diagnostics": remaining_outcome_diagnostics,
-                "remaining_loss_diagnostics": remaining_loss_diagnostics,
-                "outcome_diagnostics": outcome_diagnostics,
-                "loss_diagnostics": loss_diagnostics,
-                "closed_at_ms": execution.short_fill.filled_at_ms.max(execution.long_fill.filled_at_ms),
-            }),
-        )?;
+        let close_payload = json!({
+            "position_id": &position.position_id,
+            "symbol": &position.symbol,
+            "reason": reason,
+            "net_quote": realized_net_quote,
+            "mark_to_market_net_quote": position.current_net_quote,
+            "realized_price_pnl_quote": cumulative_realized_price_pnl_quote,
+            "captured_funding_quote": position.captured_funding_quote,
+            "second_stage_funding_quote": position.second_stage_funding_quote,
+            "total_entry_fee_quote": position.total_entry_fee_quote,
+            "total_exit_fee_quote": cumulative_exit_fee_quote,
+            "long_exit_average_price": execution.long_fill.average_price,
+            "short_exit_average_price": execution.short_fill.average_price,
+            "long_exit_quantity": execution.long_fill.quantity,
+            "short_exit_quantity": execution.short_fill.quantity,
+            "long_exit_order_id": &execution.long_fill.order_id,
+            "short_exit_order_id": &execution.short_fill.order_id,
+            "long_exit_client_order_id": &execution.long_client_order_id,
+            "short_exit_client_order_id": &execution.short_client_order_id,
+            "settlement_half_closed_quantity": position.settlement_half_closed_quantity,
+            "settlement_half_closed_at_ms": position.settlement_half_closed_at_ms,
+            "settlement_half_outcome_diagnostics": settlement_half_outcome_diagnostics,
+            "remaining_outcome_diagnostics": remaining_outcome_diagnostics,
+            "remaining_loss_diagnostics": remaining_loss_diagnostics,
+            "outcome_diagnostics": outcome_diagnostics,
+            "loss_diagnostics": loss_diagnostics,
+            "closed_at_ms": execution.short_fill.filled_at_ms.max(execution.long_fill.filled_at_ms),
+        });
+        self.log_critical_event("exit.closed", &close_payload)?;
+        self.schedule_pending_close_reconciliation(
+            CloseReconciliationKind::Final,
+            position.clone(),
+            close_payload,
+            &execution,
+            reason,
+            execution
+                .short_fill
+                .filled_at_ms
+                .max(execution.long_fill.filled_at_ms),
+        );
         self.remove_open_position(&position.position_id);
         self.state.last_error = None;
         self.state.mode = EngineMode::Running;
         self.persist_state()?;
         Ok(())
+    }
+
+    fn schedule_pending_close_reconciliation(
+        &mut self,
+        kind: CloseReconciliationKind,
+        position_snapshot: OpenPosition,
+        original_payload: serde_json::Value,
+        execution: &CloseExecution,
+        reason: &str,
+        closed_at_ms: i64,
+    ) {
+        if !matches!(self.config.runtime.mode, crate::config::RuntimeMode::Live) {
+            return;
+        }
+        self.state
+            .pending_close_reconciliations
+            .push(PendingCloseReconciliation {
+                position_id: position_snapshot.position_id.clone(),
+                symbol: position_snapshot.symbol.clone(),
+                kind,
+                reason: reason.to_string(),
+                position_snapshot,
+                original_payload,
+                long_leg: close_leg_record(
+                    execution.long_fill.venue,
+                    execution.long_fill.side,
+                    &execution.long_fill,
+                    &execution.long_client_order_id,
+                ),
+                short_leg: close_leg_record(
+                    execution.short_fill.venue,
+                    execution.short_fill.side,
+                    &execution.short_fill,
+                    &execution.short_client_order_id,
+                ),
+                closed_at_ms,
+                created_cycle: self.state.cycle,
+                next_attempt_ms: closed_at_ms,
+                attempt_count: 0,
+            });
+    }
+
+    fn build_partial_close_reconciled_payload(
+        &self,
+        task: &PendingCloseReconciliation,
+        market: &MarketView,
+        long_leg: &OrderFillReconciliation,
+        short_leg: &OrderFillReconciliation,
+    ) -> Result<serde_json::Value> {
+        let mut corrected_position = task.position_snapshot.clone();
+        let closed_quantity = long_leg.quantity.min(short_leg.quantity);
+        let reconciled_segment_realized_price_pnl_quote =
+            realized_price_pnl_quote_from_reconciled_legs(
+                &task.position_snapshot,
+                long_leg,
+                short_leg,
+            );
+        let reconciled_segment_exit_fee_quote = reconciled_exit_fee_quote(&task.long_leg, long_leg)
+            + reconciled_exit_fee_quote(&task.short_leg, short_leg);
+        let original_segment_realized_price_pnl_quote = task
+            .original_payload
+            .get("partial_realized_price_pnl_quote")
+            .and_then(|value| value.as_f64())
+            .unwrap_or_default();
+        let original_segment_exit_fee_quote = task
+            .original_payload
+            .get("partial_exit_fee_quote")
+            .and_then(|value| value.as_f64())
+            .unwrap_or_default();
+
+        corrected_position.realized_price_pnl_quote = corrected_position.realized_price_pnl_quote
+            - original_segment_realized_price_pnl_quote
+            + reconciled_segment_realized_price_pnl_quote;
+        corrected_position.realized_exit_fee_quote = corrected_position.realized_exit_fee_quote
+            - original_segment_exit_fee_quote
+            + reconciled_segment_exit_fee_quote;
+        if let (Some(long_quote), Some(short_quote)) = (
+            market.symbol(corrected_position.long_venue, &corrected_position.symbol),
+            market.symbol(corrected_position.short_venue, &corrected_position.symbol),
+        ) {
+            let unrealized_price_pnl = (long_quote.mid_price()
+                - corrected_position.long_entry_price)
+                * corrected_position.quantity
+                + (corrected_position.short_entry_price - short_quote.mid_price())
+                    * corrected_position.quantity;
+            corrected_position.current_net_quote = corrected_position.realized_price_pnl_quote
+                + unrealized_price_pnl
+                + corrected_position.captured_funding_quote
+                + corrected_position.second_stage_funding_quote
+                - corrected_position.total_entry_fee_quote
+                - corrected_position.realized_exit_fee_quote;
+            if corrected_position.current_net_quote > corrected_position.peak_net_quote {
+                corrected_position.peak_net_quote = corrected_position.current_net_quote;
+            }
+        }
+
+        let outcome_diagnostics = self.build_segment_outcome_diagnostics(
+            &corrected_position,
+            market,
+            &task.reason,
+            "settlement_half_close",
+            closed_quantity,
+            reconciled_segment_realized_price_pnl_quote,
+            reconciled_segment_exit_fee_quote,
+        );
+        let loss_diagnostics = self.compact_loss_diagnostics(outcome_diagnostics.as_ref());
+        let original_segment_net_quote = task
+            .original_payload
+            .get("outcome_diagnostics")
+            .and_then(|value| value.get("net_quote"))
+            .and_then(|value| value.as_f64())
+            .unwrap_or_default();
+        let reconciled_segment_net_quote = outcome_diagnostics
+            .as_ref()
+            .and_then(|value| value.get("net_quote"))
+            .and_then(|value| value.as_f64())
+            .unwrap_or_default();
+        let reconciled_closed_at_ms = long_leg.filled_at_ms.max(short_leg.filled_at_ms);
+
+        let mut payload = task.original_payload.clone();
+        let object = payload
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("partial close reconciliation payload is not an object"))?;
+        object.insert(
+            "realized_price_pnl_quote".to_string(),
+            json!(corrected_position.realized_price_pnl_quote),
+        );
+        object.insert(
+            "realized_exit_fee_quote".to_string(),
+            json!(corrected_position.realized_exit_fee_quote),
+        );
+        object.insert(
+            "current_net_quote".to_string(),
+            json!(corrected_position.current_net_quote),
+        );
+        object.insert(
+            "peak_net_quote".to_string(),
+            json!(corrected_position.peak_net_quote),
+        );
+        object.insert(
+            "partial_realized_price_pnl_quote".to_string(),
+            json!(reconciled_segment_realized_price_pnl_quote),
+        );
+        object.insert(
+            "partial_exit_fee_quote".to_string(),
+            json!(reconciled_segment_exit_fee_quote),
+        );
+        object.insert("closed_quantity".to_string(), json!(closed_quantity));
+        object.insert("closed_at_ms".to_string(), json!(reconciled_closed_at_ms));
+        object.insert(
+            "long_exit_average_price".to_string(),
+            json!(long_leg.average_price),
+        );
+        object.insert(
+            "short_exit_average_price".to_string(),
+            json!(short_leg.average_price),
+        );
+        object.insert("long_exit_quantity".to_string(), json!(long_leg.quantity));
+        object.insert("short_exit_quantity".to_string(), json!(short_leg.quantity));
+        object.insert("long_leg".to_string(), json!(long_leg));
+        object.insert("short_leg".to_string(), json!(short_leg));
+        object.insert(
+            "outcome_diagnostics".to_string(),
+            json!(outcome_diagnostics),
+        );
+        object.insert("loss_diagnostics".to_string(), json!(loss_diagnostics));
+        object.insert(
+            "reconciled_realized_price_pnl_quote".to_string(),
+            json!(corrected_position.realized_price_pnl_quote),
+        );
+        object.insert(
+            "reconciled_realized_exit_fee_quote".to_string(),
+            json!(corrected_position.realized_exit_fee_quote),
+        );
+        object.insert(
+            "reconciliation_delta_quote".to_string(),
+            json!(reconciled_segment_net_quote - original_segment_net_quote),
+        );
+        object.insert("reconciled_at_ms".to_string(), json!(wall_clock_now_ms()));
+        Ok(payload)
+    }
+
+    fn build_final_close_reconciled_payload(
+        &self,
+        task: &PendingCloseReconciliation,
+        market: &MarketView,
+        long_leg: &OrderFillReconciliation,
+        short_leg: &OrderFillReconciliation,
+    ) -> Result<serde_json::Value> {
+        let closed_quantity = long_leg.quantity.min(short_leg.quantity);
+        let reconciled_segment_realized_price_pnl_quote =
+            realized_price_pnl_quote_from_reconciled_legs(
+                &task.position_snapshot,
+                long_leg,
+                short_leg,
+            );
+        let reconciled_segment_exit_fee_quote = reconciled_exit_fee_quote(&task.long_leg, long_leg)
+            + reconciled_exit_fee_quote(&task.short_leg, short_leg);
+        let reconciled_realized_price_pnl_quote = task.position_snapshot.realized_price_pnl_quote
+            + reconciled_segment_realized_price_pnl_quote;
+        let reconciled_total_exit_fee_quote =
+            task.position_snapshot.realized_exit_fee_quote + reconciled_segment_exit_fee_quote;
+        let reconciled_net_quote = reconciled_realized_price_pnl_quote
+            + task.position_snapshot.captured_funding_quote
+            + task.position_snapshot.second_stage_funding_quote
+            - task.position_snapshot.total_entry_fee_quote
+            - reconciled_total_exit_fee_quote;
+        let segment_kind = if task.position_snapshot.settlement_half_closed_quantity > 0.0 {
+            "post_settlement_remaining_close"
+        } else {
+            "full_close"
+        };
+        let remaining_outcome_diagnostics = self.build_segment_outcome_diagnostics(
+            &task.position_snapshot,
+            market,
+            &task.reason,
+            segment_kind,
+            closed_quantity,
+            reconciled_segment_realized_price_pnl_quote,
+            reconciled_segment_exit_fee_quote,
+        );
+        let remaining_loss_diagnostics =
+            self.compact_loss_diagnostics(remaining_outcome_diagnostics.as_ref());
+        let outcome_diagnostics = self.build_exit_outcome_diagnostics(
+            &task.position_snapshot,
+            market,
+            &task.reason,
+            reconciled_realized_price_pnl_quote,
+            reconciled_total_exit_fee_quote,
+            reconciled_net_quote,
+        );
+        let loss_diagnostics = self.compact_loss_diagnostics(outcome_diagnostics.as_ref());
+        let original_net_quote = task
+            .original_payload
+            .get("net_quote")
+            .and_then(|value| value.as_f64())
+            .unwrap_or_default();
+        let original_remaining_net_quote = task
+            .original_payload
+            .get("remaining_outcome_diagnostics")
+            .and_then(|value| value.get("net_quote"))
+            .and_then(|value| value.as_f64())
+            .unwrap_or_default();
+        let reconciled_remaining_net_quote = remaining_outcome_diagnostics
+            .as_ref()
+            .and_then(|value| value.get("net_quote"))
+            .and_then(|value| value.as_f64())
+            .unwrap_or_default();
+        let reconciled_closed_at_ms = long_leg.filled_at_ms.max(short_leg.filled_at_ms);
+
+        let mut payload = task.original_payload.clone();
+        let object = payload
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("final close reconciliation payload is not an object"))?;
+        object.insert("net_quote".to_string(), json!(reconciled_net_quote));
+        object.insert(
+            "realized_price_pnl_quote".to_string(),
+            json!(reconciled_realized_price_pnl_quote),
+        );
+        object.insert(
+            "total_exit_fee_quote".to_string(),
+            json!(reconciled_total_exit_fee_quote),
+        );
+        object.insert(
+            "long_exit_average_price".to_string(),
+            json!(long_leg.average_price),
+        );
+        object.insert(
+            "short_exit_average_price".to_string(),
+            json!(short_leg.average_price),
+        );
+        object.insert("long_exit_quantity".to_string(), json!(long_leg.quantity));
+        object.insert("short_exit_quantity".to_string(), json!(short_leg.quantity));
+        object.insert("closed_at_ms".to_string(), json!(reconciled_closed_at_ms));
+        object.insert(
+            "remaining_outcome_diagnostics".to_string(),
+            json!(remaining_outcome_diagnostics),
+        );
+        object.insert(
+            "remaining_loss_diagnostics".to_string(),
+            json!(remaining_loss_diagnostics),
+        );
+        object.insert(
+            "outcome_diagnostics".to_string(),
+            json!(outcome_diagnostics),
+        );
+        object.insert("loss_diagnostics".to_string(), json!(loss_diagnostics));
+        object.insert("long_leg".to_string(), json!(long_leg));
+        object.insert("short_leg".to_string(), json!(short_leg));
+        object.insert(
+            "reconciled_segment_realized_price_pnl_quote".to_string(),
+            json!(reconciled_segment_realized_price_pnl_quote),
+        );
+        object.insert(
+            "reconciled_segment_exit_fee_quote".to_string(),
+            json!(reconciled_segment_exit_fee_quote),
+        );
+        object.insert(
+            "reconciliation_delta_quote".to_string(),
+            json!(reconciled_net_quote - original_net_quote),
+        );
+        object.insert(
+            "remaining_reconciliation_delta_quote".to_string(),
+            json!(reconciled_remaining_net_quote - original_remaining_net_quote),
+        );
+        object.insert("reconciled_at_ms".to_string(), json!(wall_clock_now_ms()));
+        Ok(payload)
     }
 
     fn build_exit_outcome_diagnostics(
@@ -2953,24 +3672,15 @@ impl Engine {
             "loss_quote": (-realized_net_quote).max(0.0),
             "entry_total_funding_edge_bps": position.total_funding_edge_bps_entry,
             "current_total_funding_edge_bps": current_total_funding_edge_bps,
-            "expected_total_funding_quote": expected_total_funding_quote,
             "actual_funding_quote": actual_funding_quote,
             "funding_shortfall_quote": funding_shortfall_quote,
-            "funding_realized_quote": actual_funding_quote.max(0.0),
+            "realized_price_pnl_quote": realized_price_pnl_quote,
             "adverse_price_move_quote": adverse_price_move_quote,
             "favorable_price_move_quote": favorable_price_move_quote,
             "fee_drag_quote": fee_drag_quote,
-            "estimated_entry_impact_quote": estimated_entry_impact_quote,
             "funding_edge_narrowed_quote": funding_edge_narrowed_quote,
             "funding_edge_widened_quote": funding_edge_widened_quote,
             "entry_depth_capped_at_entry": position.entry_depth_capped_at_entry,
-            "entry_cross_bps_entry": position.entry_cross_bps_entry,
-            "entry_slippage_bps_entry": position.entry_slippage_bps_entry,
-            "fee_bps_entry": position.fee_bps_entry,
-            "expected_edge_bps_entry": position.expected_edge_bps_entry,
-            "worst_case_edge_bps_entry": position.worst_case_edge_bps_entry,
-            "funding_captured": position.funding_captured,
-            "second_stage_funding_captured": position.second_stage_funding_captured,
             "exit_reason": reason,
         }))
     }
@@ -2983,6 +3693,34 @@ impl Engine {
         let long_quote = market.symbol(position.long_venue, &position.symbol)?;
         let short_quote = market.symbol(position.short_venue, &position.symbol)?;
         Some((short_quote.funding_rate - long_quote.funding_rate) * 10_000.0)
+    }
+
+    fn compact_loss_diagnostics(
+        &self,
+        diagnostics: Option<&serde_json::Value>,
+    ) -> Option<serde_json::Value> {
+        let diagnostics = diagnostics?;
+        if diagnostics.get("outcome").and_then(|value| value.as_str()) != Some("loss") {
+            return None;
+        }
+
+        let mut payload = serde_json::Map::new();
+        for key in [
+            "segment_kind",
+            "outcome",
+            "primary_reason",
+            "contributing_reasons",
+            "net_quote",
+            "loss_quote",
+            "current_total_funding_edge_bps",
+            "entry_total_funding_edge_bps",
+            "exit_reason",
+        ] {
+            if let Some(value) = diagnostics.get(key) {
+                payload.insert(key.to_string(), value.clone());
+            }
+        }
+        Some(serde_json::Value::Object(payload))
     }
 
     async fn flatten_single_leg(
@@ -3050,13 +3788,35 @@ impl Engine {
             .and_then(|quote| quote.mark_price)
     }
 
+    fn order_notional_floor_reason(
+        &self,
+        venue: Venue,
+        request: &OrderRequest,
+    ) -> Option<(String, f64)> {
+        let exchange_min_notional_quote = self.adapters.get(&venue).and_then(|adapter| {
+            adapter.min_entry_notional_quote_hint(&request.symbol, request.price_hint)
+        });
+        let min_notional_quote = effective_entry_leg_notional_floor(
+            self.config.strategy.min_entry_leg_notional_quote,
+            exchange_min_notional_quote,
+        );
+        let reason = order_notional_floor_reason(
+            min_notional_quote,
+            request.price_hint,
+            request.quantity,
+            request.reduce_only,
+        )?;
+        Some((reason, min_notional_quote))
+    }
+
     fn entry_leg_notional_trace(&self, venue: Venue, request: &OrderRequest) -> serde_json::Value {
         let exchange_min_notional_quote = self.adapters.get(&venue).and_then(|adapter| {
             adapter.min_entry_notional_quote_hint(&request.symbol, request.price_hint)
         });
-        let venue_min_notional_quote = exchange_min_notional_quote
-            .unwrap_or_default()
-            .max(self.config.strategy.min_entry_leg_notional_quote.max(0.0));
+        let venue_min_notional_quote = effective_entry_leg_notional_floor(
+            self.config.strategy.min_entry_leg_notional_quote,
+            exchange_min_notional_quote,
+        );
         json!({
             "venue": venue,
             "normalized_quantity": request.quantity,
@@ -3071,14 +3831,17 @@ impl Engine {
         &self,
         legs: &[&EntryLegPlan],
     ) -> Option<(&'static str, Venue, f64, f64)> {
-        let min_notional = self.config.strategy.min_entry_leg_notional_quote.max(0.0);
-        if min_notional <= 0.0 {
-            return None;
-        }
-
         legs.iter().find_map(|leg| {
             let leg_notional = order_request_notional_quote(&leg.request)?;
-            if leg.request.reduce_only || leg_notional + 1e-9 >= min_notional {
+            let exchange_min_notional_quote = self.adapters.get(&leg.venue).and_then(|adapter| {
+                adapter.min_entry_notional_quote_hint(&leg.request.symbol, leg.request.price_hint)
+            });
+            let min_notional = effective_entry_leg_notional_floor(
+                self.config.strategy.min_entry_leg_notional_quote,
+                exchange_min_notional_quote,
+            );
+            if leg.request.reduce_only || min_notional <= 0.0 || leg_notional + 1e-9 >= min_notional
+            {
                 return None;
             }
             Some((leg.leg.entry_stage(), leg.venue, leg_notional, min_notional))
@@ -3192,12 +3955,9 @@ impl Engine {
                 }
             }
         }
-        if let Some(reason) = order_notional_floor_reason(
-            self.config.strategy.min_entry_leg_notional_quote,
-            request.price_hint,
-            request.quantity,
-            request.reduce_only,
-        ) {
+        if let Some((reason, min_notional_quote)) =
+            self.order_notional_floor_reason(venue, &request)
+        {
             self.log_event(
                 "execution.order_blocked",
                 &json!({
@@ -3211,6 +3971,7 @@ impl Engine {
                     "reduce_only": request.reduce_only,
                     "client_order_id": &request.client_order_id,
                     "reason": reason,
+                    "venue_min_notional_quote": min_notional_quote,
                 }),
             );
             return Err(anyhow!("order blocked: entry_leg_notional_below_minimum"));
@@ -3394,10 +4155,14 @@ impl Engine {
         Ok(true)
     }
 
-    fn apply_runtime_entry_guards(&mut self, candidates: &mut [CandidateOpportunity]) {
+    fn apply_runtime_entry_guards(
+        &mut self,
+        market: &MarketView,
+        candidates: &mut [CandidateOpportunity],
+    ) {
         for candidate in candidates.iter_mut() {
             let was_tradeable = candidate.is_tradeable();
-            if let Some(reason) = self.runtime_entry_gate_reason(candidate) {
+            if let Some(reason) = self.runtime_entry_gate_reason(market, candidate) {
                 if !candidate.blocked_reasons.iter().any(|item| item == &reason) {
                     candidate.blocked_reasons.push(reason.clone());
                     candidate.blocked_reasons.sort();
@@ -3419,7 +4184,14 @@ impl Engine {
         }
     }
 
-    fn runtime_entry_gate_reason(&self, candidate: &CandidateOpportunity) -> Option<String> {
+    fn runtime_entry_gate_reason(
+        &self,
+        market: &MarketView,
+        candidate: &CandidateOpportunity,
+    ) -> Option<String> {
+        if let Some(reason) = self.runtime_entry_quote_freshness_reason(market, candidate) {
+            return Some(reason);
+        }
         if candidate.long_venue == Venue::Hyperliquid || candidate.short_venue == Venue::Hyperliquid
         {
             if let Some(samples) = self.recent_submit_ack_ms.get(&Venue::Hyperliquid) {
@@ -3445,6 +4217,36 @@ impl Engine {
         self.venue_entry_cooldown_reason(candidate.long_venue)
             .or_else(|| self.venue_entry_cooldown_reason(candidate.short_venue))
             .or_else(|| self.cached_entry_balance_reason(candidate))
+    }
+
+    fn runtime_entry_quote_freshness_reason(
+        &self,
+        market: &MarketView,
+        candidate: &CandidateOpportunity,
+    ) -> Option<String> {
+        if !matches!(self.config.runtime.mode, crate::config::RuntimeMode::Live) {
+            return None;
+        }
+        let max_order_quote_age_ms = self.config.runtime.max_order_quote_age_ms;
+        if max_order_quote_age_ms <= 0 {
+            return None;
+        }
+        let hard_block_quote_age_ms = max_order_quote_age_ms.saturating_mul(3);
+        if hard_block_quote_age_ms <= 0 {
+            return None;
+        }
+
+        for venue in [candidate.long_venue, candidate.short_venue] {
+            let observed_at_ms = market.observed_at_ms(venue)?;
+            let age_ms = wall_clock_now_ms().saturating_sub(observed_at_ms);
+            if age_ms > hard_block_quote_age_ms {
+                return Some(format!(
+                    "entry_quote_stale:{venue}:{age_ms}>{hard_block_quote_age_ms}"
+                ));
+            }
+        }
+
+        None
     }
 
     fn record_submit_ack_latency(&mut self, venue: Venue, submit_ack_ms: u64) {
@@ -3868,6 +4670,15 @@ fn order_request_notional_quote(request: &OrderRequest) -> Option<f64> {
         .map(|price| request.quantity.max(0.0) * price)
 }
 
+fn effective_entry_leg_notional_floor(
+    global_min_entry_leg_notional_quote: f64,
+    exchange_min_notional_quote: Option<f64>,
+) -> f64 {
+    global_min_entry_leg_notional_quote
+        .max(0.0)
+        .max(exchange_min_notional_quote.unwrap_or_default())
+}
+
 fn order_notional_floor_reason(
     min_entry_leg_notional_quote: f64,
     price_hint: Option<f64>,
@@ -4241,6 +5052,53 @@ fn recover_open_positions_from_journal(journal: &JsonlJournal) -> Result<Vec<Ope
     Ok(open_positions.into_values().collect())
 }
 
+fn close_leg_record(
+    venue: Venue,
+    side: Side,
+    fill: &crate::models::OrderFill,
+    client_order_id: &str,
+) -> CloseLegRecord {
+    CloseLegRecord {
+        venue,
+        side,
+        order_id: fill.order_id.clone(),
+        client_order_id: client_order_id.to_string(),
+        quantity: fill.quantity,
+        average_price: fill.average_price,
+        fee_quote: fill.fee_quote,
+        filled_at_ms: fill.filled_at_ms,
+    }
+}
+
+fn reconciled_exit_fee_quote(
+    original: &CloseLegRecord,
+    reconciled: &OrderFillReconciliation,
+) -> f64 {
+    reconciled.fee_quote.unwrap_or(original.fee_quote)
+}
+
+fn realized_price_pnl_quote_from_reconciled_legs(
+    position: &OpenPosition,
+    long_leg: &OrderFillReconciliation,
+    short_leg: &OrderFillReconciliation,
+) -> f64 {
+    (long_leg.average_price - position.long_entry_price) * long_leg.quantity
+        + (position.short_entry_price - short_leg.average_price) * short_leg.quantity
+}
+
+fn close_reconciliation_kind_rank(kind: CloseReconciliationKind) -> u8 {
+    match kind {
+        CloseReconciliationKind::Partial => 0,
+        CloseReconciliationKind::Final => 1,
+    }
+}
+
+fn close_reconciliation_retry_delay_ms(attempt_count: u32) -> i64 {
+    let exponent = attempt_count.saturating_sub(1).min(4);
+    let multiplier = 1_i64 << exponent;
+    (CLOSE_RECONCILIATION_RETRY_BASE_MS * multiplier).min(CLOSE_RECONCILIATION_RETRY_MAX_MS)
+}
+
 fn count_strings(items: impl IntoIterator<Item = String>) -> BTreeMap<String, usize> {
     let mut counts = BTreeMap::new();
     for item in items {
@@ -4261,10 +5119,10 @@ mod tests {
     use anyhow::anyhow;
 
     use super::{
-        cached_flat_guard_reason, compact_client_order_id, hyperliquid_entry_gate_reason,
-        order_error_may_have_created_exposure, order_quote_expired_reason, persistent_state_view,
-        should_probe_live_recovery, venue_order_health_risk_score, EngineMode, EngineState,
-        VenueOrderHealthSample,
+        cached_flat_guard_reason, compact_client_order_id, effective_entry_leg_notional_floor,
+        hyperliquid_entry_gate_reason, order_error_may_have_created_exposure,
+        order_quote_expired_reason, persistent_state_view, should_probe_live_recovery,
+        venue_order_health_risk_score, EngineMode, EngineState, VenueOrderHealthSample,
     };
     use crate::models::{PositionSnapshot, Venue};
 
@@ -4290,6 +5148,7 @@ mod tests {
             open_position: None,
             last_error: None,
             venue_health: BTreeMap::new(),
+            pending_close_reconciliations: Vec::new(),
         };
 
         let persisted = persistent_state_view(&state);
@@ -4357,6 +5216,13 @@ mod tests {
         assert!(order_quote_expired_reason(6_000, Some(observed_at_ms), false).is_none());
         assert!(order_quote_expired_reason(6_000, Some(observed_at_ms), true).is_none());
         assert!(order_quote_expired_reason(6_000, None, false).is_none());
+    }
+
+    #[test]
+    fn effective_entry_leg_notional_floor_prefers_exchange_floor_when_higher() {
+        assert_eq!(effective_entry_leg_notional_floor(8.0, None), 8.0);
+        assert_eq!(effective_entry_leg_notional_floor(8.0, Some(5.0)), 8.0);
+        assert_eq!(effective_entry_leg_notional_floor(8.0, Some(10.0)), 10.0);
     }
 
     #[test]

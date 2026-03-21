@@ -4,7 +4,10 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 
 use crate::{
-    models::{OrderFill, OrderRequest, PositionSnapshot, Side, Venue, VenueMarketSnapshot},
+    models::{
+        AccountBalanceSnapshot, OrderFill, OrderRequest, PositionSnapshot, Side, Venue,
+        VenueMarketSnapshot,
+    },
     venue::VenueAdapter,
 };
 
@@ -23,6 +26,7 @@ pub struct ScriptedVenueAdapter {
     venue: Venue,
     taker_fee_bps: f64,
     min_notional_quote_hint: Option<f64>,
+    balance_snapshot: Option<AccountBalanceSnapshot>,
     inner: Mutex<Inner>,
 }
 
@@ -32,6 +36,7 @@ impl ScriptedVenueAdapter {
             venue,
             taker_fee_bps,
             min_notional_quote_hint: None,
+            balance_snapshot: None,
             inner: Mutex::new(Inner {
                 snapshots,
                 cursor: 0,
@@ -53,6 +58,22 @@ impl ScriptedVenueAdapter {
 
     pub fn with_min_notional_quote_hint(mut self, min_notional_quote_hint: f64) -> Self {
         self.min_notional_quote_hint = Some(min_notional_quote_hint);
+        self
+    }
+
+    pub fn with_balance_snapshot(
+        mut self,
+        equity_quote: f64,
+        wallet_balance_quote: Option<f64>,
+        available_balance_quote: Option<f64>,
+    ) -> Self {
+        self.balance_snapshot = Some(AccountBalanceSnapshot {
+            venue: self.venue,
+            equity_quote,
+            wallet_balance_quote,
+            available_balance_quote,
+            observed_at_ms: 0,
+        });
         self
     }
 
@@ -189,6 +210,10 @@ impl VenueAdapter for ScriptedVenueAdapter {
             size: inner.positions.get(symbol).copied().unwrap_or_default(),
             updated_at_ms: observed_at_ms,
         })
+    }
+
+    async fn fetch_account_balance_snapshot(&self) -> Result<Option<AccountBalanceSnapshot>> {
+        Ok(self.balance_snapshot.clone())
     }
 
     async fn normalize_quantity(&self, _symbol: &str, quantity: f64) -> Result<f64> {

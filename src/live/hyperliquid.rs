@@ -41,8 +41,8 @@ use tracing::warn;
 use crate::{
     config::{RuntimeConfig, VenueConfig},
     models::{
-        OrderExecutionTiming, OrderFill, OrderRequest, PositionSnapshot, Side,
-        SymbolMarketSnapshot, Venue, VenueMarketSnapshot,
+        AccountBalanceSnapshot, OrderExecutionTiming, OrderFill, OrderFillReconciliation,
+        OrderRequest, PositionSnapshot, Side, SymbolMarketSnapshot, Venue, VenueMarketSnapshot,
     },
     venue::VenueAdapter,
 };
@@ -570,16 +570,18 @@ impl HyperliquidLiveAdapter {
                     .and_then(|data| data.statuses.into_iter().next())
                     .ok_or_else(|| anyhow!("hyperliquid order response missing status"))?;
                 match status {
-                    ExchangeDataStatus::Filled(order) => Ok(HyperliquidOrderOutcome::Resolved(
-                        order.oid.to_string(),
-                        parse_f64(&order.avg_px).unwrap_or(fallback_price),
-                        parse_f64(&order.total_sz).unwrap_or(fallback_qty),
-                    )),
-                    ExchangeDataStatus::Resting(order) => Ok(HyperliquidOrderOutcome::Resolved(
-                        order.oid.to_string(),
-                        fallback_price,
-                        fallback_qty,
-                    )),
+                    ExchangeDataStatus::Filled(order) => Ok(HyperliquidOrderOutcome::Resolved {
+                        order_id: order.oid.to_string(),
+                        average_price: parse_f64(&order.avg_px).unwrap_or(fallback_price),
+                        quantity: parse_f64(&order.total_sz).unwrap_or(fallback_qty),
+                        private_fill_wait_optional: true,
+                    }),
+                    ExchangeDataStatus::Resting(order) => Ok(HyperliquidOrderOutcome::Resolved {
+                        order_id: order.oid.to_string(),
+                        average_price: fallback_price,
+                        quantity: fallback_qty,
+                        private_fill_wait_optional: false,
+                    }),
                     ExchangeDataStatus::Success
                     | ExchangeDataStatus::WaitingForFill
                     | ExchangeDataStatus::WaitingForTrigger => Ok(HyperliquidOrderOutcome::Pending),
@@ -640,7 +642,7 @@ impl HyperliquidLiveAdapter {
         limit_px: f64,
         quantity: f64,
         cloid: Option<String>,
-    ) -> Result<ExchangeResponseStatus> {
+    ) -> Result<HyperliquidOrderResponseWithTiming> {
         let asset_index = self
             .exchange_client
             .coin_to_asset
@@ -662,6 +664,7 @@ impl HyperliquidLiveAdapter {
             grouping: "na".to_string(),
             builder: None,
         });
+        let sign_started_at = Instant::now();
         let nonce = next_hyperliquid_nonce();
         let connection_id =
             hyperliquid_action_connection_id(&action, nonce, self.exchange_client.vault_address)?;
@@ -670,15 +673,53 @@ impl HyperliquidLiveAdapter {
             connection_id,
             !self.config.live.is_testnet,
         )?;
+        let action_payload = serde_json::to_value(action.clone())
+            .context("failed to serialize hyperliquid action")?;
+        let request_sign_ms = elapsed_ms(sign_started_at);
 
-        self.order_ws
+        match self
+            .order_ws
             .post_action(
-                serde_json::to_value(action).context("failed to serialize hyperliquid action")?,
+                action_payload.clone(),
                 nonce,
                 signature,
                 self.exchange_client.vault_address,
             )
             .await
+        {
+            Ok(response) => Ok(HyperliquidOrderResponseWithTiming {
+                response,
+                request_sign_ms,
+            }),
+            Err(error) if should_retry_hyperliquid_duplicate_nonce(&error) => {
+                tokio::time::sleep(tokio::time::Duration::from_millis(2)).await;
+                let retry_sign_started_at = Instant::now();
+                let retry_nonce = next_hyperliquid_nonce();
+                let retry_connection_id = hyperliquid_action_connection_id(
+                    &action,
+                    retry_nonce,
+                    self.exchange_client.vault_address,
+                )?;
+                let retry_signature = sign_hyperliquid_l1_action(
+                    &self.exchange_client.wallet,
+                    retry_connection_id,
+                    !self.config.live.is_testnet,
+                )?;
+                self.order_ws
+                    .post_action(
+                        action_payload,
+                        retry_nonce,
+                        retry_signature,
+                        self.exchange_client.vault_address,
+                    )
+                    .await
+                    .map(|response| HyperliquidOrderResponseWithTiming {
+                        response,
+                        request_sign_ms: elapsed_ms(retry_sign_started_at),
+                    })
+            }
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -770,6 +811,10 @@ impl VenueAdapter for HyperliquidLiveAdapter {
         let timing = Some(OrderExecutionTiming {
             quote_resolve_ms: Some(quote_resolve_ms),
             order_prepare_ms: Some(order_prepare_ms),
+            request_sign_ms: Some(response.request_sign_ms),
+            submit_http_ms: None,
+            response_decode_ms: None,
+            private_fill_wait_ms: None,
             submit_ack_ms: Some(submit_ack_ms),
         });
         let mut fill = OrderFill {
@@ -783,26 +828,46 @@ impl VenueAdapter for HyperliquidLiveAdapter {
             filled_at_ms,
             timing,
         };
-        match self.decode_response(response, fallback_price, request.quantity)? {
-            HyperliquidOrderOutcome::Resolved(order_id, average_price, quantity) => {
+        let outcome = self.decode_response(response.response, fallback_price, request.quantity)?;
+        match outcome {
+            HyperliquidOrderOutcome::Resolved {
+                order_id,
+                average_price,
+                quantity,
+                private_fill_wait_optional,
+            } => {
                 fill.order_id = order_id.clone();
                 fill.average_price = average_price;
                 fill.quantity = quantity;
                 fill.fee_quote =
                     estimate_fee_quote(average_price, quantity, self.config.taker_fee_bps);
+                let private_fill_wait_ms = hyperliquid_private_fill_wait_ms(
+                    &HyperliquidOrderOutcome::Resolved {
+                        order_id: order_id.clone(),
+                        average_price,
+                        quantity,
+                        private_fill_wait_optional,
+                    },
+                    self.config.live.post_ack_private_fill_wait_ms,
+                );
+                let private_fill_wait_started_at = Instant::now();
                 if let Some(private_fill) = lookup_or_wait_private_order(
                     &self.private_ws,
                     Some(wire_cloid.as_str()),
                     Some(order_id.as_str()),
-                    self.config.live.post_ack_private_fill_wait_ms,
+                    private_fill_wait_ms,
                 )
                 .await
                 {
                     fill = enrich_fill_from_private(fill, &private_fill);
                 }
+                if let Some(timing) = fill.timing.as_mut() {
+                    timing.private_fill_wait_ms = Some(elapsed_ms(private_fill_wait_started_at));
+                }
                 Ok(fill)
             }
             HyperliquidOrderOutcome::Pending => {
+                let private_fill_wait_started_at = Instant::now();
                 if let Some(private_fill) = lookup_or_wait_private_order(
                     &self.private_ws,
                     Some(wire_cloid.as_str()),
@@ -811,7 +876,15 @@ impl VenueAdapter for HyperliquidLiveAdapter {
                 )
                 .await
                 {
-                    return Ok(enrich_fill_from_private(fill, &private_fill));
+                    fill = enrich_fill_from_private(fill, &private_fill);
+                    if let Some(timing) = fill.timing.as_mut() {
+                        timing.private_fill_wait_ms =
+                            Some(elapsed_ms(private_fill_wait_started_at));
+                    }
+                    return Ok(fill);
+                }
+                if let Some(timing) = fill.timing.as_mut() {
+                    timing.private_fill_wait_ms = Some(elapsed_ms(private_fill_wait_started_at));
                 }
                 Err(anyhow!(
                     "hyperliquid order status uncertain after pending ack"
@@ -867,6 +940,70 @@ impl VenueAdapter for HyperliquidLiveAdapter {
         })
     }
 
+    async fn fetch_account_balance_snapshot(&self) -> Result<Option<AccountBalanceSnapshot>> {
+        let user_state = self
+            .info_client
+            .user_state(self.account_address)
+            .await
+            .context("failed to query hyperliquid user state")?;
+        Ok(Some(AccountBalanceSnapshot {
+            venue: Venue::Hyperliquid,
+            equity_quote: parse_f64(&user_state.margin_summary.account_value)?,
+            wallet_balance_quote: Some(parse_f64(&user_state.cross_margin_summary.account_value)?),
+            available_balance_quote: Some(parse_f64(&user_state.withdrawable)?),
+            observed_at_ms: now_ms(),
+        }))
+    }
+
+    async fn fetch_order_fill_reconciliation(
+        &self,
+        symbol: &str,
+        order_id: &str,
+        _client_order_id: Option<&str>,
+    ) -> Result<Option<OrderFillReconciliation>> {
+        let parsed_order_id = order_id
+            .parse::<u64>()
+            .with_context(|| format!("invalid hyperliquid order id {order_id}"))?;
+        let asset = venue_symbol(&self.config, symbol);
+        let fills = self
+            .info_client
+            .user_fills(self.account_address)
+            .await
+            .context("failed to query hyperliquid user fills")?;
+        let matched = fills
+            .into_iter()
+            .filter(|fill| fill.oid == parsed_order_id && fill.coin == asset)
+            .collect::<Vec<_>>();
+        if matched.is_empty() {
+            return Ok(None);
+        }
+
+        let mut total_quantity = 0.0;
+        let mut weighted_notional = 0.0;
+        let mut total_fee_quote = 0.0;
+        let mut latest_fill_ms = 0_i64;
+        for fill in matched {
+            let quantity = parse_f64(&fill.sz)?;
+            let price = parse_f64(&fill.px)?;
+            total_quantity += quantity;
+            weighted_notional += price * quantity;
+            total_fee_quote += parse_f64(&fill.fee)?.abs();
+            latest_fill_ms = latest_fill_ms.max(fill.time.min(i64::MAX as u64) as i64);
+        }
+        if total_quantity <= 0.0 {
+            return Ok(None);
+        }
+
+        Ok(Some(OrderFillReconciliation {
+            order_id: order_id.to_string(),
+            client_order_id: None,
+            quantity: total_quantity,
+            average_price: weighted_notional / total_quantity,
+            fee_quote: Some(total_fee_quote).filter(|value| *value > 0.0),
+            filled_at_ms: latest_fill_ms.max(now_ms()),
+        }))
+    }
+
     async fn normalize_quantity(&self, symbol: &str, quantity: f64) -> Result<f64> {
         let asset = venue_symbol(&self.config, symbol);
         let asset_meta = self.asset_meta(&asset).await?;
@@ -879,6 +1016,10 @@ impl VenueAdapter for HyperliquidLiveAdapter {
         _price_hint: Option<f64>,
     ) -> Option<f64> {
         Some(HYPERLIQUID_MIN_NOTIONAL_QUOTE)
+    }
+
+    async fn live_startup_prewarm(&self) -> Result<()> {
+        self.order_ws.prewarm().await
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -916,8 +1057,31 @@ fn prune_hyperliquid_symbol_catalog_entry(
 }
 
 enum HyperliquidOrderOutcome {
-    Resolved(String, f64, f64),
+    Resolved {
+        order_id: String,
+        average_price: f64,
+        quantity: f64,
+        private_fill_wait_optional: bool,
+    },
     Pending,
+}
+
+fn hyperliquid_private_fill_wait_ms(
+    outcome: &HyperliquidOrderOutcome,
+    configured_wait_ms: u64,
+) -> u64 {
+    match outcome {
+        HyperliquidOrderOutcome::Resolved {
+            private_fill_wait_optional: true,
+            ..
+        } => 0,
+        _ => configured_wait_ms,
+    }
+}
+
+struct HyperliquidOrderResponseWithTiming {
+    response: ExchangeResponseStatus,
+    request_sign_ms: u64,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -1056,6 +1220,19 @@ impl HyperliquidWsPostClient {
         }
 
         Err(anyhow!("hyperliquid ws post request exhausted retries"))
+    }
+
+    async fn prewarm(&self) -> Result<()> {
+        let mut state = self.state.lock().await;
+        if should_refresh_ws_connection(state.last_used_at) {
+            state.socket = None;
+            state.last_used_at = None;
+        }
+        if state.socket.is_none() {
+            state.socket = Some(connect_hyperliquid_ws(&self.url).await?);
+        }
+        state.last_used_at = Some(TokioInstant::now());
+        Ok(())
     }
 
     async fn shutdown(&self) {
@@ -1237,6 +1414,11 @@ fn next_hyperliquid_nonce() -> u64 {
     }
 }
 
+fn should_retry_hyperliquid_duplicate_nonce(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("invalid nonce") && message.contains("duplicate nonce")
+}
+
 fn hyperliquid_action_connection_id(
     action: &HyperliquidAction,
     nonce: u64,
@@ -1401,6 +1583,7 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::str::FromStr;
 
+    use anyhow::anyhow;
     use ethers::types::H256;
     use hyperliquid_rust_sdk::ExchangeResponseStatus;
     use serde_json::json;
@@ -1409,8 +1592,10 @@ mod tests {
 
     use super::{
         decode_ws_post_action_response, encode_ws_post_order_request,
-        hyperliquid_cloid_for_client_order, ioc_order_params_from_reference_price,
-        prune_hyperliquid_symbol_catalog_entry, sign_hyperliquid_l1_action, HyperliquidAssetMeta,
+        hyperliquid_cloid_for_client_order, hyperliquid_private_fill_wait_ms,
+        ioc_order_params_from_reference_price, prune_hyperliquid_symbol_catalog_entry,
+        should_retry_hyperliquid_duplicate_nonce, sign_hyperliquid_l1_action, HyperliquidAssetMeta,
+        HyperliquidOrderOutcome,
     };
 
     #[test]
@@ -1427,6 +1612,29 @@ mod tests {
             ioc_order_params_from_reference_price(Side::Sell, 0.011, 3, 4, Some(0.0), 2142.89);
         assert_eq!(limit_px, 2121.5);
         assert_eq!(quantity, 0.011);
+    }
+
+    #[test]
+    fn private_fill_wait_is_skipped_only_for_ack_filled_orders() {
+        let filled = HyperliquidOrderOutcome::Resolved {
+            order_id: "1".to_string(),
+            average_price: 1100.0,
+            quantity: 0.2,
+            private_fill_wait_optional: true,
+        };
+        let resting = HyperliquidOrderOutcome::Resolved {
+            order_id: "2".to_string(),
+            average_price: 1100.0,
+            quantity: 0.2,
+            private_fill_wait_optional: false,
+        };
+
+        assert_eq!(hyperliquid_private_fill_wait_ms(&filled, 120), 0);
+        assert_eq!(hyperliquid_private_fill_wait_ms(&resting, 120), 120);
+        assert_eq!(
+            hyperliquid_private_fill_wait_ms(&HyperliquidOrderOutcome::Pending, 120),
+            120
+        );
     }
 
     #[test]
@@ -1575,6 +1783,16 @@ mod tests {
             cloid,
             hyperliquid_cloid_for_client_order("pos-1-entry-long")
         );
+    }
+
+    #[test]
+    fn duplicate_nonce_errors_are_retryable() {
+        assert!(should_retry_hyperliquid_duplicate_nonce(&anyhow!(
+            "hyperliquid order error: Invalid nonce: duplicate nonce"
+        )));
+        assert!(!should_retry_hyperliquid_duplicate_nonce(&anyhow!(
+            "hyperliquid order error: Order must have minimum value of $10. asset=103"
+        )));
     }
 
     #[test]

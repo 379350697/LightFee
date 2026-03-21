@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     sync::{Arc, Mutex},
+    time::Instant,
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -18,8 +19,9 @@ use tracing::{debug, warn};
 use crate::{
     config::{RuntimeConfig, VenueConfig},
     models::{
-        AssetTransferStatus, OrderFill, OrderRequest, PositionSnapshot, Side, SymbolMarketSnapshot,
-        Venue, VenueMarketSnapshot,
+        AccountBalanceSnapshot, AssetTransferStatus, OrderExecutionTiming, OrderFill,
+        OrderFillReconciliation, OrderRequest, PositionSnapshot, Side, SymbolMarketSnapshot, Venue,
+        VenueMarketSnapshot,
     },
     resilience::FailureBackoff,
     venue::VenueAdapter,
@@ -599,13 +601,14 @@ impl BybitLiveAdapter {
         })
     }
 
-    async fn submit_order(
+    async fn submit_order_once(
         &self,
         request: &OrderRequest,
         meta: &BybitInstrumentMeta,
         quantity: f64,
         position_mode: BybitPositionMode,
-    ) -> Result<BybitApiResponse<BybitOrderResult>> {
+    ) -> Result<BybitOrderResponseWithTiming> {
+        let sign_started_at = Instant::now();
         let body = serde_json::json!({
             "category": "linear",
             "symbol": venue_symbol(&self.config, &request.symbol),
@@ -620,11 +623,61 @@ impl BybitLiveAdapter {
             "orderLinkId": request.client_order_id,
         })
         .to_string();
-        self.signed_request(reqwest::Method::POST, "/v5/order/create", None, Some(body))
-            .await?
+        let api_key = self
+            .config
+            .live
+            .resolved_api_key()
+            .ok_or_else(|| anyhow!("bybit api key is not configured"))?;
+        let api_secret = self
+            .config
+            .live
+            .resolved_api_secret()
+            .ok_or_else(|| anyhow!("bybit api secret is not configured"))?;
+        let timestamp = self.server_timestamp_ms().await?.to_string();
+        let recv_window = "5000".to_string();
+        let signature = hmac_sha256_hex(
+            &api_secret,
+            &format!("{timestamp}{api_key}{recv_window}{body}"),
+        )?;
+        let request_sign_ms = elapsed_ms(sign_started_at);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("X-BAPI-API-KEY", HeaderValue::from_str(&api_key)?);
+        headers.insert("X-BAPI-SIGN", HeaderValue::from_str(&signature)?);
+        headers.insert("X-BAPI-TIMESTAMP", HeaderValue::from_str(&timestamp)?);
+        headers.insert("X-BAPI-RECV-WINDOW", HeaderValue::from_str(&recv_window)?);
+        headers.insert("Content-Type", HeaderValue::from_static("application/json"));
+
+        let submit_started_at = Instant::now();
+        let response = self
+            .client
+            .request(
+                reqwest::Method::POST,
+                format!("{}{}", self.base_url, "/v5/order/create"),
+            )
+            .headers(headers)
+            .body(body)
+            .send()
+            .await
+            .context("failed to send signed bybit request")?;
+        let submit_http_ms = elapsed_ms(submit_started_at);
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(format_bybit_http_error(status, &body));
+        }
+        let decode_started_at = Instant::now();
+        let response = response
             .json::<BybitApiResponse<BybitOrderResult>>()
             .await
-            .context("failed to decode bybit order response")
+            .context("failed to decode bybit order response")?;
+        let response_decode_ms = elapsed_ms(decode_started_at);
+        Ok(BybitOrderResponseWithTiming {
+            response,
+            request_sign_ms,
+            submit_http_ms,
+            response_decode_ms,
+        })
     }
 
     async fn signed_request(
@@ -809,38 +862,49 @@ impl VenueAdapter for BybitLiveAdapter {
     }
 
     async fn place_order(&self, request: OrderRequest) -> Result<OrderFill> {
+        let order_prepare_started_at = Instant::now();
         let meta = self.symbol_meta(&request.symbol).await?;
         ensure_bybit_order_link_id(&request.client_order_id)?;
         let quantity = floor_to_step(request.quantity, meta.qty_step);
         validate_bybit_order_request(&meta, &request.symbol, quantity, request.price_hint)?;
+        let order_prepare_ms = elapsed_ms(order_prepare_started_at);
 
         let initial_mode = self.position_mode();
+        let submit_started_at = Instant::now();
         let mut response = self
-            .submit_order(&request, &meta, quantity, initial_mode)
+            .submit_order_once(&request, &meta, quantity, initial_mode)
             .await?;
-        if response.ret_code != 0
-            && bybit_position_mode_retry_allowed(response.ret_code, &response.ret_msg)
+        if response.response.ret_code != 0
+            && bybit_position_mode_retry_allowed(
+                response.response.ret_code,
+                &response.response.ret_msg,
+            )
         {
             let fallback_mode = initial_mode.alternate();
             let fallback_response = self
-                .submit_order(&request, &meta, quantity, fallback_mode)
+                .submit_order_once(&request, &meta, quantity, fallback_mode)
                 .await?;
-            if fallback_response.ret_code == 0 {
+            if fallback_response.response.ret_code == 0 {
                 self.position_mode
                     .lock()
                     .expect("lock")
                     .replace(fallback_mode);
-                response = fallback_response;
+                response.request_sign_ms += fallback_response.request_sign_ms;
+                response.submit_http_ms += fallback_response.submit_http_ms;
+                response.response_decode_ms += fallback_response.response_decode_ms;
+                response.response = fallback_response.response;
             }
         }
-        if response.ret_code != 0 {
+        let submit_ack_ms = elapsed_ms(submit_started_at);
+        if response.response.ret_code != 0 {
             return Err(format_bybit_api_error(
                 "bybit order failed",
-                response.ret_code,
-                &response.ret_msg,
+                response.response.ret_code,
+                &response.response.ret_msg,
             ));
         }
         let order_id = response
+            .response
             .result
             .and_then(|result| result.order_id)
             .unwrap_or_else(|| "bybit-unknown".to_string());
@@ -863,8 +927,17 @@ impl VenueAdapter for BybitLiveAdapter {
             fee_quote: estimate_fee_quote(average_price, quantity, self.config.taker_fee_bps),
             order_id: order_id.clone(),
             filled_at_ms,
-            timing: None,
+            timing: Some(OrderExecutionTiming {
+                quote_resolve_ms: None,
+                order_prepare_ms: Some(order_prepare_ms),
+                request_sign_ms: Some(response.request_sign_ms),
+                submit_http_ms: Some(response.submit_http_ms),
+                response_decode_ms: Some(response.response_decode_ms),
+                private_fill_wait_ms: None,
+                submit_ack_ms: Some(submit_ack_ms),
+            }),
         };
+        let private_fill_wait_started_at = Instant::now();
         if let Some(private_fill) = lookup_or_wait_private_order(
             &self.private_ws,
             Some(&request.client_order_id),
@@ -874,6 +947,9 @@ impl VenueAdapter for BybitLiveAdapter {
         .await
         {
             fill = enrich_fill_from_private(fill, &private_fill);
+        }
+        if let Some(timing) = fill.timing.as_mut() {
+            timing.private_fill_wait_ms = Some(elapsed_ms(private_fill_wait_started_at));
         }
         Ok(fill)
     }
@@ -973,6 +1049,107 @@ impl VenueAdapter for BybitLiveAdapter {
         })
     }
 
+    async fn fetch_account_balance_snapshot(&self) -> Result<Option<AccountBalanceSnapshot>> {
+        let query = build_query(&[("accountType", "UNIFIED".to_string())]);
+        let response = self
+            .signed_request(
+                reqwest::Method::GET,
+                "/v5/account/wallet-balance",
+                Some(query),
+                None,
+            )
+            .await?
+            .json::<BybitApiResponse<BybitWalletBalanceResult>>()
+            .await
+            .context("failed to decode bybit wallet balance")?;
+        if response.ret_code != 0 {
+            return Err(format_bybit_api_error(
+                "bybit wallet balance failed",
+                response.ret_code,
+                &response.ret_msg,
+            ));
+        }
+        let row = response
+            .result
+            .and_then(|result| result.list.into_iter().next())
+            .ok_or_else(|| anyhow!("bybit wallet balance missing row"))?;
+
+        Ok(Some(AccountBalanceSnapshot {
+            venue: Venue::Bybit,
+            equity_quote: parse_f64(&row.total_equity)?,
+            wallet_balance_quote: Some(parse_f64(&row.total_wallet_balance)?),
+            available_balance_quote: row
+                .total_available_balance
+                .as_deref()
+                .map(parse_f64)
+                .transpose()?,
+            observed_at_ms: now_ms(),
+        }))
+    }
+
+    async fn fetch_order_fill_reconciliation(
+        &self,
+        symbol: &str,
+        order_id: &str,
+        _client_order_id: Option<&str>,
+    ) -> Result<Option<OrderFillReconciliation>> {
+        let query = build_query(&[
+            ("category", "linear".to_string()),
+            ("symbol", venue_symbol(&self.config, symbol)),
+            ("orderId", order_id.to_string()),
+        ]);
+        let response = self
+            .signed_request(
+                reqwest::Method::GET,
+                "/v5/execution/list",
+                Some(query),
+                None,
+            )
+            .await?
+            .json::<BybitApiResponse<BybitExecutionList>>()
+            .await
+            .context("failed to decode bybit execution reconciliation")?;
+        if response.ret_code != 0 {
+            return Err(format_bybit_api_error(
+                "bybit execution reconciliation failed",
+                response.ret_code,
+                &response.ret_msg,
+            ));
+        }
+        let executions = response
+            .result
+            .map(|result| result.list)
+            .unwrap_or_default();
+        if executions.is_empty() {
+            return Ok(None);
+        }
+
+        let mut total_quantity = 0.0;
+        let mut weighted_notional = 0.0;
+        let mut total_fee_quote = 0.0;
+        let mut latest_fill_ms = 0_i64;
+        for execution in executions {
+            let quantity = parse_f64(&execution.exec_qty)?;
+            let price = parse_f64(&execution.exec_price)?;
+            total_quantity += quantity;
+            weighted_notional += price * quantity;
+            total_fee_quote += parse_f64(&execution.exec_fee)?.abs();
+            latest_fill_ms = latest_fill_ms.max(parse_i64(&execution.exec_time)?);
+        }
+        if total_quantity <= 0.0 {
+            return Ok(None);
+        }
+
+        Ok(Some(OrderFillReconciliation {
+            order_id: order_id.to_string(),
+            client_order_id: None,
+            quantity: total_quantity,
+            average_price: weighted_notional / total_quantity,
+            fee_quote: Some(total_fee_quote).filter(|value| *value > 0.0),
+            filled_at_ms: latest_fill_ms.max(now_ms()),
+        }))
+    }
+
     async fn normalize_quantity(&self, symbol: &str, quantity: f64) -> Result<f64> {
         let meta = self.symbol_meta(symbol).await?;
         Ok(floor_to_step(quantity, meta.qty_step))
@@ -1033,6 +1210,11 @@ impl VenueAdapter for BybitLiveAdapter {
             .expect("lock")
             .replace(cache);
         Ok(statuses)
+    }
+
+    async fn live_startup_prewarm(&self) -> Result<()> {
+        let _ = self.server_timestamp_ms().await?;
+        Ok(())
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -1499,6 +1681,14 @@ struct BybitOrderResult {
     order_id: Option<String>,
 }
 
+#[derive(Debug)]
+struct BybitOrderResponseWithTiming {
+    response: BybitApiResponse<BybitOrderResult>,
+    request_sign_ms: u64,
+    submit_http_ms: u64,
+    response_decode_ms: u64,
+}
+
 #[derive(Debug, Deserialize)]
 struct BybitPositionList {
     #[serde(default)]
@@ -1511,6 +1701,24 @@ struct BybitPosition {
     side: Option<String>,
     #[serde(rename = "positionIdx")]
     position_idx: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BybitExecutionList {
+    #[serde(default)]
+    list: Vec<BybitExecution>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BybitExecution {
+    #[serde(rename = "execQty")]
+    exec_qty: String,
+    #[serde(rename = "execPrice")]
+    exec_price: String,
+    #[serde(rename = "execFee")]
+    exec_fee: String,
+    #[serde(rename = "execTime")]
+    exec_time: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1532,6 +1740,26 @@ struct BybitCoinChain {
     chain_deposit: String,
     #[serde(rename = "chainWithdraw")]
     chain_withdraw: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BybitWalletBalanceResult {
+    #[serde(default)]
+    list: Vec<BybitWalletBalance>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BybitWalletBalance {
+    #[serde(rename = "totalEquity")]
+    total_equity: String,
+    #[serde(rename = "totalWalletBalance")]
+    total_wallet_balance: String,
+    #[serde(rename = "totalAvailableBalance")]
+    total_available_balance: Option<String>,
+}
+
+fn elapsed_ms(started_at: Instant) -> u64 {
+    started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

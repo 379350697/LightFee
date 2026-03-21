@@ -452,7 +452,7 @@ fn adapter(adapters: &[Arc<dyn VenueAdapter>], venue: Venue) -> Result<Arc<dyn V
 
 fn print_fill(label: &str, fill: &OrderFill, latency: LatencySample) {
     println!(
-        "{label} venue={} symbol={} side={:?} qty={} avg_price={} fee_quote={} order_id={} filled_at_ms={} local_roundtrip_ms={} quote_resolve_ms={} order_prepare_ms={} submit_ack_ms={}",
+        "{label} venue={} symbol={} side={:?} qty={} avg_price={} fee_quote={} order_id={} filled_at_ms={} local_roundtrip_ms={} quote_resolve_ms={} order_prepare_ms={} request_sign_ms={} submit_http_ms={} response_decode_ms={} private_fill_wait_ms={} submit_ack_ms={}",
         fill.venue,
         fill.symbol,
         fill.side,
@@ -469,6 +469,22 @@ fn print_fill(label: &str, fill: &OrderFill, latency: LatencySample) {
         fill.timing
             .as_ref()
             .and_then(|timing| timing.order_prepare_ms)
+            .unwrap_or_default(),
+        fill.timing
+            .as_ref()
+            .and_then(|timing| timing.request_sign_ms)
+            .unwrap_or_default(),
+        fill.timing
+            .as_ref()
+            .and_then(|timing| timing.submit_http_ms)
+            .unwrap_or_default(),
+        fill.timing
+            .as_ref()
+            .and_then(|timing| timing.response_decode_ms)
+            .unwrap_or_default(),
+        fill.timing
+            .as_ref()
+            .and_then(|timing| timing.private_fill_wait_ms)
             .unwrap_or_default(),
         fill.timing
             .as_ref()

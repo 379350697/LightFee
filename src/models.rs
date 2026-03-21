@@ -128,6 +128,17 @@ pub struct PositionSnapshot {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AccountBalanceSnapshot {
+    pub venue: Venue,
+    pub equity_quote: f64,
+    #[serde(default)]
+    pub wallet_balance_quote: Option<f64>,
+    #[serde(default)]
+    pub available_balance_quote: Option<f64>,
+    pub observed_at_ms: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AssetTransferStatus {
     pub venue: Venue,
     pub asset: String,
@@ -173,11 +184,31 @@ pub struct OrderFill {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OrderFillReconciliation {
+    pub order_id: String,
+    #[serde(default)]
+    pub client_order_id: Option<String>,
+    pub quantity: f64,
+    pub average_price: f64,
+    #[serde(default)]
+    pub fee_quote: Option<f64>,
+    pub filled_at_ms: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct OrderExecutionTiming {
     #[serde(default)]
     pub quote_resolve_ms: Option<u64>,
     #[serde(default)]
     pub order_prepare_ms: Option<u64>,
+    #[serde(default)]
+    pub request_sign_ms: Option<u64>,
+    #[serde(default)]
+    pub submit_http_ms: Option<u64>,
+    #[serde(default)]
+    pub response_decode_ms: Option<u64>,
+    #[serde(default)]
+    pub private_fill_wait_ms: Option<u64>,
     #[serde(default)]
     pub submit_ack_ms: Option<u64>,
 }
@@ -256,6 +287,10 @@ mod tests {
             timing: Some(OrderExecutionTiming {
                 quote_resolve_ms: Some(3),
                 order_prepare_ms: Some(5),
+                request_sign_ms: Some(2),
+                submit_http_ms: Some(41),
+                response_decode_ms: Some(7),
+                private_fill_wait_ms: Some(0),
                 submit_ack_ms: Some(1200),
             }),
         };
@@ -266,6 +301,10 @@ mod tests {
             json!({
                 "quote_resolve_ms": 3,
                 "order_prepare_ms": 5,
+                "request_sign_ms": 2,
+                "submit_http_ms": 41,
+                "response_decode_ms": 7,
+                "private_fill_wait_ms": 0,
                 "submit_ack_ms": 1200,
             })
         );

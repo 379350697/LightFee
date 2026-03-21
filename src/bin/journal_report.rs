@@ -32,6 +32,61 @@ fn main() -> Result<()> {
         report.run_count
     );
 
+    if let Some(snapshot) = &report.current_balance_snapshot {
+        println!(
+            "current_balance observed_at_ms={} total_equity_quote={:?} failed_venues={}",
+            snapshot.observed_at_ms,
+            snapshot.total_equity_quote,
+            snapshot.failed_venues.len(),
+        );
+        for venue in &snapshot.venues {
+            println!(
+                "current_balance_venue venue={} equity_quote={:.8} wallet_balance_quote={:?} available_balance_quote={:?}",
+                venue.venue,
+                venue.equity_quote,
+                venue.wallet_balance_quote,
+                venue.available_balance_quote,
+            );
+        }
+        for failure in &snapshot.failed_venues {
+            println!(
+                "current_balance_failed venue={} error={}",
+                failure.venue, failure.error
+            );
+        }
+    }
+
+    for daily in &report.daily_profit_summaries {
+        println!(
+            "daily_profit date={} realized_revenue_quote={:.8} partial_realized_revenue_quote={:.8} remaining_close_realized_revenue_quote={:.8} opened_position_count={} partial_close_count={} closed_position_count={} latest_total_equity_quote={:?}",
+            daily.date,
+            daily.realized_revenue_quote,
+            daily.partial_realized_revenue_quote,
+            daily.remaining_close_realized_revenue_quote,
+            daily.opened_position_count,
+            daily.partial_close_count,
+            daily.closed_position_count,
+            daily.latest_total_equity_quote,
+        );
+        for (venue, equity) in &daily.venue_equity_quote {
+            println!(
+                "daily_profit_balance date={} venue={} equity_quote={:.8}",
+                daily.date, venue, equity
+            );
+        }
+        for symbol in &daily.opened_symbol_revenues {
+            println!(
+                "daily_symbol date={} symbol={} position_count={} partial_close_count={} closed_position_count={} realized_net_quote={:.8}",
+                daily.date,
+                symbol.symbol,
+                symbol.position_count,
+                symbol.partial_close_count,
+                symbol.closed_position_count,
+                symbol.realized_net_quote,
+            );
+        }
+    }
+
     for (venue, stats) in &report.venue_stats {
         println!(
             "venue={} submitted_orders={} filled_orders={} failed_orders={} failure_rate_pct={:.2} latency_p50_ms={:?} latency_p95_ms={:?} latency_p99_ms={:?} latency_max_ms={:?} total_fee_quote={:.8}",

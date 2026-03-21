@@ -474,6 +474,106 @@ fn journal_runtime_metrics_snapshot_tracks_lightweight_write_path_counters() {
     );
 }
 
+#[test]
+fn journal_analysis_reports_daily_profit_and_balance_snapshots() {
+    let records = vec![
+        record(
+            0,
+            "run-a",
+            1_742_486_400_000,
+            "balance.snapshot",
+            json!({
+                "total_equity_quote": 120.0,
+                "venues": [
+                    {
+                        "venue": "binance",
+                        "equity_quote": 70.0,
+                        "wallet_balance_quote": 68.0,
+                        "available_balance_quote": 60.0,
+                        "observed_at_ms": 1_742_486_400_000_i64
+                    },
+                    {
+                        "venue": "okx",
+                        "equity_quote": 50.0,
+                        "wallet_balance_quote": 49.0,
+                        "available_balance_quote": 45.0,
+                        "observed_at_ms": 1_742_486_400_000_i64
+                    }
+                ],
+                "failed_venues": []
+            }),
+        ),
+        record(
+            1,
+            "run-a",
+            1_742_486_500_000,
+            "entry.opened",
+            json!({
+                "position_id": "pos-2",
+                "symbol": "XAIUSDT",
+                "entered_at_ms": 1_742_486_500_000_i64,
+                "long_venue": "binance",
+                "short_venue": "hyperliquid",
+                "quantity": 100.0
+            }),
+        ),
+        record(
+            2,
+            "run-a",
+            1_742_486_600_000,
+            "exit.partial_closed",
+            json!({
+                "position_id": "pos-2",
+                "symbol": "XAIUSDT",
+                "reason": "settlement_half_close",
+                "closed_quantity": 50.0,
+                "remaining_quantity": 50.0,
+                "outcome_diagnostics": {
+                    "net_quote": 1.2,
+                    "outcome": "profit"
+                }
+            }),
+        ),
+        record(
+            3,
+            "run-a",
+            1_742_486_700_000,
+            "exit.closed",
+            json!({
+                "position_id": "pos-2",
+                "symbol": "XAIUSDT",
+                "reason": "settlement_force_close",
+                "net_quote": 1.8,
+                "remaining_outcome_diagnostics": {
+                    "net_quote": 0.6,
+                    "outcome": "profit"
+                },
+                "closed_at_ms": 1_742_486_700_000_i64
+            }),
+        ),
+    ];
+
+    let report = analyze_journal_records(&records);
+
+    assert_eq!(
+        report
+            .current_balance_snapshot
+            .as_ref()
+            .and_then(|item| item.total_equity_quote),
+        Some(120.0)
+    );
+    assert_eq!(report.daily_profit_summaries.len(), 1);
+    let day = &report.daily_profit_summaries[0];
+    assert!((day.realized_revenue_quote - 1.8).abs() < 1e-9);
+    assert_eq!(day.latest_total_equity_quote, Some(120.0));
+    assert_eq!(day.opened_symbol_revenues.len(), 1);
+    let symbol = &day.opened_symbol_revenues[0];
+    assert_eq!(symbol.symbol, "XAIUSDT");
+    assert_eq!(symbol.position_count, 1);
+    assert!((symbol.realized_net_quote - 1.8).abs() < 1e-9);
+    assert_eq!(symbol.closed_position_count, 1);
+}
+
 fn record(
     seq: u64,
     run_id: &str,

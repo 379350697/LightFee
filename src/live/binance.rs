@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     sync::{Arc, Mutex},
+    time::Instant,
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -18,8 +19,9 @@ use tracing::{debug, warn};
 use crate::{
     config::{RuntimeConfig, VenueConfig},
     models::{
-        AssetTransferStatus, OrderFill, OrderRequest, PositionSnapshot, Side, SymbolMarketSnapshot,
-        Venue, VenueMarketSnapshot,
+        AccountBalanceSnapshot, AssetTransferStatus, OrderExecutionTiming, OrderFill,
+        OrderFillReconciliation, OrderRequest, PositionSnapshot, Side, SymbolMarketSnapshot, Venue,
+        VenueMarketSnapshot,
     },
     resilience::FailureBackoff,
     venue::VenueAdapter,
@@ -35,6 +37,7 @@ use super::{
 };
 
 const BINANCE_MAX_SUBSCRIBE_STREAMS_PER_MESSAGE: usize = 150;
+const BINANCE_RECV_WINDOW_MS: &str = "10000";
 
 pub struct BinanceLiveAdapter {
     config: VenueConfig,
@@ -598,6 +601,92 @@ impl BinanceLiveAdapter {
             .replace(mode.clone());
         Ok(mode)
     }
+
+    async fn submit_market_order_once(
+        &self,
+        request: &OrderRequest,
+        quantity: f64,
+        step_size: f64,
+        position_mode: BinancePositionMode,
+    ) -> Result<BinanceOrderResponseWithTiming> {
+        let timestamp = self.server_timestamp_ms().await?.to_string();
+        let sign_started_at = Instant::now();
+        let mut params = vec![
+            ("symbol", venue_symbol(&self.config, &request.symbol)),
+            (
+                "side",
+                match request.side {
+                    Side::Buy => "BUY".to_string(),
+                    Side::Sell => "SELL".to_string(),
+                },
+            ),
+            ("type", "MARKET".to_string()),
+            ("quantity", format_decimal(quantity, step_size)),
+            ("newClientOrderId", request.client_order_id.clone()),
+            ("newOrderRespType", "RESULT".to_string()),
+            ("recvWindow", BINANCE_RECV_WINDOW_MS.to_string()),
+            ("timestamp", timestamp),
+        ];
+        if matches!(position_mode, BinancePositionMode::Hedge) {
+            params.push((
+                "positionSide",
+                binance_position_side(position_mode, request.side, request.reduce_only).to_string(),
+            ));
+        } else {
+            params.push(("reduceOnly", request.reduce_only.to_string()));
+        }
+        let api_key = self
+            .config
+            .live
+            .resolved_api_key()
+            .ok_or_else(|| anyhow!("binance api key is not configured"))?;
+        let api_secret = self
+            .config
+            .live
+            .resolved_api_secret()
+            .ok_or_else(|| anyhow!("binance api secret is not configured"))?;
+        let query = build_query(&params);
+        let signature = hmac_sha256_hex(&api_secret, &query)?;
+        let url = format!(
+            "{}/fapi/v1/order?{query}&signature={signature}",
+            self.base_url
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("X-MBX-APIKEY", HeaderValue::from_str(&api_key)?);
+        let request_builder = self
+            .client
+            .request(reqwest::Method::POST, url)
+            .headers(headers);
+        let request_sign_ms = elapsed_ms(sign_started_at);
+
+        let submit_started_at = Instant::now();
+        let response = request_builder
+            .send()
+            .await
+            .context("failed to send signed binance request")?;
+        let submit_http_ms = elapsed_ms(submit_started_at);
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(format_binance_http_error(status, &body));
+        }
+        let decode_started_at = Instant::now();
+        let response = response
+            .json::<BinanceOrderResponse>()
+            .await
+            .context("failed to decode binance order response")?;
+        let response_decode_ms = elapsed_ms(decode_started_at);
+        Ok(BinanceOrderResponseWithTiming {
+            response,
+            request_sign_ms,
+            submit_http_ms,
+            response_decode_ms,
+        })
+    }
+
+    fn clear_server_time_offset(&self) {
+        self.time_offset_ms.lock().expect("lock").take();
+    }
 }
 
 fn format_binance_http_error(status: reqwest::StatusCode, body: &str) -> anyhow::Error {
@@ -622,6 +711,37 @@ fn format_binance_http_error(status: reqwest::StatusCode, body: &str) -> anyhow:
             status,
             trimmed
         )
+    }
+}
+
+fn should_retry_binance_order_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("code=-1021")
+        || message.contains("recvwindow")
+        || message.contains("timestamp")
+        || message.contains("status=500")
+        || message.contains("status=502")
+        || message.contains("status=503")
+        || message.contains("status=504")
+}
+
+fn elapsed_ms(started_at: Instant) -> u64 {
+    started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn binance_private_fill_wait_ms(
+    average_price: f64,
+    executed_quantity: f64,
+    configured_wait_ms: u64,
+) -> u64 {
+    if average_price.is_finite()
+        && average_price > 0.0
+        && executed_quantity.is_finite()
+        && executed_quantity > 0.0
+    {
+        0
+    } else {
+        configured_wait_ms
     }
 }
 
@@ -674,6 +794,7 @@ impl VenueAdapter for BinanceLiveAdapter {
 
     async fn place_order(&self, request: OrderRequest) -> Result<OrderFill> {
         ensure_binance_client_order_id(&request.client_order_id)?;
+        let order_prepare_started_at = Instant::now();
         let meta = self.symbol_meta(&request.symbol).await?;
         let position_mode = self.position_mode().await?;
         let quantity = floor_to_step(request.quantity, meta.step_size);
@@ -684,44 +805,23 @@ impl VenueAdapter for BinanceLiveAdapter {
             request.price_hint,
             request.mark_price_hint,
         )?;
+        let order_prepare_ms = elapsed_ms(order_prepare_started_at);
 
-        let timestamp = self.server_timestamp_ms().await?.to_string();
-        let mut params = vec![
-            ("symbol", venue_symbol(&self.config, &request.symbol)),
-            (
-                "side",
-                match request.side {
-                    Side::Buy => "BUY".to_string(),
-                    Side::Sell => "SELL".to_string(),
-                },
-            ),
-            ("type", "MARKET".to_string()),
-            ("quantity", format_decimal(quantity, meta.step_size)),
-            ("newClientOrderId", request.client_order_id.clone()),
-            ("newOrderRespType", "RESULT".to_string()),
-            ("recvWindow", "5000".to_string()),
-            ("timestamp", timestamp),
-        ];
-        if matches!(position_mode, BinancePositionMode::Hedge) {
-            params.push((
-                "positionSide",
-                binance_position_side(position_mode, request.side, request.reduce_only).to_string(),
-            ));
-        } else {
-            params.push(("reduceOnly", request.reduce_only.to_string()));
-        }
-        let response = self
-            .signed_request(
-                reqwest::Method::POST,
-                "/fapi/v1/order",
-                params,
-                None,
-                &self.base_url,
-            )
-            .await?
-            .json::<BinanceOrderResponse>()
+        let submit_started_at = Instant::now();
+        let response = match self
+            .submit_market_order_once(&request, quantity, meta.step_size, position_mode.clone())
             .await
-            .context("failed to decode binance order response")?;
+        {
+            Ok(response) => response,
+            Err(error) if should_retry_binance_order_error(&error) => {
+                self.clear_server_time_offset();
+                sleep(Duration::from_millis(100)).await;
+                self.submit_market_order_once(&request, quantity, meta.step_size, position_mode)
+                    .await?
+            }
+            Err(error) => return Err(error),
+        };
+        let submit_ack_ms = elapsed_ms(submit_started_at);
 
         let (fallback_price, fallback_ts) = if let Some(fill) = hinted_fill(&request) {
             fill
@@ -731,14 +831,14 @@ impl VenueAdapter for BinanceLiveAdapter {
                 .await?;
             quote_fill(&snapshot, &request.symbol, request.side)?
         };
-        let average_price = parse_f64(&response.avg_price).unwrap_or(0.0);
+        let average_price = parse_f64(&response.response.avg_price).unwrap_or(0.0);
         let average_price = if average_price > 0.0 {
             average_price
         } else {
             fallback_price
         };
-        let executed_qty = parse_f64(&response.executed_qty).unwrap_or(quantity);
-        let order_id = response.order_id.to_string();
+        let executed_qty = parse_f64(&response.response.executed_qty).unwrap_or(quantity);
+        let order_id = response.response.order_id.to_string();
 
         let mut fill = OrderFill {
             venue: Venue::Binance,
@@ -748,18 +848,35 @@ impl VenueAdapter for BinanceLiveAdapter {
             average_price,
             fee_quote: estimate_fee_quote(average_price, executed_qty, self.config.taker_fee_bps),
             order_id: order_id.clone(),
-            filled_at_ms: response.update_time.unwrap_or(fallback_ts),
-            timing: None,
+            filled_at_ms: response.response.update_time.unwrap_or(fallback_ts),
+            timing: Some(OrderExecutionTiming {
+                quote_resolve_ms: None,
+                order_prepare_ms: Some(order_prepare_ms),
+                request_sign_ms: Some(response.request_sign_ms),
+                submit_http_ms: Some(response.submit_http_ms),
+                response_decode_ms: Some(response.response_decode_ms),
+                private_fill_wait_ms: None,
+                submit_ack_ms: Some(submit_ack_ms),
+            }),
         };
+        let private_fill_wait_ms = binance_private_fill_wait_ms(
+            average_price,
+            executed_qty,
+            self.config.live.post_ack_private_fill_wait_ms,
+        );
+        let private_fill_wait_started_at = Instant::now();
         if let Some(private_fill) = lookup_or_wait_private_order(
             &self.private_ws,
             Some(&request.client_order_id),
             Some(order_id.as_str()),
-            self.config.live.post_ack_private_fill_wait_ms,
+            private_fill_wait_ms,
         )
         .await
         {
             fill = enrich_fill_from_private(fill, &private_fill);
+        }
+        if let Some(timing) = fill.timing.as_mut() {
+            timing.private_fill_wait_ms = Some(elapsed_ms(private_fill_wait_started_at));
         }
         Ok(fill)
     }
@@ -791,7 +908,7 @@ impl VenueAdapter for BinanceLiveAdapter {
 
         let params = vec![
             ("symbol", venue_symbol(&self.config, symbol)),
-            ("recvWindow", "5000".to_string()),
+            ("recvWindow", BINANCE_RECV_WINDOW_MS.to_string()),
             ("timestamp", self.server_timestamp_ms().await?.to_string()),
         ];
         let positions = self
@@ -823,6 +940,118 @@ impl VenueAdapter for BinanceLiveAdapter {
             size,
             updated_at_ms: now_ms(),
         })
+    }
+
+    async fn fetch_account_balance_snapshot(&self) -> Result<Option<AccountBalanceSnapshot>> {
+        let params = vec![
+            ("recvWindow", BINANCE_RECV_WINDOW_MS.to_string()),
+            ("timestamp", self.server_timestamp_ms().await?.to_string()),
+        ];
+        let account = self
+            .signed_request(
+                reqwest::Method::GET,
+                "/fapi/v2/account",
+                params,
+                None,
+                &self.base_url,
+            )
+            .await?
+            .json::<BinanceAccountInfo>()
+            .await
+            .context("failed to decode binance account balance")?;
+
+        Ok(Some(AccountBalanceSnapshot {
+            venue: Venue::Binance,
+            equity_quote: parse_f64(&account.total_margin_balance)?,
+            wallet_balance_quote: Some(parse_f64(&account.total_wallet_balance)?),
+            available_balance_quote: Some(parse_f64(&account.available_balance)?),
+            observed_at_ms: now_ms(),
+        }))
+    }
+
+    async fn fetch_order_fill_reconciliation(
+        &self,
+        symbol: &str,
+        order_id: &str,
+        _client_order_id: Option<&str>,
+    ) -> Result<Option<OrderFillReconciliation>> {
+        let parsed_order_id = order_id
+            .parse::<i64>()
+            .with_context(|| format!("invalid binance order id {order_id}"))?;
+        let params = vec![
+            ("symbol", venue_symbol(&self.config, symbol)),
+            ("orderId", parsed_order_id.to_string()),
+            ("recvWindow", BINANCE_RECV_WINDOW_MS.to_string()),
+            ("timestamp", self.server_timestamp_ms().await?.to_string()),
+        ];
+        let order = self
+            .signed_request(
+                reqwest::Method::GET,
+                "/fapi/v1/order",
+                params,
+                None,
+                &self.base_url,
+            )
+            .await?
+            .json::<BinanceOrderResponse>()
+            .await
+            .context("failed to decode binance order reconciliation")?;
+        let quantity = parse_f64(&order.executed_qty)?;
+        if quantity <= 0.0 {
+            return Ok(None);
+        }
+
+        let trade_params = vec![
+            ("symbol", venue_symbol(&self.config, symbol)),
+            ("orderId", parsed_order_id.to_string()),
+            ("recvWindow", BINANCE_RECV_WINDOW_MS.to_string()),
+            ("timestamp", self.server_timestamp_ms().await?.to_string()),
+        ];
+        let trades = self
+            .signed_request(
+                reqwest::Method::GET,
+                "/fapi/v1/userTrades",
+                trade_params,
+                None,
+                &self.base_url,
+            )
+            .await?
+            .json::<Vec<BinanceUserTrade>>()
+            .await
+            .context("failed to decode binance user trades")?;
+        let mut total_quantity = 0.0;
+        let mut weighted_notional = 0.0;
+        let mut total_fee_quote = 0.0;
+        let mut latest_fill_ms = order.update_time.unwrap_or_else(now_ms);
+        for trade in trades
+            .into_iter()
+            .filter(|trade| trade.order_id == parsed_order_id)
+        {
+            let trade_quantity = parse_f64(&trade.qty)?;
+            let trade_price = parse_f64(&trade.price)?;
+            total_quantity += trade_quantity;
+            weighted_notional += trade_price * trade_quantity;
+            total_fee_quote += parse_f64(&trade.commission)?;
+            latest_fill_ms = latest_fill_ms.max(trade.time);
+        }
+        let average_price = if total_quantity > 0.0 {
+            weighted_notional / total_quantity
+        } else {
+            parse_f64(&order.avg_price)?
+        };
+
+        Ok(Some(OrderFillReconciliation {
+            order_id: order.order_id.to_string(),
+            client_order_id: None,
+            quantity: if total_quantity > 0.0 {
+                total_quantity
+            } else {
+                quantity
+            },
+            average_price,
+            fee_quote: Some(total_fee_quote).filter(|value| *value > 0.0),
+            filled_at_ms: latest_fill_ms,
+        }))
     }
 
     async fn normalize_quantity(&self, symbol: &str, quantity: f64) -> Result<f64> {
@@ -860,7 +1089,7 @@ impl VenueAdapter for BinanceLiveAdapter {
         }
 
         let params = vec![
-            ("recvWindow", "5000".to_string()),
+            ("recvWindow", BINANCE_RECV_WINDOW_MS.to_string()),
             ("timestamp", self.server_timestamp_ms().await?.to_string()),
         ];
         let coins = self
@@ -914,6 +1143,12 @@ impl VenueAdapter for BinanceLiveAdapter {
 
     fn supported_symbols(&self, requested_symbols: &[String]) -> Option<Vec<String>> {
         Some(self.tracked_symbols(requested_symbols))
+    }
+
+    async fn live_startup_prewarm(&self) -> Result<()> {
+        let _ = self.server_timestamp_ms().await?;
+        let _ = self.position_mode().await?;
+        Ok(())
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -1052,6 +1287,14 @@ struct BinanceOrderResponse {
     executed_qty: String,
     #[serde(rename = "updateTime")]
     update_time: Option<i64>,
+}
+
+#[derive(Debug)]
+struct BinanceOrderResponseWithTiming {
+    response: BinanceOrderResponse,
+    request_sign_ms: u64,
+    submit_http_ms: u64,
+    response_decode_ms: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1443,11 +1686,13 @@ fn validate_binance_order_request(
 #[cfg(test)]
 mod tests {
     use super::{
-        binance_position_side, build_binance_subscribe_messages, ensure_binance_client_order_id,
-        format_binance_http_error, validate_binance_order_request, BinancePositionMode,
+        binance_position_side, binance_private_fill_wait_ms, build_binance_subscribe_messages,
+        ensure_binance_client_order_id, format_binance_http_error,
+        should_retry_binance_order_error, validate_binance_order_request, BinancePositionMode,
         BinancePremiumIndex, BinanceSymbolMeta, BINANCE_MAX_SUBSCRIBE_STREAMS_PER_MESSAGE,
     };
     use crate::models::Side;
+    use anyhow::anyhow;
 
     #[test]
     fn premium_index_accepts_integer_next_funding_time() {
@@ -1519,6 +1764,26 @@ mod tests {
     }
 
     #[test]
+    fn retryable_order_errors_include_timestamp_and_server_failures() {
+        assert!(should_retry_binance_order_error(&anyhow!(
+            "binance private endpoint returned non-success status: status=400 Bad Request code=-1021 msg=Timestamp for this request is outside of the recvWindow."
+        )));
+        assert!(should_retry_binance_order_error(&anyhow!(
+            "binance private endpoint returned non-success status: status=503 Service Unavailable body=busy"
+        )));
+        assert!(!should_retry_binance_order_error(&anyhow!(
+            "binance private endpoint returned non-success status: status=400 Bad Request code=-4164 msg=Order's notional must be no smaller than 5"
+        )));
+    }
+
+    #[test]
+    fn result_response_skips_private_fill_wait_when_fill_is_already_known() {
+        assert_eq!(binance_private_fill_wait_ms(2134.5, 0.011, 120), 0);
+        assert_eq!(binance_private_fill_wait_ms(0.0, 0.011, 120), 120);
+        assert_eq!(binance_private_fill_wait_ms(2134.5, 0.0, 120), 120);
+    }
+
+    #[test]
     fn client_order_id_validation_rejects_overlong_values() {
         let error = ensure_binance_client_order_id(&"a".repeat(37)).expect_err("reject long id");
         assert!(error.to_string().contains("too long"));
@@ -1572,6 +1837,16 @@ struct BinancePositionRisk {
 }
 
 #[derive(Debug, Deserialize)]
+struct BinanceAccountInfo {
+    #[serde(rename = "totalMarginBalance")]
+    total_margin_balance: String,
+    #[serde(rename = "totalWalletBalance")]
+    total_wallet_balance: String,
+    #[serde(rename = "availableBalance")]
+    available_balance: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct BinanceCapitalCoin {
     coin: String,
     #[serde(rename = "networkList", default)]
@@ -1584,6 +1859,16 @@ struct BinanceCapitalNetwork {
     deposit_enable: bool,
     #[serde(rename = "withdrawEnable")]
     withdraw_enable: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct BinanceUserTrade {
+    #[serde(rename = "orderId")]
+    order_id: i64,
+    price: String,
+    qty: String,
+    commission: String,
+    time: i64,
 }
 
 #[derive(Debug, Deserialize)]

@@ -26,6 +26,7 @@ This repository intentionally avoids the heavyweight control-plane shape from la
 cargo test
 cargo run -- config/example.toml
 cargo run --bin journal_report -- runtime/events.jsonl
+cargo run --bin daily_report -- config/example.toml
 ```
 
 The bundled config runs in `paper` mode using scripted venue feeds from `config/demo/`.
@@ -34,7 +35,7 @@ The bundled config runs in `paper` mode using scripted venue feeds from `config/
 
 - single binary crate instead of a multi-crate platform
 - taker-only v1 execution path for deterministic unattended behavior
-- scan/entry discovery limited to the last 15 to 5 minutes before funding by default
+- scan/entry discovery limited to the last 25 to 5 minutes before funding by default
 - up to two concurrent hedged symbols, selected by edge plus execution-risk balance
 - temporary live per-leg notional cap of 30 USDT until broader live soak testing is complete
 - staggered funding opportunities are scored on first-stage realizable edge by default, with configurable continuation into a second stage
@@ -71,6 +72,22 @@ It summarizes:
 - runtime gate blocks, venue cooldown counts, and first-leg risk-factor distribution
 - recent per-position trade replays including candidate selection, entry plan, per-leg fills/failures, and warnings/errors
 - heuristic optimization recommendations with evidence, so recurring latency/timeout/depth issues surface directly in the report
+
+For a low-impact daily report, use `daily_report` as a separate once-per-day task instead of adding balance snapshots to the trading loop:
+
+```bash
+cargo run --bin daily_report -- config/live.example.toml
+cargo run --bin daily_report -- --date 2026-03-20 config/live.example.toml
+cargo run --bin daily_report -- --json config/live.example.toml
+```
+
+The daily report:
+
+- fetches a current four-venue balance snapshot at report time
+- appends a `balance.snapshot` journal event for later replay and comparison
+- computes the previous natural day's realized revenue from the journal
+- breaks out revenue by symbols opened on that day
+- keeps the entire balance/report workflow outside the trading hot path
 
 That gives us low-overhead logging during normal trading while still making restart recovery deterministic.
 

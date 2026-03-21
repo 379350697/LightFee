@@ -2,7 +2,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use crate::models::{
-    AssetTransferStatus, OrderFill, OrderRequest, PositionSnapshot, Venue, VenueMarketSnapshot,
+    AccountBalanceSnapshot, AssetTransferStatus, OrderFill, OrderFillReconciliation, OrderRequest,
+    PositionSnapshot, Venue, VenueMarketSnapshot,
 };
 
 #[async_trait]
@@ -27,6 +28,19 @@ pub trait VenueAdapter: Send + Sync {
         Ok(None)
     }
 
+    async fn fetch_account_balance_snapshot(&self) -> Result<Option<AccountBalanceSnapshot>> {
+        Ok(None)
+    }
+
+    async fn fetch_order_fill_reconciliation(
+        &self,
+        _symbol: &str,
+        _order_id: &str,
+        _client_order_id: Option<&str>,
+    ) -> Result<Option<OrderFillReconciliation>> {
+        Ok(None)
+    }
+
     async fn normalize_quantity(&self, _symbol: &str, quantity: f64) -> Result<f64> {
         Ok(quantity)
     }
@@ -48,6 +62,10 @@ pub trait VenueAdapter: Send + Sync {
 
     fn supported_symbols(&self, _requested_symbols: &[String]) -> Option<Vec<String>> {
         None
+    }
+
+    async fn live_startup_prewarm(&self) -> Result<()> {
+        Ok(())
     }
 
     async fn shutdown(&self) -> Result<()> {

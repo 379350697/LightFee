@@ -11,9 +11,10 @@ use lightfee::{
     config::{OpportunitySourceMode, RuntimeMode, StaggeredExitMode},
     strategy::discover_candidates,
     AppConfig, AssetTransferStatus, DirectedPairConfig, Engine, EngineMode, FundingOpportunityType,
-    MarketView, OpportunityHint, OpportunityHintSource, OrderExecutionTiming, PersistenceConfig,
-    RuntimeConfig, ScriptedVenueAdapter, StrategyConfig, SymbolMarketSnapshot, TransferStatusView,
-    Venue, VenueAdapter, VenueConfig, VenueMarketSnapshot,
+    MarketView, OpportunityHint, OpportunityHintSource, OrderExecutionTiming,
+    OrderFillReconciliation, PersistenceConfig, RuntimeConfig, ScriptedVenueAdapter,
+    StrategyConfig, SymbolMarketSnapshot, TransferStatusView, Venue, VenueAdapter, VenueConfig,
+    VenueMarketSnapshot,
 };
 use serde_json::Value;
 use tempfile::TempDir;
@@ -120,6 +121,13 @@ async fn exit_closed_net_quote_uses_realized_exit_fills() {
                     "BTCUSDT", 105.0, 106.0, 200.0, 200.0, -0.0005, 60_000,
                 )],
             ),
+            venue_snapshot(
+                Venue::Binance,
+                361_000,
+                vec![symbol_snapshot(
+                    "BTCUSDT", 105.0, 106.0, 200.0, 200.0, -0.0005, 60_000,
+                )],
+            ),
         ],
     ));
     let okx = Arc::new(ScriptedVenueAdapter::new(
@@ -136,6 +144,13 @@ async fn exit_closed_net_quote_uses_realized_exit_fills() {
             venue_snapshot(
                 Venue::Okx,
                 61_000,
+                vec![symbol_snapshot(
+                    "BTCUSDT", 95.0, 96.0, 200.0, 200.0, 0.0015, 60_000,
+                )],
+            ),
+            venue_snapshot(
+                Venue::Okx,
+                361_000,
                 vec![symbol_snapshot(
                     "BTCUSDT", 95.0, 96.0, 200.0, 200.0, 0.0015, 60_000,
                 )],
@@ -465,7 +480,7 @@ async fn aligned_position_half_closes_at_settlement_then_force_closes_remainder(
         Venue::Okx,
         0.5,
         vec![
-            snapshot(Venue::Okx, 0, 100.0, 100.0, 200.0, 200.0, 0.0015, 60_000),
+            snapshot(Venue::Okx, 0, 100.0, 100.0, 200.0, 200.0, 0.0015, 360_000),
             snapshot(
                 Venue::Okx,
                 60_000,
@@ -651,6 +666,456 @@ async fn settlement_half_close_does_not_fail_closed_on_stale_market_data() {
 
     let records = read_event_records(&config.persistence.event_log_path);
     assert!(has_event(&records, "exit.partial_closed"));
+}
+
+#[tokio::test]
+async fn stale_market_does_not_block_remaining_funding_capture_close() {
+    let temp = TempDir::new().expect("tempdir");
+    let mut config = test_config(&temp, true);
+    config.runtime.max_market_age_ms = 10_000;
+    config.strategy.stop_loss_quote = 1_000.0;
+    config.strategy.profit_take_quote = 1_000.0;
+    config.strategy.trailing_drawdown_quote = 1_000.0;
+    config.venues = vec![venue(Venue::Binance, 0.0), venue(Venue::Okx, 0.0)];
+    config.directed_pairs = vec![DirectedPairConfig {
+        long: Venue::Binance,
+        short: Venue::Okx,
+        symbols: vec!["BTCUSDT".to_string()],
+    }];
+
+    let binance = Arc::new(ScriptedVenueAdapter::new(
+        Venue::Binance,
+        0.0,
+        vec![
+            snapshot(
+                Venue::Binance,
+                0,
+                100.0,
+                100.0,
+                200.0,
+                200.0,
+                -0.0005,
+                60_000,
+            ),
+            snapshot(
+                Venue::Binance,
+                60_000,
+                100.0,
+                100.0,
+                200.0,
+                200.0,
+                -0.0005,
+                60_000,
+            ),
+            snapshot(
+                Venue::Binance,
+                361_000,
+                100.0,
+                100.0,
+                200.0,
+                200.0,
+                -0.0005,
+                60_000,
+            ),
+        ],
+    ));
+    let okx = Arc::new(ScriptedVenueAdapter::new(
+        Venue::Okx,
+        0.0,
+        vec![snapshot(
+            Venue::Okx,
+            0,
+            100.0,
+            100.0,
+            200.0,
+            200.0,
+            0.0015,
+            60_000,
+        )],
+    ));
+
+    let mut engine = Engine::new(
+        config.clone(),
+        vec![
+            binance as Arc<dyn VenueAdapter>,
+            okx as Arc<dyn VenueAdapter>,
+        ],
+    )
+    .await
+    .expect("engine");
+
+    engine.tick().await.expect("entry tick");
+    assert!(engine.state().open_position.is_some());
+
+    engine.tick().await.expect("settlement half close tick");
+    assert!(engine.state().open_position.is_some());
+
+    engine
+        .tick()
+        .await
+        .expect("stale funding capture close tick");
+    assert!(engine.state().open_position.is_none());
+    assert_eq!(engine.state().mode, EngineMode::Running);
+
+    let records = read_event_records(&config.persistence.event_log_path);
+    let exit_closed = records
+        .iter()
+        .find(|record| record_kind(record) == Some("exit.closed"))
+        .expect("exit closed");
+    assert_eq!(
+        exit_closed["payload"]["reason"].as_str(),
+        Some("funding_capture")
+    );
+}
+
+#[tokio::test]
+async fn remaining_close_waits_five_minutes_after_settlement() {
+    let temp = TempDir::new().expect("tempdir");
+    let mut config = test_config(&temp, true);
+    config.strategy.stop_loss_quote = 1_000.0;
+    config.strategy.profit_take_quote = 1_000.0;
+    config.strategy.trailing_drawdown_quote = 1_000.0;
+    config.venues = vec![venue(Venue::Binance, 0.0), venue(Venue::Okx, 0.0)];
+    config.directed_pairs = vec![DirectedPairConfig {
+        long: Venue::Binance,
+        short: Venue::Okx,
+        symbols: vec!["BTCUSDT".to_string()],
+    }];
+
+    let binance = Arc::new(ScriptedVenueAdapter::new(
+        Venue::Binance,
+        0.0,
+        vec![
+            snapshot(
+                Venue::Binance,
+                0,
+                100.0,
+                100.0,
+                200.0,
+                200.0,
+                -0.0005,
+                60_000,
+            ),
+            snapshot(
+                Venue::Binance,
+                60_000,
+                100.0,
+                100.0,
+                200.0,
+                200.0,
+                -0.0005,
+                60_000,
+            ),
+            snapshot(
+                Venue::Binance,
+                300_000,
+                100.0,
+                100.0,
+                200.0,
+                200.0,
+                -0.0005,
+                60_000,
+            ),
+            snapshot(
+                Venue::Binance,
+                361_000,
+                100.0,
+                100.0,
+                200.0,
+                200.0,
+                -0.0005,
+                60_000,
+            ),
+        ],
+    ));
+    let okx = Arc::new(ScriptedVenueAdapter::new(
+        Venue::Okx,
+        0.0,
+        vec![
+            snapshot(Venue::Okx, 0, 100.0, 100.0, 200.0, 200.0, 0.0015, 60_000),
+            snapshot(
+                Venue::Okx,
+                60_000,
+                100.0,
+                100.0,
+                200.0,
+                200.0,
+                0.0015,
+                60_000,
+            ),
+            snapshot(
+                Venue::Okx,
+                300_000,
+                100.0,
+                100.0,
+                200.0,
+                200.0,
+                0.0015,
+                60_000,
+            ),
+            snapshot(
+                Venue::Okx,
+                361_000,
+                100.0,
+                100.0,
+                200.0,
+                200.0,
+                0.0015,
+                60_000,
+            ),
+        ],
+    ));
+
+    let mut engine = Engine::new(
+        config.clone(),
+        vec![
+            binance as Arc<dyn VenueAdapter>,
+            okx as Arc<dyn VenueAdapter>,
+        ],
+    )
+    .await
+    .expect("engine");
+
+    engine.tick().await.expect("entry tick");
+    engine.tick().await.expect("settlement half close tick");
+    assert!(engine.state().open_position.is_some());
+
+    engine.tick().await.expect("delay window tick");
+    assert!(engine.state().open_position.is_some());
+
+    engine.tick().await.expect("post delay close tick");
+    assert!(engine.state().open_position.is_none());
+
+    let records = read_event_records(&config.persistence.event_log_path);
+    let exit_closed = records
+        .iter()
+        .find(|record| record_kind(record) == Some("exit.closed"))
+        .expect("exit closed");
+    assert_eq!(
+        exit_closed["payload"]["reason"].as_str(),
+        Some("funding_capture")
+    );
+}
+
+#[tokio::test]
+async fn close_reconciliation_runs_after_close_outside_entry_window() {
+    let temp = TempDir::new().expect("tempdir");
+    let mut config = test_config(&temp, true);
+    config.runtime.mode = RuntimeMode::Live;
+    config.runtime.max_order_quote_age_ms = 0;
+    config.strategy.max_scan_minutes_before_funding = 25;
+    config.strategy.min_scan_minutes_before_funding = 5;
+    config.strategy.stop_loss_quote = 1_000.0;
+    config.strategy.profit_take_quote = 1_000.0;
+    config.strategy.trailing_drawdown_quote = 1_000.0;
+    config.venues = vec![venue(Venue::Binance, 0.0), venue(Venue::Okx, 0.0)];
+    config.directed_pairs = vec![DirectedPairConfig {
+        long: Venue::Binance,
+        short: Venue::Okx,
+        symbols: vec!["BTCUSDT".to_string()],
+    }];
+
+    let binance = Arc::new(TimedFillAdapter::new(
+        Venue::Binance,
+        vec![
+            snapshot(
+                Venue::Binance,
+                0,
+                100.0,
+                100.0,
+                200.0,
+                200.0,
+                -0.0005,
+                360_000,
+            ),
+            snapshot(
+                Venue::Binance,
+                361_000,
+                100.0,
+                100.0,
+                200.0,
+                200.0,
+                -0.0005,
+                360_000,
+            ),
+            snapshot(
+                Venue::Binance,
+                361_000,
+                100.0,
+                100.0,
+                200.0,
+                200.0,
+                -0.0005,
+                360_000,
+            ),
+            snapshot(
+                Venue::Binance,
+                1_561_000,
+                105.0,
+                106.0,
+                200.0,
+                200.0,
+                -0.0005,
+                360_000,
+            ),
+            snapshot(
+                Venue::Binance,
+                1_561_000,
+                105.0,
+                106.0,
+                200.0,
+                200.0,
+                -0.0005,
+                360_000,
+            ),
+            snapshot(
+                Venue::Binance,
+                1_562_000,
+                105.0,
+                106.0,
+                200.0,
+                200.0,
+                -0.0005,
+                360_000,
+            ),
+        ],
+        None,
+    ));
+    let okx = Arc::new(TimedFillAdapter::new(
+        Venue::Okx,
+        vec![
+            snapshot(Venue::Okx, 0, 100.0, 100.0, 200.0, 200.0, 0.0015, 360_000),
+            snapshot(
+                Venue::Okx,
+                361_000,
+                100.0,
+                100.0,
+                200.0,
+                200.0,
+                0.0015,
+                360_000,
+            ),
+            snapshot(
+                Venue::Okx,
+                361_000,
+                100.0,
+                100.0,
+                200.0,
+                200.0,
+                0.0015,
+                360_000,
+            ),
+            snapshot(
+                Venue::Okx,
+                1_561_000,
+                94.0,
+                95.0,
+                200.0,
+                200.0,
+                0.0015,
+                360_000,
+            ),
+            snapshot(
+                Venue::Okx,
+                1_561_000,
+                94.0,
+                95.0,
+                200.0,
+                200.0,
+                0.0015,
+                360_000,
+            ),
+            snapshot(
+                Venue::Okx,
+                1_562_000,
+                94.0,
+                95.0,
+                200.0,
+                200.0,
+                0.0015,
+                360_000,
+            ),
+        ],
+        None,
+    ));
+
+    let mut engine = Engine::new(
+        config.clone(),
+        vec![
+            binance.clone() as Arc<dyn VenueAdapter>,
+            okx.clone() as Arc<dyn VenueAdapter>,
+        ],
+    )
+    .await
+    .expect("engine");
+
+    engine.tick().await.expect("entry tick");
+    engine.tick().await.expect("settlement half close tick");
+    engine.tick().await.expect("post-settlement wait tick");
+    engine.tick().await.expect("final close tick");
+    assert!(engine.state().open_position.is_none());
+
+    let records = read_event_records(&config.persistence.event_log_path);
+    assert!(!has_event(&records, "exit.reconciled"));
+
+    let exit_closed = records
+        .iter()
+        .find(|record| record_kind(record) == Some("exit.closed"))
+        .expect("exit closed");
+    let long_order_id = exit_closed["payload"]["long_exit_order_id"]
+        .as_str()
+        .expect("long exit order id");
+    let short_order_id = exit_closed["payload"]["short_exit_order_id"]
+        .as_str()
+        .expect("short exit order id");
+
+    binance.set_reconciled_fill(
+        long_order_id,
+        OrderFillReconciliation {
+            order_id: long_order_id.to_string(),
+            client_order_id: Some("close-long-recon".to_string()),
+            quantity: 0.5,
+            average_price: 105.5,
+            fee_quote: Some(0.15),
+            filled_at_ms: 361_500,
+        },
+    );
+    okx.set_reconciled_fill(
+        short_order_id,
+        OrderFillReconciliation {
+            order_id: short_order_id.to_string(),
+            client_order_id: Some("close-short-recon".to_string()),
+            quantity: 0.5,
+            average_price: 94.5,
+            fee_quote: Some(0.12),
+            filled_at_ms: 361_550,
+        },
+    );
+
+    engine.tick().await.expect("reconciliation tick");
+
+    let records = read_event_records(&config.persistence.event_log_path);
+    let reconciled = records
+        .iter()
+        .find(|record| record_kind(record) == Some("exit.reconciled"))
+        .unwrap_or_else(|| {
+            panic!(
+                "exit reconciled missing; kinds={:?} binance_calls={} okx_calls={}",
+                records.iter().filter_map(record_kind).collect::<Vec<_>>(),
+                binance.reconciliation_call_count(),
+                okx.reconciliation_call_count()
+            )
+        });
+    assert_eq!(
+        reconciled["payload"]["long_leg"]["average_price"].as_f64(),
+        Some(105.5)
+    );
+    assert_eq!(
+        reconciled["payload"]["short_leg"]["average_price"].as_f64(),
+        Some(94.5)
+    );
+    assert!(binance.reconciliation_call_count() > 0);
+    assert!(okx.reconciliation_call_count() > 0);
 }
 
 #[tokio::test]
@@ -1028,6 +1493,16 @@ async fn restart_restores_venue_health_snapshot_for_hyperliquid_gate() {
                 -0.0004,
                 60_000,
             ),
+            snapshot(
+                Venue::Binance,
+                361_000,
+                99.95,
+                100.0,
+                200.0,
+                200.0,
+                -0.0004,
+                60_000,
+            ),
         ],
         None,
     ));
@@ -1054,10 +1529,24 @@ async fn restart_restores_venue_health_snapshot_for_hyperliquid_gate() {
                 0.0010,
                 60_000,
             ),
+            snapshot(
+                Venue::Hyperliquid,
+                361_000,
+                100.2,
+                100.25,
+                200.0,
+                200.0,
+                0.0010,
+                60_000,
+            ),
         ],
         Some(OrderExecutionTiming {
             quote_resolve_ms: Some(1),
             order_prepare_ms: Some(1),
+            request_sign_ms: None,
+            submit_http_ms: None,
+            response_decode_ms: None,
+            private_fill_wait_ms: None,
             submit_ack_ms: Some(1_500),
         }),
     ));
@@ -2906,6 +3395,16 @@ fn adapters_for_capture() -> VenueSet {
                     -0.0005,
                     60_000,
                 ),
+                snapshot(
+                    Venue::Binance,
+                    361_000,
+                    100.0,
+                    100.0,
+                    200.0,
+                    200.0,
+                    -0.0005,
+                    60_000,
+                ),
             ],
         )),
         Arc::new(ScriptedVenueAdapter::new(
@@ -2923,6 +3422,16 @@ fn adapters_for_capture() -> VenueSet {
                     0.0015,
                     60_000,
                 ),
+                snapshot(
+                    Venue::Okx,
+                    361_000,
+                    100.0,
+                    100.0,
+                    200.0,
+                    200.0,
+                    0.0015,
+                    60_000,
+                ),
             ],
         )),
         Arc::new(ScriptedVenueAdapter::new(
@@ -2933,6 +3442,16 @@ fn adapters_for_capture() -> VenueSet {
                 snapshot(
                     Venue::Bybit,
                     61_000,
+                    100.0,
+                    100.0,
+                    200.0,
+                    200.0,
+                    0.0002,
+                    60_000,
+                ),
+                snapshot(
+                    Venue::Bybit,
+                    361_000,
                     100.0,
                     100.0,
                     200.0,
@@ -2959,6 +3478,16 @@ fn adapters_for_capture() -> VenueSet {
                 snapshot(
                     Venue::Hyperliquid,
                     61_000,
+                    100.0,
+                    100.0,
+                    200.0,
+                    200.0,
+                    0.0001,
+                    60_000,
+                ),
+                snapshot(
+                    Venue::Hyperliquid,
+                    361_000,
                     100.0,
                     100.0,
                     200.0,
@@ -2997,6 +3526,16 @@ fn adapters_for_staggered_capture() -> VenueSet {
                     -0.0012,
                     60_000,
                 ),
+                snapshot(
+                    Venue::Binance,
+                    361_000,
+                    100.0,
+                    100.0,
+                    200.0,
+                    200.0,
+                    -0.0012,
+                    60_000,
+                ),
             ],
         )),
         Arc::new(ScriptedVenueAdapter::new(
@@ -3016,6 +3555,16 @@ fn adapters_for_staggered_capture() -> VenueSet {
                 snapshot(
                     Venue::Okx,
                     61_000,
+                    100.0,
+                    100.0,
+                    200.0,
+                    200.0,
+                    -0.0020,
+                    4 * 60 * 60 * 1_000,
+                ),
+                snapshot(
+                    Venue::Okx,
+                    361_000,
                     100.0,
                     100.0,
                     200.0,
@@ -3314,6 +3863,9 @@ struct TimedFillAdapter {
     venue: Venue,
     snapshots: Mutex<Vec<VenueMarketSnapshot>>,
     positions: Mutex<BTreeMap<String, f64>>,
+    next_order_id: Mutex<u64>,
+    reconciliations: Mutex<BTreeMap<String, OrderFillReconciliation>>,
+    reconciliation_calls: Arc<Mutex<usize>>,
     timing: Option<OrderExecutionTiming>,
 }
 
@@ -3393,6 +3945,9 @@ impl TimedFillAdapter {
             venue,
             snapshots: Mutex::new(snapshots),
             positions: Mutex::new(BTreeMap::new()),
+            next_order_id: Mutex::new(1),
+            reconciliations: Mutex::new(BTreeMap::new()),
+            reconciliation_calls: Arc::new(Mutex::new(0)),
             timing,
         }
     }
@@ -3404,6 +3959,17 @@ impl TimedFillAdapter {
             .first()
             .cloned()
             .expect("snapshot")
+    }
+
+    fn set_reconciled_fill(&self, order_id: &str, reconciliation: OrderFillReconciliation) {
+        self.reconciliations
+            .lock()
+            .expect("lock")
+            .insert(order_id.to_string(), reconciliation);
+    }
+
+    fn reconciliation_call_count(&self) -> usize {
+        *self.reconciliation_calls.lock().expect("lock")
     }
 }
 
@@ -3626,6 +4192,9 @@ impl VenueAdapter for TimedFillAdapter {
             };
         }
         *position += request.side.signed_qty(quantity);
+        let mut next_order_id = self.next_order_id.lock().expect("lock");
+        let order_id = format!("{}-timed-{}", self.venue, *next_order_id);
+        *next_order_id += 1;
         Ok(lightfee::OrderFill {
             venue: self.venue,
             symbol: request.symbol,
@@ -3636,7 +4205,7 @@ impl VenueAdapter for TimedFillAdapter {
                 lightfee::Side::Sell => symbol.best_bid,
             },
             fee_quote: 0.0,
-            order_id: format!("{}-timed", self.venue),
+            order_id,
             filled_at_ms: snapshot.observed_at_ms,
             timing: self.timing.clone(),
         })
@@ -3655,6 +4224,21 @@ impl VenueAdapter for TimedFillAdapter {
                 .unwrap_or_default(),
             updated_at_ms: self.current_snapshot().observed_at_ms,
         })
+    }
+
+    async fn fetch_order_fill_reconciliation(
+        &self,
+        _symbol: &str,
+        order_id: &str,
+        _client_order_id: Option<&str>,
+    ) -> Result<Option<OrderFillReconciliation>> {
+        *self.reconciliation_calls.lock().expect("lock") += 1;
+        Ok(self
+            .reconciliations
+            .lock()
+            .expect("lock")
+            .get(order_id)
+            .cloned())
     }
 }
 

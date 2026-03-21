@@ -30,6 +30,7 @@ async fn main() -> Result<()> {
     let adapters = build_adapters(&config, &config_path)
         .await
         .context("failed to build venue adapters")?;
+    prewarm_live_adapters(config.runtime.mode.clone(), &adapters).await?;
     let (opportunity_source, transfer_status_source) = build_sources(&config)?;
     let mut engine = Engine::with_sources(
         config.clone(),
@@ -88,6 +89,24 @@ async fn main() -> Result<()> {
                 break;
             }
         }
+    }
+
+    Ok(())
+}
+
+async fn prewarm_live_adapters(
+    mode: RuntimeMode,
+    adapters: &[Arc<dyn VenueAdapter>],
+) -> Result<()> {
+    if !matches!(mode, RuntimeMode::Live) {
+        return Ok(());
+    }
+
+    for adapter in adapters {
+        adapter
+            .live_startup_prewarm()
+            .await
+            .with_context(|| format!("failed to prewarm {}", adapter.venue()))?;
     }
 
     Ok(())
@@ -202,8 +221,19 @@ fn build_sources(
 
 #[cfg(test)]
 mod tests {
-    use super::startup_market_warmup_ms;
-    use lightfee::config::RuntimeMode;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use super::{prewarm_live_adapters, startup_market_warmup_ms};
+    use anyhow::Result;
+    use async_trait::async_trait;
+    use lightfee::{
+        config::RuntimeMode,
+        models::{OrderFill, OrderRequest, PositionSnapshot, Venue, VenueMarketSnapshot},
+        venue::VenueAdapter,
+    };
 
     #[test]
     fn live_startup_warms_up_when_no_positions_are_open() {
@@ -221,5 +251,61 @@ mod tests {
     #[test]
     fn paper_mode_skips_warmup() {
         assert_eq!(startup_market_warmup_ms(RuntimeMode::Paper, 0, 1_500), None);
+    }
+
+    struct PrewarmProbeAdapter {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl VenueAdapter for PrewarmProbeAdapter {
+        fn venue(&self) -> Venue {
+            Venue::Binance
+        }
+
+        async fn fetch_market_snapshot(&self, _symbols: &[String]) -> Result<VenueMarketSnapshot> {
+            unreachable!("not used in test")
+        }
+
+        async fn place_order(&self, _request: OrderRequest) -> Result<OrderFill> {
+            unreachable!("not used in test")
+        }
+
+        async fn fetch_position(&self, _symbol: &str) -> Result<PositionSnapshot> {
+            unreachable!("not used in test")
+        }
+
+        async fn live_startup_prewarm(&self) -> Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn live_mode_prewarms_adapters_once() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let adapters: Vec<Arc<dyn VenueAdapter>> = vec![Arc::new(PrewarmProbeAdapter {
+            calls: calls.clone(),
+        })];
+
+        prewarm_live_adapters(RuntimeMode::Live, &adapters)
+            .await
+            .expect("prewarm");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn paper_mode_skips_adapter_prewarm() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let adapters: Vec<Arc<dyn VenueAdapter>> = vec![Arc::new(PrewarmProbeAdapter {
+            calls: calls.clone(),
+        })];
+
+        prewarm_live_adapters(RuntimeMode::Paper, &adapters)
+            .await
+            .expect("prewarm");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 }

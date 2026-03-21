@@ -1,8 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use chrono::{Local, TimeZone};
 use serde::Serialize;
 
-use crate::{journal::JournalRecord, models::Venue};
+use crate::{
+    journal::JournalRecord,
+    models::{AccountBalanceSnapshot, Venue},
+};
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct VenueJournalStats {
@@ -26,7 +30,47 @@ pub struct JournalAnalysisReport {
     pub fail_closed_reason_counts: BTreeMap<String, u64>,
     pub optimization_stats: JournalOptimizationStats,
     pub recommendations: Vec<OptimizationRecommendation>,
+    pub current_balance_snapshot: Option<BalanceSnapshotReport>,
+    pub daily_profit_summaries: Vec<DailyProfitSummary>,
     pub trade_replays: Vec<TradeReplay>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct BalanceSnapshotFailure {
+    pub venue: Venue,
+    pub error: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct BalanceSnapshotReport {
+    pub observed_at_ms: i64,
+    pub total_equity_quote: Option<f64>,
+    pub venues: Vec<AccountBalanceSnapshot>,
+    pub failed_venues: Vec<BalanceSnapshotFailure>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct DailySymbolRevenue {
+    pub symbol: String,
+    pub position_count: u64,
+    pub partial_close_count: u64,
+    pub closed_position_count: u64,
+    pub realized_net_quote: f64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct DailyProfitSummary {
+    pub date: String,
+    pub realized_revenue_quote: f64,
+    pub partial_realized_revenue_quote: f64,
+    pub remaining_close_realized_revenue_quote: f64,
+    pub opened_position_count: u64,
+    pub partial_close_count: u64,
+    pub closed_position_count: u64,
+    pub latest_total_equity_quote: Option<f64>,
+    pub latest_balance_observed_at_ms: Option<i64>,
+    pub venue_equity_quote: BTreeMap<Venue, f64>,
+    pub opened_symbol_revenues: Vec<DailySymbolRevenue>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
@@ -121,13 +165,57 @@ struct TradeReplayAccumulator {
     total_fee_quote: f64,
 }
 
+#[derive(Default)]
+struct DailySymbolRevenueAccumulator {
+    symbol: String,
+    position_ids: BTreeSet<String>,
+    partial_close_count: u64,
+    closed_position_count: u64,
+    realized_net_quote: f64,
+}
+
+#[derive(Default)]
+struct DailyProfitAccumulator {
+    date: String,
+    realized_revenue_quote: f64,
+    partial_realized_revenue_quote: f64,
+    remaining_close_realized_revenue_quote: f64,
+    opened_position_count: u64,
+    partial_close_count: u64,
+    closed_position_count: u64,
+    latest_total_equity_quote: Option<f64>,
+    latest_balance_observed_at_ms: Option<i64>,
+    venue_equity_quote: BTreeMap<Venue, f64>,
+    opened_symbol_revenues: BTreeMap<String, DailySymbolRevenueAccumulator>,
+}
+
+#[derive(Default)]
+struct PositionDayInfo {
+    symbol: Option<String>,
+    opened_date: Option<String>,
+}
+
 pub fn analyze_journal_records(records: &[JournalRecord]) -> JournalAnalysisReport {
+    let reconciled_final_positions = records
+        .iter()
+        .filter(|record| record.kind == "exit.reconciled")
+        .filter_map(|record| payload_string(record, "position_id").map(ToOwned::to_owned))
+        .collect::<BTreeSet<_>>();
+    let reconciled_partial_positions = records
+        .iter()
+        .filter(|record| record.kind == "exit.partial_reconciled")
+        .filter_map(partial_reconciliation_key)
+        .collect::<BTreeSet<_>>();
+
     let mut runs = BTreeSet::new();
     let mut venue_accumulators = BTreeMap::<Venue, VenueAccumulator>::new();
     let mut recovery_counts = BTreeMap::<String, u64>::new();
     let mut fail_closed_reason_counts = BTreeMap::<String, u64>::new();
     let mut optimization_stats = JournalOptimizationStats::default();
     let mut trade_replays = BTreeMap::<String, TradeReplayAccumulator>::new();
+    let mut current_balance_snapshot = None::<BalanceSnapshotReport>;
+    let mut daily_profit_accumulators = BTreeMap::<String, DailyProfitAccumulator>::new();
+    let mut position_day_info = BTreeMap::<String, PositionDayInfo>::new();
 
     for record in records {
         if !record.run_id.trim().is_empty() {
@@ -135,6 +223,38 @@ pub fn analyze_journal_records(records: &[JournalRecord]) -> JournalAnalysisRepo
         }
         if record.kind.starts_with("recovery.") {
             *recovery_counts.entry(record.kind.clone()).or_default() += 1;
+        }
+
+        if record.kind == "balance.snapshot" {
+            if let Some(snapshot) = parse_balance_snapshot_report(record) {
+                if current_balance_snapshot
+                    .as_ref()
+                    .map(|current| current.observed_at_ms <= snapshot.observed_at_ms)
+                    .unwrap_or(true)
+                {
+                    current_balance_snapshot = Some(snapshot.clone());
+                }
+                let date = local_date_key(record.ts_ms);
+                let daily = daily_profit_accumulators
+                    .entry(date.clone())
+                    .or_insert_with(|| DailyProfitAccumulator {
+                        date,
+                        ..DailyProfitAccumulator::default()
+                    });
+                if daily
+                    .latest_balance_observed_at_ms
+                    .map(|observed| observed <= snapshot.observed_at_ms)
+                    .unwrap_or(true)
+                {
+                    daily.latest_total_equity_quote = snapshot.total_equity_quote;
+                    daily.latest_balance_observed_at_ms = Some(snapshot.observed_at_ms);
+                    daily.venue_equity_quote = snapshot
+                        .venues
+                        .iter()
+                        .map(|item| (item.venue, item.equity_quote))
+                        .collect();
+                }
+            }
         }
 
         match record.kind.as_str() {
@@ -278,6 +398,102 @@ pub fn analyze_journal_records(records: &[JournalRecord]) -> JournalAnalysisRepo
             _ => {}
         }
 
+        let date = local_date_key(record.ts_ms);
+        match record.kind.as_str() {
+            "entry.opened" => {
+                let Some(position_id) = payload_string(record, "position_id") else {
+                    continue;
+                };
+                let symbol = payload_string(record, "symbol").map(ToOwned::to_owned);
+                let info = position_day_info
+                    .entry(position_id.to_string())
+                    .or_default();
+                if info.symbol.is_none() {
+                    info.symbol = symbol.clone();
+                }
+                if info.opened_date.is_none() {
+                    info.opened_date = Some(date.clone());
+                }
+                let daily = daily_profit_accumulators
+                    .entry(date.clone())
+                    .or_insert_with(|| DailyProfitAccumulator {
+                        date: date.clone(),
+                        ..DailyProfitAccumulator::default()
+                    });
+                daily.opened_position_count += 1;
+                if let Some(symbol) = symbol {
+                    let symbol_daily = daily
+                        .opened_symbol_revenues
+                        .entry(symbol.clone())
+                        .or_insert_with(|| DailySymbolRevenueAccumulator {
+                            symbol,
+                            ..DailySymbolRevenueAccumulator::default()
+                        });
+                    symbol_daily.position_ids.insert(position_id.to_string());
+                }
+            }
+            "exit.partial_closed" => {
+                if partial_reconciliation_key(record)
+                    .as_ref()
+                    .is_some_and(|key| reconciled_partial_positions.contains(key))
+                {
+                    continue;
+                }
+                let Some(position_id) = payload_string(record, "position_id") else {
+                    continue;
+                };
+                accumulate_partial_close(
+                    &mut daily_profit_accumulators,
+                    &position_day_info,
+                    date,
+                    position_id,
+                    record,
+                );
+            }
+            "exit.partial_reconciled" => {
+                let Some(position_id) = payload_string(record, "position_id") else {
+                    continue;
+                };
+                accumulate_partial_close(
+                    &mut daily_profit_accumulators,
+                    &position_day_info,
+                    payload_date_key(record),
+                    position_id,
+                    record,
+                );
+            }
+            "exit.closed" => {
+                if payload_string(record, "position_id")
+                    .is_some_and(|position_id| reconciled_final_positions.contains(position_id))
+                {
+                    continue;
+                }
+                let Some(position_id) = payload_string(record, "position_id") else {
+                    continue;
+                };
+                accumulate_final_close(
+                    &mut daily_profit_accumulators,
+                    &position_day_info,
+                    date,
+                    position_id,
+                    record,
+                );
+            }
+            "exit.reconciled" => {
+                let Some(position_id) = payload_string(record, "position_id") else {
+                    continue;
+                };
+                accumulate_final_close(
+                    &mut daily_profit_accumulators,
+                    &position_day_info,
+                    payload_date_key(record),
+                    position_id,
+                    record,
+                );
+            }
+            _ => {}
+        }
+
         if let Some(position_id) = payload_string(record, "position_id") {
             let replay = trade_replays
                 .entry(position_id.to_string())
@@ -327,6 +543,11 @@ pub fn analyze_journal_records(records: &[JournalRecord]) -> JournalAnalysisRepo
         .collect::<Vec<_>>();
     trade_replays.sort_by_key(|replay| (replay.first_ts_ms, replay.position_id.clone()));
     let recommendations = build_recommendations(&venue_stats, &optimization_stats, &trade_replays);
+    let mut daily_profit_summaries = daily_profit_accumulators
+        .into_values()
+        .map(finalize_daily_profit_summary)
+        .collect::<Vec<_>>();
+    daily_profit_summaries.sort_by(|left, right| left.date.cmp(&right.date));
 
     JournalAnalysisReport {
         total_records: records.len(),
@@ -336,8 +557,58 @@ pub fn analyze_journal_records(records: &[JournalRecord]) -> JournalAnalysisRepo
         fail_closed_reason_counts,
         optimization_stats,
         recommendations,
+        current_balance_snapshot,
+        daily_profit_summaries,
         trade_replays,
     }
+}
+
+fn parse_balance_snapshot_report(record: &JournalRecord) -> Option<BalanceSnapshotReport> {
+    let observed_at_ms = record.ts_ms;
+    let total_equity_quote = payload_f64(record, "total_equity_quote");
+    let venues = record
+        .payload
+        .get("venues")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    serde_json::from_value::<AccountBalanceSnapshot>(item.clone()).ok()
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let failed_venues = record
+        .payload
+        .get("failed_venues")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    Some(BalanceSnapshotFailure {
+                        venue: item.get("venue")?.as_str()?.parse().ok()?,
+                        error: item.get("error")?.as_str()?.to_string(),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Some(BalanceSnapshotReport {
+        observed_at_ms,
+        total_equity_quote,
+        venues,
+        failed_venues,
+    })
+}
+
+fn local_date_key(ts_ms: i64) -> String {
+    Local
+        .timestamp_millis_opt(ts_ms)
+        .single()
+        .map(|value| value.date_naive().to_string())
+        .unwrap_or_else(|| "1970-01-01".to_string())
 }
 
 fn payload_venue(record: &JournalRecord) -> Option<Venue> {
@@ -350,6 +621,10 @@ fn payload_string<'a>(record: &'a JournalRecord, key: &str) -> Option<&'a str> {
 
 fn payload_u64(record: &JournalRecord, key: &str) -> Option<u64> {
     record.payload.get(key).and_then(|value| value.as_u64())
+}
+
+fn payload_i64(record: &JournalRecord, key: &str) -> Option<i64> {
+    record.payload.get(key).and_then(|value| value.as_i64())
 }
 
 fn payload_f64(record: &JournalRecord, key: &str) -> Option<f64> {
@@ -373,6 +648,110 @@ fn extend_counter_map(target: &mut BTreeMap<String, u64>, value: Option<&serde_j
             continue;
         };
         *target.entry(key.clone()).or_default() += count;
+    }
+}
+
+fn payload_date_key(record: &JournalRecord) -> String {
+    local_date_key(payload_i64(record, "closed_at_ms").unwrap_or(record.ts_ms))
+}
+
+fn partial_reconciliation_key(record: &JournalRecord) -> Option<(String, i64)> {
+    Some((
+        payload_string(record, "position_id")?.to_string(),
+        payload_i64(record, "closed_at_ms")?,
+    ))
+}
+
+fn accumulate_partial_close(
+    daily_profit_accumulators: &mut BTreeMap<String, DailyProfitAccumulator>,
+    position_day_info: &BTreeMap<String, PositionDayInfo>,
+    date: String,
+    position_id: &str,
+    record: &JournalRecord,
+) {
+    let segment_net_quote = record
+        .payload
+        .get("outcome_diagnostics")
+        .and_then(|value| value.get("net_quote"))
+        .and_then(|value| value.as_f64())
+        .unwrap_or_default();
+    let daily = daily_profit_accumulators
+        .entry(date.clone())
+        .or_insert_with(|| DailyProfitAccumulator {
+            date: date.clone(),
+            ..DailyProfitAccumulator::default()
+        });
+    daily.realized_revenue_quote += segment_net_quote;
+    daily.partial_realized_revenue_quote += segment_net_quote;
+    daily.partial_close_count += 1;
+
+    if let Some(info) = position_day_info.get(position_id) {
+        if let (Some(opened_date), Some(symbol)) = (info.opened_date.as_ref(), info.symbol.as_ref())
+        {
+            let opened_daily = daily_profit_accumulators
+                .entry(opened_date.clone())
+                .or_insert_with(|| DailyProfitAccumulator {
+                    date: opened_date.clone(),
+                    ..DailyProfitAccumulator::default()
+                });
+            let symbol_daily = opened_daily
+                .opened_symbol_revenues
+                .entry(symbol.clone())
+                .or_insert_with(|| DailySymbolRevenueAccumulator {
+                    symbol: symbol.clone(),
+                    ..DailySymbolRevenueAccumulator::default()
+                });
+            symbol_daily.position_ids.insert(position_id.to_string());
+            symbol_daily.partial_close_count += 1;
+            symbol_daily.realized_net_quote += segment_net_quote;
+        }
+    }
+}
+
+fn accumulate_final_close(
+    daily_profit_accumulators: &mut BTreeMap<String, DailyProfitAccumulator>,
+    position_day_info: &BTreeMap<String, PositionDayInfo>,
+    date: String,
+    position_id: &str,
+    record: &JournalRecord,
+) {
+    let segment_net_quote = record
+        .payload
+        .get("remaining_outcome_diagnostics")
+        .and_then(|value| value.get("net_quote"))
+        .and_then(|value| value.as_f64())
+        .or_else(|| payload_f64(record, "net_quote"))
+        .unwrap_or_default();
+    let daily = daily_profit_accumulators
+        .entry(date.clone())
+        .or_insert_with(|| DailyProfitAccumulator {
+            date: date.clone(),
+            ..DailyProfitAccumulator::default()
+        });
+    daily.realized_revenue_quote += segment_net_quote;
+    daily.remaining_close_realized_revenue_quote += segment_net_quote;
+    daily.closed_position_count += 1;
+
+    if let Some(info) = position_day_info.get(position_id) {
+        if let (Some(opened_date), Some(symbol)) = (info.opened_date.as_ref(), info.symbol.as_ref())
+        {
+            let opened_daily = daily_profit_accumulators
+                .entry(opened_date.clone())
+                .or_insert_with(|| DailyProfitAccumulator {
+                    date: opened_date.clone(),
+                    ..DailyProfitAccumulator::default()
+                });
+            let symbol_daily = opened_daily
+                .opened_symbol_revenues
+                .entry(symbol.clone())
+                .or_insert_with(|| DailySymbolRevenueAccumulator {
+                    symbol: symbol.clone(),
+                    ..DailySymbolRevenueAccumulator::default()
+                });
+            symbol_daily.position_ids.insert(position_id.to_string());
+            symbol_daily.closed_position_count += 1;
+            symbol_daily.realized_net_quote += segment_net_quote;
+        }
     }
 }
 
@@ -405,10 +784,21 @@ fn update_trade_replay(replay: &mut TradeReplayAccumulator, record: &JournalReco
         "entry.opened" => {
             replay.opened_position = Some(record.payload.clone());
         }
-        "exit.partial_closed" => {
-            replay.partial_close_summaries.push(record.payload.clone());
+        "exit.partial_closed" | "exit.partial_reconciled" => {
+            let closed_at_ms = payload_i64(record, "closed_at_ms");
+            if let Some(closed_at_ms) = closed_at_ms {
+                if let Some(existing) = replay.partial_close_summaries.iter_mut().find(|item| {
+                    item.get("closed_at_ms").and_then(|value| value.as_i64()) == Some(closed_at_ms)
+                }) {
+                    *existing = record.payload.clone();
+                } else {
+                    replay.partial_close_summaries.push(record.payload.clone());
+                }
+            } else {
+                replay.partial_close_summaries.push(record.payload.clone());
+            }
         }
-        "exit.closed" => {
+        "exit.closed" | "exit.reconciled" => {
             replay.close_summary = Some(record.payload.clone());
         }
         "entry.compensated" | "execution.compensation_failed" => {
@@ -540,6 +930,35 @@ fn finalize_trade_replay(mut accumulator: TradeReplayAccumulator) -> TradeReplay
         warnings: accumulator.warnings,
         errors: accumulator.errors,
         total_fee_quote: accumulator.total_fee_quote,
+    }
+}
+
+fn finalize_daily_profit_summary(accumulator: DailyProfitAccumulator) -> DailyProfitSummary {
+    let mut opened_symbol_revenues = accumulator
+        .opened_symbol_revenues
+        .into_values()
+        .map(|item| DailySymbolRevenue {
+            symbol: item.symbol,
+            position_count: item.position_ids.len() as u64,
+            partial_close_count: item.partial_close_count,
+            closed_position_count: item.closed_position_count,
+            realized_net_quote: item.realized_net_quote,
+        })
+        .collect::<Vec<_>>();
+    opened_symbol_revenues.sort_by(|left, right| left.symbol.cmp(&right.symbol));
+
+    DailyProfitSummary {
+        date: accumulator.date,
+        realized_revenue_quote: accumulator.realized_revenue_quote,
+        partial_realized_revenue_quote: accumulator.partial_realized_revenue_quote,
+        remaining_close_realized_revenue_quote: accumulator.remaining_close_realized_revenue_quote,
+        opened_position_count: accumulator.opened_position_count,
+        partial_close_count: accumulator.partial_close_count,
+        closed_position_count: accumulator.closed_position_count,
+        latest_total_equity_quote: accumulator.latest_total_equity_quote,
+        latest_balance_observed_at_ms: accumulator.latest_balance_observed_at_ms,
+        venue_equity_quote: accumulator.venue_equity_quote,
+        opened_symbol_revenues,
     }
 }
 

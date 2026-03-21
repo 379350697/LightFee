@@ -14,7 +14,8 @@ pub mod transfer;
 pub mod venue;
 
 pub use analysis::{
-    analyze_journal_records, JournalAnalysisReport, JournalOptimizationStats,
+    analyze_journal_records, BalanceSnapshotFailure, BalanceSnapshotReport, DailyProfitSummary,
+    DailySymbolRevenue, JournalAnalysisReport, JournalOptimizationStats,
     OptimizationRecommendation, TradeLegReplay, TradeReplay, VenueJournalStats,
 };
 pub use config::{
@@ -26,9 +27,9 @@ pub use journal::{JournalRecord, JournalRuntimeMetricsSnapshot, JsonlJournal};
 pub use live::{BinanceLiveAdapter, BybitLiveAdapter, HyperliquidLiveAdapter, OkxLiveAdapter};
 pub use market::MarketView;
 pub use models::{
-    AssetTransferStatus, CandidateOpportunity, FundingLeg, FundingOpportunityType,
-    OrderExecutionTiming, OrderFill, OrderRequest, PositionSnapshot, Side, SymbolMarketSnapshot,
-    Venue, VenueMarketSnapshot,
+    AccountBalanceSnapshot, AssetTransferStatus, CandidateOpportunity, FundingLeg,
+    FundingOpportunityType, OrderExecutionTiming, OrderFill, OrderFillReconciliation, OrderRequest,
+    PositionSnapshot, Side, SymbolMarketSnapshot, Venue, VenueMarketSnapshot,
 };
 pub use opportunity_source::{
     ChillybotOpportunitySource, FeedgrabChillybotSource, OpportunityHint, OpportunityHintSource,

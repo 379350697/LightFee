@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     sync::{Arc, Mutex},
+    time::Instant,
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -18,8 +19,9 @@ use tracing::{debug, warn};
 use crate::{
     config::{RuntimeConfig, VenueConfig},
     models::{
-        AssetTransferStatus, OrderFill, OrderRequest, PositionSnapshot, Side, SymbolMarketSnapshot,
-        Venue, VenueMarketSnapshot,
+        AccountBalanceSnapshot, AssetTransferStatus, OrderExecutionTiming, OrderFill,
+        OrderFillReconciliation, OrderRequest, PositionSnapshot, Side, SymbolMarketSnapshot, Venue,
+        VenueMarketSnapshot,
     },
     resilience::FailureBackoff,
     venue::VenueAdapter,
@@ -778,6 +780,94 @@ impl OkxLiveAdapter {
         }
         Ok(response)
     }
+
+    async fn submit_order_once(
+        &self,
+        request: &OrderRequest,
+        meta: &OkxInstrumentMeta,
+        position_mode: OkxPositionMode,
+        contracts: f64,
+    ) -> Result<OkxOrderResponseWithTiming> {
+        let sign_started_at = Instant::now();
+        let body = serde_json::json!({
+            "instId": venue_symbol(&self.config, &request.symbol),
+            "tdMode": "cross",
+            "side": match request.side {
+                Side::Buy => "buy",
+                Side::Sell => "sell",
+            },
+            "posSide": okx_pos_side(position_mode, request.side, request.reduce_only),
+            "ordType": "market",
+            "sz": format_decimal(contracts, meta.lot_sz),
+            "clOrdId": request.client_order_id,
+            "reduceOnly": request.reduce_only,
+        })
+        .to_string();
+        let timestamp = self.server_timestamp_iso8601().await?;
+        let api_key = self
+            .config
+            .live
+            .resolved_api_key()
+            .ok_or_else(|| anyhow!("okx api key is not configured"))?;
+        let api_secret = self
+            .config
+            .live
+            .resolved_api_secret()
+            .ok_or_else(|| anyhow!("okx api secret is not configured"))?;
+        let passphrase = self
+            .config
+            .live
+            .resolved_api_passphrase()
+            .ok_or_else(|| anyhow!("okx api passphrase is not configured"))?;
+        let request_path = "/api/v5/trade/order";
+        let sign_payload = format!(
+            "{}{}{}{}",
+            timestamp,
+            reqwest::Method::POST.as_str(),
+            request_path,
+            body
+        );
+        let signature = hmac_sha256_base64(&api_secret, &sign_payload)?;
+        let request_sign_ms = elapsed_ms(sign_started_at);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("OK-ACCESS-KEY", HeaderValue::from_str(&api_key)?);
+        headers.insert("OK-ACCESS-SIGN", HeaderValue::from_str(&signature)?);
+        headers.insert("OK-ACCESS-TIMESTAMP", HeaderValue::from_str(&timestamp)?);
+        headers.insert("OK-ACCESS-PASSPHRASE", HeaderValue::from_str(&passphrase)?);
+        headers.insert("Content-Type", HeaderValue::from_static("application/json"));
+
+        let submit_started_at = Instant::now();
+        let response = self
+            .client
+            .request(
+                reqwest::Method::POST,
+                format!("{}{}", self.base_url, request_path),
+            )
+            .headers(headers)
+            .body(body)
+            .send()
+            .await
+            .context("failed to send signed okx request")?;
+        let submit_http_ms = elapsed_ms(submit_started_at);
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(format_okx_http_error(status, &body));
+        }
+        let decode_started_at = Instant::now();
+        let response = response
+            .json::<OkxApiResponse<OkxOrderAck>>()
+            .await
+            .context("failed to decode okx order ack")?;
+        let response_decode_ms = elapsed_ms(decode_started_at);
+        Ok(OkxOrderResponseWithTiming {
+            response,
+            request_sign_ms,
+            submit_http_ms,
+            response_decode_ms,
+        })
+    }
 }
 
 fn format_okx_http_error(status: reqwest::StatusCode, body: &str) -> anyhow::Error {
@@ -913,43 +1003,30 @@ impl VenueAdapter for OkxLiveAdapter {
 
     async fn place_order(&self, request: OrderRequest) -> Result<OrderFill> {
         ensure_okx_client_order_id(&request.client_order_id)?;
+        let order_prepare_started_at = Instant::now();
         let meta = self.symbol_meta(&request.symbol).await?;
         let position_mode = self.position_mode().await?;
         let contracts = floor_to_step(request.quantity / meta.ct_val, meta.lot_sz);
         validate_okx_order_request(&meta, &request.symbol, contracts)?;
-
-        let body = serde_json::json!({
-            "instId": venue_symbol(&self.config, &request.symbol),
-            "tdMode": "cross",
-            "side": match request.side {
-                Side::Buy => "buy",
-                Side::Sell => "sell",
-            },
-            "posSide": okx_pos_side(position_mode, request.side, request.reduce_only),
-            "ordType": "market",
-            "sz": format_decimal(contracts, meta.lot_sz),
-            "clOrdId": request.client_order_id,
-            "reduceOnly": request.reduce_only,
-        })
-        .to_string();
+        let order_prepare_ms = elapsed_ms(order_prepare_started_at);
+        let submit_started_at = Instant::now();
         let response = self
-            .signed_request(
-                reqwest::Method::POST,
-                "/api/v5/trade/order",
-                None,
-                Some(body),
-            )
-            .await?
-            .json::<OkxApiResponse<OkxOrderAck>>()
-            .await
-            .context("failed to decode okx order ack")?;
-        if response.code.as_deref().is_some_and(|code| code != "0") {
+            .submit_order_once(&request, &meta, position_mode, contracts)
+            .await?;
+        let submit_ack_ms = elapsed_ms(submit_started_at);
+        if response
+            .response
+            .code
+            .as_deref()
+            .is_some_and(|code| code != "0")
+        {
             return Err(format_okx_order_response_error(
                 "okx order ack failed",
-                &response,
+                &response.response,
             ));
         }
         let ack = response
+            .response
             .data
             .into_iter()
             .next()
@@ -977,8 +1054,17 @@ impl VenueAdapter for OkxLiveAdapter {
             fee_quote: estimate_fee_quote(average_price, quantity, self.config.taker_fee_bps),
             order_id: ack.ord_id.unwrap_or_else(|| "okx-unknown".to_string()),
             filled_at_ms,
-            timing: None,
+            timing: Some(OrderExecutionTiming {
+                quote_resolve_ms: None,
+                order_prepare_ms: Some(order_prepare_ms),
+                request_sign_ms: Some(response.request_sign_ms),
+                submit_http_ms: Some(response.submit_http_ms),
+                response_decode_ms: Some(response.response_decode_ms),
+                private_fill_wait_ms: None,
+                submit_ack_ms: Some(submit_ack_ms),
+            }),
         };
+        let private_fill_wait_started_at = Instant::now();
         if let Some(private_fill) = lookup_or_wait_private_order(
             &self.private_ws,
             Some(&request.client_order_id),
@@ -988,6 +1074,9 @@ impl VenueAdapter for OkxLiveAdapter {
         .await
         {
             fill = enrich_fill_from_private(fill, &private_fill);
+        }
+        if let Some(timing) = fill.timing.as_mut() {
+            timing.private_fill_wait_ms = Some(elapsed_ms(private_fill_wait_started_at));
         }
         Ok(fill)
     }
@@ -1092,6 +1181,84 @@ impl VenueAdapter for OkxLiveAdapter {
         ))
     }
 
+    async fn fetch_account_balance_snapshot(&self) -> Result<Option<AccountBalanceSnapshot>> {
+        let response = self
+            .signed_request(reqwest::Method::GET, "/api/v5/account/balance", None, None)
+            .await?
+            .json::<OkxApiResponse<OkxAccountBalance>>()
+            .await
+            .context("failed to decode okx account balance")?;
+        let response = ensure_okx_api_success("okx account balance failed", response)?;
+        let row = response
+            .data
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("okx account balance missing row"))?;
+
+        Ok(Some(AccountBalanceSnapshot {
+            venue: Venue::Okx,
+            equity_quote: parse_f64(&row.total_eq)?,
+            wallet_balance_quote: row.adj_eq.as_deref().map(parse_f64).transpose()?,
+            available_balance_quote: row.avail_eq.as_deref().map(parse_f64).transpose()?,
+            observed_at_ms: now_ms(),
+        }))
+    }
+
+    async fn fetch_order_fill_reconciliation(
+        &self,
+        symbol: &str,
+        order_id: &str,
+        _client_order_id: Option<&str>,
+    ) -> Result<Option<OrderFillReconciliation>> {
+        let meta = self.symbol_meta(symbol).await?;
+        let query = build_query(&[
+            ("instType", "SWAP".to_string()),
+            ("instId", venue_symbol(&self.config, symbol)),
+            ("ordId", order_id.to_string()),
+        ]);
+        let response = self
+            .signed_request(
+                reqwest::Method::GET,
+                "/api/v5/trade/fills",
+                Some(query),
+                None,
+            )
+            .await?
+            .json::<OkxApiResponse<OkxTradeFill>>()
+            .await
+            .context("failed to decode okx fill reconciliation")?;
+        let response = ensure_okx_api_success("okx fill reconciliation failed", response)?;
+        if response.data.is_empty() {
+            return Ok(None);
+        }
+
+        let mut total_quantity = 0.0;
+        let mut weighted_notional = 0.0;
+        let mut total_fee_quote = 0.0;
+        let mut latest_fill_ms = 0_i64;
+        for fill in response.data {
+            let contracts = parse_f64(&fill.fill_sz)?;
+            let quantity = contracts * meta.ct_val;
+            let price = parse_f64(&fill.fill_px)?;
+            total_quantity += quantity;
+            weighted_notional += price * quantity;
+            total_fee_quote += parse_f64(&fill.fee)?.abs();
+            latest_fill_ms = latest_fill_ms.max(parse_i64(&fill.ts)?);
+        }
+        if total_quantity <= 0.0 {
+            return Ok(None);
+        }
+
+        Ok(Some(OrderFillReconciliation {
+            order_id: order_id.to_string(),
+            client_order_id: None,
+            quantity: total_quantity,
+            average_price: weighted_notional / total_quantity,
+            fee_quote: Some(total_fee_quote).filter(|value| *value > 0.0),
+            filled_at_ms: latest_fill_ms.max(now_ms()),
+        }))
+    }
+
     async fn normalize_quantity(&self, symbol: &str, quantity: f64) -> Result<f64> {
         let meta = self.symbol_meta(symbol).await?;
         let contracts = floor_to_step(quantity / meta.ct_val, meta.lot_sz);
@@ -1172,6 +1339,12 @@ impl VenueAdapter for OkxLiveAdapter {
         Some(self.tracked_symbols(requested_symbols))
     }
 
+    async fn live_startup_prewarm(&self) -> Result<()> {
+        let _ = self.server_timestamp_ms().await?;
+        let _ = self.position_mode().await?;
+        Ok(())
+    }
+
     async fn shutdown(&self) -> Result<()> {
         self.market_ws.abort_worker();
         self.private_ws.abort_workers();
@@ -1192,6 +1365,14 @@ struct OkxSymbolCatalogCache {
     updated_at_ms: i64,
     supported_symbols: Vec<String>,
     metadata: HashMap<String, OkxInstrumentMeta>,
+}
+
+#[derive(Debug)]
+struct OkxOrderResponseWithTiming {
+    response: OkxApiResponse<OkxOrderAck>,
+    request_sign_ms: u64,
+    submit_http_ms: u64,
+    response_decode_ms: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1266,6 +1447,16 @@ struct OkxPosition {
     pos_side: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct OkxTradeFill {
+    #[serde(rename = "fillPx")]
+    fill_px: String,
+    #[serde(rename = "fillSz")]
+    fill_sz: String,
+    fee: String,
+    ts: String,
+}
+
 #[derive(Clone, Debug)]
 enum OkxPositionMode {
     Net,
@@ -1296,6 +1487,10 @@ fn okx_public_ws_url(base_url: &str) -> &'static str {
     } else {
         "wss://ws.okx.com:8443/ws/v5/public"
     }
+}
+
+fn elapsed_ms(started_at: Instant) -> u64 {
+    started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
 }
 
 fn okx_private_ws_url(base_url: &str) -> &'static str {
@@ -1575,6 +1770,16 @@ struct OkxCurrency {
     can_dep: bool,
     #[serde(rename = "canWd")]
     can_wd: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct OkxAccountBalance {
+    #[serde(rename = "totalEq")]
+    total_eq: String,
+    #[serde(rename = "adjEq")]
+    adj_eq: Option<String>,
+    #[serde(rename = "availEq")]
+    avail_eq: Option<String>,
 }
 
 fn ensure_okx_client_order_id(client_order_id: &str) -> Result<()> {
