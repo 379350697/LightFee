@@ -42,7 +42,8 @@ use crate::{
     config::{RuntimeConfig, VenueConfig},
     models::{
         AccountBalanceSnapshot, OrderExecutionTiming, OrderFill, OrderFillReconciliation,
-        OrderRequest, PositionSnapshot, Side, SymbolMarketSnapshot, Venue, VenueMarketSnapshot,
+        OrderRequest, PerpLiquiditySnapshot, PositionSnapshot, Side, SymbolMarketSnapshot, Venue,
+        VenueMarketSnapshot,
     },
     venue::VenueAdapter,
 };
@@ -54,6 +55,7 @@ use super::{
 };
 
 const HYPERLIQUID_MIN_NOTIONAL_QUOTE: f64 = 10.0;
+const HYPERLIQUID_PERP_LIQUIDITY_CACHE_TTL_MS: i64 = 60 * 1_000;
 
 pub struct HyperliquidLiveAdapter {
     config: VenueConfig,
@@ -66,6 +68,7 @@ pub struct HyperliquidLiveAdapter {
     market_ws: Arc<WsMarketState>,
     market_subscription_symbols: Mutex<Vec<String>>,
     private_ws: Arc<WsPrivateState>,
+    perp_liquidity_cache: Arc<Mutex<HashMap<String, PerpLiquiditySnapshot>>>,
     order_ws: HyperliquidWsPostClient,
 }
 
@@ -132,6 +135,7 @@ impl HyperliquidLiveAdapter {
             market_ws,
             market_subscription_symbols: Mutex::new(Vec::new()),
             private_ws: WsPrivateState::new(),
+            perp_liquidity_cache: Arc::new(Mutex::new(HashMap::new())),
             order_ws: HyperliquidWsPostClient::new(hyperliquid_ws_url(base_url)),
         };
         if let Err(error) = adapter.refresh_symbol_catalog().await {
@@ -274,6 +278,7 @@ impl HyperliquidLiveAdapter {
         }
 
         let cache = self.market_ws.clone();
+        let perp_liquidity_cache = self.perp_liquidity_cache.clone();
         let unhealthy_after_failures = self.runtime.ws_unhealthy_after_failures;
         let task = tokio::spawn(async move {
             let _info_client = info_client;
@@ -318,6 +323,22 @@ impl HyperliquidLiveAdapter {
                         };
                         let funding_rate = match ctx.data.ctx {
                             hyperliquid_rust_sdk::AssetCtx::Perps(ref perps) => {
+                                if let (Ok(volume_24h_quote), Ok(open_interest), Ok(mark_price)) = (
+                                    parse_f64(&perps.shared.day_ntl_vlm),
+                                    parse_f64(&perps.open_interest),
+                                    parse_f64(&perps.shared.mark_px),
+                                ) {
+                                    perp_liquidity_cache.lock().expect("lock").insert(
+                                        symbol.clone(),
+                                        PerpLiquiditySnapshot {
+                                            venue: Venue::Hyperliquid,
+                                            symbol: symbol.clone(),
+                                            volume_24h_quote,
+                                            open_interest_quote: open_interest * mark_price,
+                                            observed_at_ms: now_ms(),
+                                        },
+                                    );
+                                }
                                 parse_f64(&perps.funding).ok()
                             }
                             hyperliquid_rust_sdk::AssetCtx::Spot(_) => None,
@@ -607,6 +628,27 @@ impl HyperliquidLiveAdapter {
             .get(asset)
             .cloned()
             .ok_or_else(|| anyhow!("hyperliquid asset metadata missing for {asset}"))
+    }
+
+    fn cached_perp_liquidity_snapshot(
+        &self,
+        symbol: &str,
+        observed_at_ms: i64,
+    ) -> Option<PerpLiquiditySnapshot> {
+        let snapshot = self
+            .perp_liquidity_cache
+            .lock()
+            .expect("lock")
+            .get(symbol)
+            .cloned()?;
+        if !cache_is_fresh(
+            snapshot.observed_at_ms,
+            observed_at_ms,
+            HYPERLIQUID_PERP_LIQUIDITY_CACHE_TTL_MS,
+        ) {
+            return None;
+        }
+        Some(snapshot)
     }
 
     async fn ioc_order_params(
@@ -1011,6 +1053,24 @@ impl VenueAdapter for HyperliquidLiveAdapter {
         let asset = venue_symbol(&self.config, symbol);
         let asset_meta = self.asset_meta(&asset).await?;
         Ok(round_to_decimals(quantity, asset_meta.sz_decimals))
+    }
+
+    async fn fetch_perp_liquidity_snapshot(
+        &self,
+        symbol: &str,
+    ) -> Result<Option<PerpLiquiditySnapshot>> {
+        if !self.supports_symbol(symbol) {
+            return Ok(None);
+        }
+        let observed_at_ms = now_ms();
+        self.cached_perp_liquidity_snapshot(symbol, observed_at_ms)
+            .map(Some)
+            .ok_or_else(|| {
+                anyhow!(
+                    "hyperliquid active asset ctx unavailable for {}",
+                    venue_symbol(&self.config, symbol)
+                )
+            })
     }
 
     fn min_entry_notional_quote_hint(

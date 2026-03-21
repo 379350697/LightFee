@@ -3,7 +3,7 @@ use async_trait::async_trait;
 
 use crate::models::{
     AccountBalanceSnapshot, AssetTransferStatus, OrderFill, OrderFillReconciliation, OrderRequest,
-    PositionSnapshot, Venue, VenueMarketSnapshot,
+    PerpLiquiditySnapshot, PositionSnapshot, Venue, VenueMarketSnapshot,
 };
 
 #[async_trait]
@@ -43,6 +43,13 @@ pub trait VenueAdapter: Send + Sync {
 
     async fn normalize_quantity(&self, _symbol: &str, quantity: f64) -> Result<f64> {
         Ok(quantity)
+    }
+
+    async fn fetch_perp_liquidity_snapshot(
+        &self,
+        _symbol: &str,
+    ) -> Result<Option<PerpLiquiditySnapshot>> {
+        Ok(None)
     }
 
     fn min_entry_notional_quote_hint(

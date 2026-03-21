@@ -5,8 +5,8 @@ use async_trait::async_trait;
 
 use crate::{
     models::{
-        AccountBalanceSnapshot, OrderFill, OrderRequest, PositionSnapshot, Side, Venue,
-        VenueMarketSnapshot,
+        AccountBalanceSnapshot, OrderFill, OrderRequest, PerpLiquiditySnapshot, PositionSnapshot,
+        Side, Venue, VenueMarketSnapshot,
     },
     venue::VenueAdapter,
 };
@@ -17,6 +17,8 @@ struct Inner {
     cursor: usize,
     last_index: usize,
     positions: BTreeMap<String, f64>,
+    perp_liquidity: BTreeMap<String, PerpLiquiditySnapshot>,
+    perp_liquidity_errors: BTreeMap<String, String>,
     fail_next_orders: usize,
     next_order_id: u64,
 }
@@ -42,6 +44,8 @@ impl ScriptedVenueAdapter {
                 cursor: 0,
                 last_index: 0,
                 positions: BTreeMap::new(),
+                perp_liquidity: BTreeMap::new(),
+                perp_liquidity_errors: BTreeMap::new(),
                 fail_next_orders: 0,
                 next_order_id: 1,
             }),
@@ -74,6 +78,42 @@ impl ScriptedVenueAdapter {
             available_balance_quote,
             observed_at_ms: 0,
         });
+        self
+    }
+
+    pub fn with_perp_liquidity_snapshot(
+        self,
+        symbol: &str,
+        volume_24h_quote: f64,
+        open_interest_quote: f64,
+    ) -> Self {
+        let observed_at_ms = self
+            .inner
+            .lock()
+            .expect("lock")
+            .snapshots
+            .first()
+            .map(|snapshot| snapshot.observed_at_ms)
+            .unwrap_or_default();
+        self.inner.lock().expect("lock").perp_liquidity.insert(
+            symbol.to_string(),
+            PerpLiquiditySnapshot {
+                venue: self.venue,
+                symbol: symbol.to_string(),
+                volume_24h_quote,
+                open_interest_quote,
+                observed_at_ms,
+            },
+        );
+        self
+    }
+
+    pub fn with_perp_liquidity_error(self, symbol: &str, error: &str) -> Self {
+        self.inner
+            .lock()
+            .expect("lock")
+            .perp_liquidity_errors
+            .insert(symbol.to_string(), error.to_string());
         self
     }
 
@@ -218,6 +258,29 @@ impl VenueAdapter for ScriptedVenueAdapter {
 
     async fn normalize_quantity(&self, _symbol: &str, quantity: f64) -> Result<f64> {
         Ok(quantity)
+    }
+
+    async fn fetch_perp_liquidity_snapshot(
+        &self,
+        symbol: &str,
+    ) -> Result<Option<PerpLiquiditySnapshot>> {
+        let inner = self.inner.lock().expect("lock");
+        if let Some(error) = inner.perp_liquidity_errors.get(symbol) {
+            return Err(anyhow!("{error}"));
+        }
+        if let Some(snapshot) = inner.perp_liquidity.get(symbol).cloned() {
+            return Ok(Some(snapshot));
+        }
+        let observed_at_ms = Self::current_snapshot(&inner)
+            .map(|snapshot| snapshot.observed_at_ms)
+            .unwrap_or_default();
+        Ok(Some(PerpLiquiditySnapshot {
+            venue: self.venue,
+            symbol: symbol.to_string(),
+            volume_24h_quote: 10_000_000_000.0,
+            open_interest_quote: 10_000_000_000.0,
+            observed_at_ms,
+        }))
     }
 
     fn min_entry_notional_quote_hint(

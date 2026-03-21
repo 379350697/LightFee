@@ -31,7 +31,8 @@ pub use market::MarketView;
 pub use models::{
     AccountBalanceSnapshot, AssetTransferStatus, CandidateOpportunity, FundingLeg,
     FundingOpportunityType, OrderExecutionTiming, OrderFill, OrderFillReconciliation, OrderRequest,
-    PositionSnapshot, Side, SymbolMarketSnapshot, Venue, VenueMarketSnapshot,
+    PerpLiquiditySnapshot, PositionSnapshot, Side, SymbolMarketSnapshot, Venue,
+    VenueMarketSnapshot,
 };
 pub use opportunity_source::{
     ChillybotOpportunitySource, FeedgrabChillybotSource, OpportunityHint, OpportunityHintSource,

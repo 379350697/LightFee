@@ -20,8 +20,8 @@ use crate::{
     config::{RuntimeConfig, VenueConfig},
     models::{
         AccountBalanceSnapshot, AssetTransferStatus, OrderExecutionTiming, OrderFill,
-        OrderFillReconciliation, OrderRequest, PositionSnapshot, Side, SymbolMarketSnapshot, Venue,
-        VenueMarketSnapshot,
+        OrderFillReconciliation, OrderRequest, PerpLiquiditySnapshot, PositionSnapshot, Side,
+        SymbolMarketSnapshot, Venue, VenueMarketSnapshot,
     },
     resilience::FailureBackoff,
     venue::VenueAdapter,
@@ -37,6 +37,7 @@ use super::{
 };
 
 const OKX_MAX_SUBSCRIBE_ARGS_PER_MESSAGE: usize = 100;
+const OKX_PERP_LIQUIDITY_CACHE_TTL_MS: i64 = 60 * 1_000;
 
 pub struct OkxLiveAdapter {
     config: VenueConfig,
@@ -51,6 +52,7 @@ pub struct OkxLiveAdapter {
     market_subscription_symbols: Mutex<Vec<String>>,
     private_ws: Arc<WsPrivateState>,
     transfer_status_cache: Mutex<Option<VenueTransferStatusCache>>,
+    perp_liquidity_cache: Mutex<HashMap<String, PerpLiquiditySnapshot>>,
 }
 
 impl OkxLiveAdapter {
@@ -100,6 +102,7 @@ impl OkxLiveAdapter {
             market_subscription_symbols: Mutex::new(Vec::new()),
             private_ws: WsPrivateState::new(),
             transfer_status_cache: Mutex::new(transfer_status_cache),
+            perp_liquidity_cache: Mutex::new(HashMap::new()),
         };
         if let Err(error) = adapter.refresh_symbol_catalog().await {
             if adapter.supported_symbols.lock().expect("lock").is_empty() {
@@ -189,6 +192,27 @@ impl OkxLiveAdapter {
             return None;
         }
         Some(filter_transfer_statuses(cache, wanted))
+    }
+
+    fn cached_perp_liquidity_snapshot(
+        &self,
+        symbol: &str,
+        observed_at_ms: i64,
+    ) -> Option<PerpLiquiditySnapshot> {
+        let snapshot = self
+            .perp_liquidity_cache
+            .lock()
+            .expect("lock")
+            .get(symbol)
+            .cloned()?;
+        if !cache_is_fresh(
+            snapshot.observed_at_ms,
+            observed_at_ms,
+            OKX_PERP_LIQUIDITY_CACHE_TTL_MS,
+        ) {
+            return None;
+        }
+        Some(snapshot)
     }
 
     fn start_market_ws(&self, symbols: &[String]) {
@@ -1415,6 +1439,97 @@ impl VenueAdapter for OkxLiveAdapter {
         Ok(())
     }
 
+    async fn fetch_perp_liquidity_snapshot(
+        &self,
+        symbol: &str,
+    ) -> Result<Option<PerpLiquiditySnapshot>> {
+        if !self.supports_symbol(symbol) {
+            return Ok(None);
+        }
+        let observed_at_ms = now_ms();
+        if let Some(snapshot) = self.cached_perp_liquidity_snapshot(symbol, observed_at_ms) {
+            return Ok(Some(snapshot));
+        }
+
+        let inst_id = venue_symbol(&self.config, symbol);
+        let meta = self.symbol_meta(symbol).await?;
+        let ticker_response = self
+            .client
+            .get(format!("{}/api/v5/market/ticker", self.base_url))
+            .query(&[("instId", inst_id.as_str())])
+            .send()
+            .await
+            .context("failed to request okx ticker for liquidity")?;
+        let status = ticker_response.status();
+        if !status.is_success() {
+            let body = ticker_response.text().await.unwrap_or_default();
+            return Err(format_okx_http_error(status, &body));
+        }
+        let ticker = ticker_response
+            .json::<OkxApiResponse<OkxTicker>>()
+            .await
+            .context("failed to decode okx ticker for liquidity")?;
+        let ticker = ensure_okx_api_success("okx ticker failed", ticker)?;
+        let ticker = ticker
+            .data
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("okx ticker missing rows for {inst_id}"))?;
+
+        let open_interest_response = self
+            .client
+            .get(format!("{}/api/v5/public/open-interest", self.base_url))
+            .query(&[("instType", "SWAP"), ("instId", inst_id.as_str())])
+            .send()
+            .await
+            .context("failed to request okx open interest")?;
+        let status = open_interest_response.status();
+        if !status.is_success() {
+            let body = open_interest_response.text().await.unwrap_or_default();
+            return Err(format_okx_http_error(status, &body));
+        }
+        let open_interest = open_interest_response
+            .json::<OkxApiResponse<OkxOpenInterest>>()
+            .await
+            .context("failed to decode okx open interest")?;
+        let open_interest = ensure_okx_api_success("okx open interest failed", open_interest)?;
+        let open_interest = open_interest
+            .data
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("okx open interest missing rows for {inst_id}"))?;
+
+        let last_price = parse_f64(&ticker.last)?;
+        let open_interest_quote = open_interest
+            .oi_usd
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .map(parse_f64)
+            .transpose()?
+            .or_else(|| {
+                open_interest
+                    .oi_ccy
+                    .as_deref()
+                    .filter(|value| !value.is_empty())
+                    .and_then(|value| parse_f64(value).ok())
+                    .map(|value| value * last_price)
+            })
+            .unwrap_or(parse_f64(&open_interest.oi)? * meta.ct_val * last_price);
+
+        let snapshot = PerpLiquiditySnapshot {
+            venue: Venue::Okx,
+            symbol: symbol.to_string(),
+            volume_24h_quote: parse_f64(&ticker.vol_ccy_24h)?,
+            open_interest_quote,
+            observed_at_ms,
+        };
+        self.perp_liquidity_cache
+            .lock()
+            .expect("lock")
+            .insert(symbol.to_string(), snapshot.clone());
+        Ok(Some(snapshot))
+    }
+
     async fn shutdown(&self) -> Result<()> {
         self.market_ws.abort_worker();
         self.private_ws.abort_workers();
@@ -1488,6 +1603,23 @@ struct OkxFundingRate {
     funding_rate: String,
     #[serde(rename = "nextFundingTime")]
     next_funding_time: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OkxTicker {
+    #[serde(rename = "last")]
+    last: String,
+    #[serde(rename = "volCcy24h")]
+    vol_ccy_24h: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OkxOpenInterest {
+    oi: String,
+    #[serde(rename = "oiCcy")]
+    oi_ccy: Option<String>,
+    #[serde(rename = "oiUsd")]
+    oi_usd: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

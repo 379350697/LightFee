@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::{
-    config::{AppConfig, StaggeredExitMode},
+    config::{AppConfig, RuntimeMode, StaggeredExitMode},
     journal::JsonlJournal,
     live::{
         cache_is_fresh, load_json_cache, now_ms, quote_fill, store_json_cache, SYMBOL_CACHE_TTL_MS,
@@ -19,7 +19,7 @@ use crate::{
     market::MarketView,
     models::{
         CandidateOpportunity, FundingLeg, FundingOpportunityType, OrderFillReconciliation,
-        OrderRequest, Side, Venue,
+        OrderRequest, PerpLiquiditySnapshot, Side, Venue,
     },
     opportunity_source::{
         normalize_symbol_key, OpportunityHint, OpportunityHintSource, TransferStatusSource,
@@ -112,11 +112,16 @@ pub struct OpenPosition {
 
 const ENTRY_SELECTION_BUFFER_MULTIPLIER: usize = 4;
 const ENTRY_SELECTION_BUFFER_MAX: usize = 8;
+const ENTRY_LIQUIDITY_SCREEN_MULTIPLIER: usize = 3;
+const ENTRY_LIQUIDITY_SCREEN_MAX: usize = 24;
 const SETTLEMENT_HALF_CLOSE_RATIO: f64 = 0.5;
 const SETTLEMENT_REMAINDER_CLOSE_DELAY_MS: i64 = 5 * 60 * 1_000;
 const SETTLEMENT_FORCE_CLOSE_DELAY_MS: i64 = 20 * 60 * 1_000;
 const CLOSE_RECONCILIATION_RETRY_BASE_MS: i64 = 30 * 1_000;
 const CLOSE_RECONCILIATION_RETRY_MAX_MS: i64 = 5 * 60 * 1_000;
+const CEX_MIN_PERP_VOLUME_24H_QUOTE: f64 = 5_000_000.0;
+const HYPERLIQUID_MIN_PERP_VOLUME_24H_QUOTE: f64 = 1_000_000.0;
+const MIN_PERP_OPEN_INTEREST_QUOTE: f64 = 1_000_000.0;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EngineState {
@@ -464,6 +469,20 @@ const RECONCILIATION_SUMMARY_ONLY_DELTA_QUOTE: f64 = 0.05;
 
 fn default_exit_after_first_stage() -> bool {
     true
+}
+
+fn entry_selection_target(remaining_slots: usize) -> usize {
+    remaining_slots
+        .saturating_mul(ENTRY_SELECTION_BUFFER_MULTIPLIER)
+        .clamp(remaining_slots, ENTRY_SELECTION_BUFFER_MAX)
+}
+
+fn perp_liquidity_thresholds(venue: Venue) -> (f64, f64) {
+    let min_volume_24h_quote = match venue {
+        Venue::Hyperliquid => HYPERLIQUID_MIN_PERP_VOLUME_24H_QUOTE,
+        Venue::Binance | Venue::Okx | Venue::Bybit => CEX_MIN_PERP_VOLUME_24H_QUOTE,
+    };
+    (min_volume_24h_quote, MIN_PERP_OPEN_INTEREST_QUOTE)
 }
 
 impl Engine {
@@ -887,6 +906,8 @@ impl Engine {
                 self.persist_state()?;
                 return Ok(());
             }
+            self.apply_perp_liquidity_guards(&market, &mut candidates)
+                .await?;
             let tradeable_count = candidates
                 .iter()
                 .filter(|candidate| candidate.is_tradeable())
@@ -1388,9 +1409,7 @@ impl Engine {
         if remaining_slots == 0 {
             return Vec::new();
         }
-        let selection_target = remaining_slots
-            .saturating_mul(ENTRY_SELECTION_BUFFER_MULTIPLIER)
-            .clamp(remaining_slots, ENTRY_SELECTION_BUFFER_MAX);
+        let selection_target = entry_selection_target(remaining_slots);
 
         let mut ranked = candidates
             .iter()
@@ -1424,6 +1443,191 @@ impl Engine {
             }
         }
         selected
+    }
+
+    async fn apply_perp_liquidity_guards(
+        &mut self,
+        market: &MarketView,
+        candidates: &mut [CandidateOpportunity],
+    ) -> Result<()> {
+        if !matches!(self.config.runtime.mode, RuntimeMode::Live) {
+            return Ok(());
+        }
+
+        let capacity = self.config.strategy.max_concurrent_positions.max(1);
+        let remaining_slots = capacity.saturating_sub(self.active_position_count());
+        if remaining_slots == 0 {
+            return Ok(());
+        }
+
+        let selection_target = entry_selection_target(remaining_slots);
+        let evaluation_budget = selection_target
+            .saturating_mul(ENTRY_LIQUIDITY_SCREEN_MULTIPLIER)
+            .clamp(selection_target, ENTRY_LIQUIDITY_SCREEN_MAX);
+
+        let mut ranked_indices = candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| candidate.is_tradeable())
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        ranked_indices.sort_by(|left, right| {
+            self.runtime_candidate_selection_score(market, &candidates[*right])
+                .total_cmp(&self.runtime_candidate_selection_score(market, &candidates[*left]))
+                .then_with(|| {
+                    candidates[*right]
+                        .ranking_edge_bps
+                        .total_cmp(&candidates[*left].ranking_edge_bps)
+                })
+                .then_with(|| {
+                    candidates[*right]
+                        .worst_case_edge_bps
+                        .total_cmp(&candidates[*left].worst_case_edge_bps)
+                })
+                .then_with(|| candidates[*left].pair_id.cmp(&candidates[*right].pair_id))
+        });
+
+        let mut liquidity_cache = HashMap::<
+            (Venue, String),
+            std::result::Result<Option<PerpLiquiditySnapshot>, String>,
+        >::new();
+        let mut passing_symbols = HashSet::new();
+        let mut evaluated = 0usize;
+
+        for index in ranked_indices {
+            if evaluated >= evaluation_budget || passing_symbols.len() >= selection_target {
+                break;
+            }
+            let symbol = candidates[index].symbol.clone();
+            if self.has_active_symbol(&symbol) || passing_symbols.contains(symbol.as_str()) {
+                continue;
+            }
+            evaluated = evaluated.saturating_add(1);
+            self.apply_candidate_perp_liquidity_guard(&mut candidates[index], &mut liquidity_cache)
+                .await?;
+            if candidates[index].is_tradeable() {
+                passing_symbols.insert(symbol);
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn apply_candidate_perp_liquidity_guard(
+        &mut self,
+        candidate: &mut CandidateOpportunity,
+        cache: &mut HashMap<
+            (Venue, String),
+            std::result::Result<Option<PerpLiquiditySnapshot>, String>,
+        >,
+    ) -> Result<()> {
+        for venue in [candidate.long_venue, candidate.short_venue] {
+            let snapshot = match self
+                .fetch_perp_liquidity_with_cache(cache, venue, &candidate.symbol)
+                .await
+            {
+                Ok(Some(snapshot)) => snapshot,
+                Ok(None) | Err(_) => {
+                    self.push_candidate_block_reason(
+                        candidate,
+                        format!("perp_liquidity_unavailable:{}", venue.as_str()),
+                    );
+                    continue;
+                }
+            };
+            let (min_volume_24h_quote, min_open_interest_quote) = perp_liquidity_thresholds(venue);
+            if snapshot.volume_24h_quote < min_volume_24h_quote {
+                self.push_candidate_block_reason(
+                    candidate,
+                    format!("perp_volume_below_floor:{}", venue.as_str()),
+                );
+                self.log_event(
+                    "execution.entry_liquidity_blocked",
+                    &json!({
+                        "position_symbol": candidate.symbol,
+                        "pair_id": candidate.pair_id,
+                        "venue": venue,
+                        "metric": "volume_24h_quote",
+                        "observed_value": snapshot.volume_24h_quote,
+                        "minimum_required": min_volume_24h_quote,
+                    }),
+                );
+            }
+            if snapshot.open_interest_quote < min_open_interest_quote {
+                self.push_candidate_block_reason(
+                    candidate,
+                    format!("perp_open_interest_below_floor:{}", venue.as_str()),
+                );
+                self.log_event(
+                    "execution.entry_liquidity_blocked",
+                    &json!({
+                        "position_symbol": candidate.symbol,
+                        "pair_id": candidate.pair_id,
+                        "venue": venue,
+                        "metric": "open_interest_quote",
+                        "observed_value": snapshot.open_interest_quote,
+                        "minimum_required": min_open_interest_quote,
+                    }),
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn fetch_perp_liquidity_with_cache(
+        &mut self,
+        cache: &mut HashMap<
+            (Venue, String),
+            std::result::Result<Option<PerpLiquiditySnapshot>, String>,
+        >,
+        venue: Venue,
+        symbol: &str,
+    ) -> std::result::Result<Option<PerpLiquiditySnapshot>, String> {
+        let key = (venue, symbol.to_string());
+        if let Some(result) = cache.get(&key) {
+            return result.clone();
+        }
+
+        let adapter = match self.adapter(venue) {
+            Ok(adapter) => adapter,
+            Err(error) => return Err(error.to_string()),
+        };
+        let result = match adapter.fetch_perp_liquidity_snapshot(symbol).await {
+            Ok(snapshot) => {
+                if snapshot.is_none() {
+                    let _ = self.log_critical_event(
+                        "execution.entry_liquidity_unavailable",
+                        &json!({
+                            "venue": venue,
+                            "symbol": symbol,
+                            "error": "perp liquidity snapshot unavailable",
+                        }),
+                    );
+                }
+                Ok(snapshot)
+            }
+            Err(error) => {
+                let error_message = error.to_string();
+                let _ = self.log_critical_event(
+                    "execution.entry_liquidity_unavailable",
+                    &json!({
+                        "venue": venue,
+                        "symbol": symbol,
+                        "error": error_message,
+                    }),
+                );
+                Err(error_message)
+            }
+        };
+        cache.insert(key, result.clone());
+        result
+    }
+
+    fn push_candidate_block_reason(&self, candidate: &mut CandidateOpportunity, reason: String) {
+        if !candidate.blocked_reasons.iter().any(|item| item == &reason) {
+            candidate.blocked_reasons.push(reason);
+        }
     }
 
     fn log_no_entry_diagnostics(

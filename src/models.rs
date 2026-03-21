@@ -139,6 +139,15 @@ pub struct AccountBalanceSnapshot {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PerpLiquiditySnapshot {
+    pub venue: Venue,
+    pub symbol: String,
+    pub volume_24h_quote: f64,
+    pub open_interest_quote: f64,
+    pub observed_at_ms: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AssetTransferStatus {
     pub venue: Venue,
     pub asset: String,

@@ -1054,6 +1054,7 @@ async fn close_reconciliation_runs_after_close_outside_entry_window() {
     engine.tick().await.expect("settlement half close tick");
     engine.tick().await.expect("post-settlement wait tick");
     engine.tick().await.expect("final close tick");
+    engine.shutdown().await.expect("shutdown");
     assert!(engine.state().open_position.is_none());
 
     let records = read_event_records(&config.persistence.event_log_path);
@@ -1275,6 +1276,7 @@ async fn tiny_close_reconciliation_delta_emits_summary_payload() {
     engine.tick().await.expect("settlement half close tick");
     engine.tick().await.expect("post-settlement wait tick");
     engine.tick().await.expect("final close tick");
+    engine.shutdown().await.expect("shutdown");
 
     let records = read_event_records(&config.persistence.event_log_path);
     let exit_closed = records
@@ -1859,10 +1861,13 @@ async fn restart_restores_venue_health_snapshot_for_hyperliquid_gate() {
         .as_ref()
         .and_then(|scan| scan.best_candidate.as_ref())
         .expect("best candidate");
-    assert!(best
-        .blocked_reasons
-        .iter()
-        .any(|reason| reason.contains("hyperliquid_recent_submit_ack_p95_ms_above_limit")));
+    assert!(
+        best.blocked_reasons
+            .iter()
+            .any(|reason| reason.contains("hyperliquid_recent_submit_ack_p95_ms_above_limit")),
+        "blocked_reasons={:?}",
+        best.blocked_reasons
+    );
 }
 
 #[tokio::test]
@@ -3197,6 +3202,88 @@ async fn backup_candidate_is_tried_after_first_candidate_rounds_to_zero() {
 }
 
 #[tokio::test]
+async fn live_candidate_is_blocked_when_perp_liquidity_is_unavailable() {
+    let temp = TempDir::new().expect("tempdir");
+    let mut config = test_config(&temp, true);
+    config.runtime.mode = RuntimeMode::Live;
+    config.strategy.max_scan_minutes_before_funding = 25;
+    config.strategy.min_scan_minutes_before_funding = 5;
+    config.symbols = vec!["BTCUSDT".to_string()];
+    config.directed_pairs = vec![DirectedPairConfig {
+        long: Venue::Binance,
+        short: Venue::Okx,
+        symbols: config.symbols.clone(),
+    }];
+
+    let binance = Arc::new(
+        ScriptedVenueAdapter::new(
+            Venue::Binance,
+            0.5,
+            vec![venue_snapshot(
+                Venue::Binance,
+                2_100_000,
+                vec![symbol_snapshot(
+                    "BTCUSDT", 100.0, 100.0, 500.0, 500.0, -0.0001, 3_600_000,
+                )],
+            )],
+        )
+        .with_perp_liquidity_snapshot("BTCUSDT", 8_000_000.0, 2_000_000.0),
+    );
+    let okx = Arc::new(
+        ScriptedVenueAdapter::new(
+            Venue::Okx,
+            0.5,
+            vec![venue_snapshot(
+                Venue::Okx,
+                2_100_000,
+                vec![symbol_snapshot(
+                    "BTCUSDT", 100.0, 100.0, 500.0, 500.0, 0.0012, 3_600_000,
+                )],
+            )],
+        )
+        .with_perp_liquidity_error("BTCUSDT", "okx open interest unavailable"),
+    );
+    let bybit = Arc::new(ScriptedVenueAdapter::new(
+        Venue::Bybit,
+        0.6,
+        vec![venue_snapshot(Venue::Bybit, 2_100_000, vec![])],
+    ));
+    let hyper = Arc::new(ScriptedVenueAdapter::new(
+        Venue::Hyperliquid,
+        0.3,
+        vec![venue_snapshot(Venue::Hyperliquid, 2_100_000, vec![])],
+    ));
+
+    let mut engine = Engine::new(
+        config.clone(),
+        vec![
+            binance as Arc<dyn VenueAdapter>,
+            okx as Arc<dyn VenueAdapter>,
+            bybit as Arc<dyn VenueAdapter>,
+            hyper as Arc<dyn VenueAdapter>,
+        ],
+    )
+    .await
+    .expect("engine");
+
+    engine.tick().await.expect("tick");
+    engine.shutdown().await.expect("shutdown");
+
+    assert!(engine.state().open_positions.is_empty());
+
+    let records = read_event_records(&config.persistence.event_log_path);
+    assert!(has_event(&records, "execution.entry_liquidity_unavailable"));
+    let diagnostics = records
+        .iter()
+        .find(|record| record_kind(record) == Some("scan.no_entry_diagnostics"))
+        .expect("no entry diagnostics");
+    assert!(diagnostics["payload"]["blocked_reason_counts"]
+        .as_object()
+        .expect("blocked counts")
+        .contains_key("perp_liquidity_unavailable:okx"));
+}
+
+#[tokio::test]
 async fn entry_is_blocked_when_effective_leg_notional_falls_below_global_minimum() {
     let temp = TempDir::new().expect("tempdir");
     let mut config = test_config(&temp, true);
@@ -3738,6 +3825,20 @@ fn transfer_status(
         withdraw_enabled,
         observed_at_ms: 0,
         source: "test".to_string(),
+    }
+}
+
+fn ample_perp_liquidity_snapshot(
+    venue: Venue,
+    symbol: &str,
+    observed_at_ms: i64,
+) -> lightfee::PerpLiquiditySnapshot {
+    lightfee::PerpLiquiditySnapshot {
+        venue,
+        symbol: symbol.to_string(),
+        volume_24h_quote: 10_000_000_000.0,
+        open_interest_quote: 10_000_000_000.0,
+        observed_at_ms,
     }
 }
 
@@ -4673,6 +4774,17 @@ impl VenueAdapter for TimedFillAdapter {
             .get(order_id)
             .cloned())
     }
+
+    async fn fetch_perp_liquidity_snapshot(
+        &self,
+        symbol: &str,
+    ) -> Result<Option<lightfee::PerpLiquiditySnapshot>> {
+        Ok(Some(ample_perp_liquidity_snapshot(
+            self.venue,
+            symbol,
+            self.current_snapshot().observed_at_ms,
+        )))
+    }
 }
 
 #[async_trait]
@@ -4718,6 +4830,17 @@ impl VenueAdapter for StrictRequestedSymbolsAdapter {
             updated_at_ms: self.snapshot.observed_at_ms,
         })
     }
+
+    async fn fetch_perp_liquidity_snapshot(
+        &self,
+        symbol: &str,
+    ) -> Result<Option<lightfee::PerpLiquiditySnapshot>> {
+        Ok(Some(ample_perp_liquidity_snapshot(
+            self.venue,
+            symbol,
+            self.snapshot.observed_at_ms,
+        )))
+    }
 }
 
 #[async_trait]
@@ -4760,6 +4883,17 @@ impl VenueAdapter for CachedPositionAdapter {
             size: self.fetched_size,
             updated_at_ms: self.snapshot.observed_at_ms,
         })
+    }
+
+    async fn fetch_perp_liquidity_snapshot(
+        &self,
+        symbol: &str,
+    ) -> Result<Option<lightfee::PerpLiquiditySnapshot>> {
+        Ok(Some(ample_perp_liquidity_snapshot(
+            self.venue,
+            symbol,
+            self.snapshot.observed_at_ms,
+        )))
     }
 }
 
@@ -4832,6 +4966,24 @@ impl VenueAdapter for SelectiveNormalizeAdapter {
         } else {
             Ok(quantity)
         }
+    }
+
+    async fn fetch_perp_liquidity_snapshot(
+        &self,
+        symbol: &str,
+    ) -> Result<Option<lightfee::PerpLiquiditySnapshot>> {
+        let observed_at_ms = self
+            .snapshots
+            .lock()
+            .expect("lock")
+            .first()
+            .map(|snapshot| snapshot.observed_at_ms)
+            .unwrap_or_default();
+        Ok(Some(ample_perp_liquidity_snapshot(
+            self.venue,
+            symbol,
+            observed_at_ms,
+        )))
     }
 }
 

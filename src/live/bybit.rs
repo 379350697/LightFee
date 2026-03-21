@@ -20,8 +20,8 @@ use crate::{
     config::{RuntimeConfig, VenueConfig},
     models::{
         AccountBalanceSnapshot, AssetTransferStatus, OrderExecutionTiming, OrderFill,
-        OrderFillReconciliation, OrderRequest, PositionSnapshot, Side, SymbolMarketSnapshot, Venue,
-        VenueMarketSnapshot,
+        OrderFillReconciliation, OrderRequest, PerpLiquiditySnapshot, PositionSnapshot, Side,
+        SymbolMarketSnapshot, Venue, VenueMarketSnapshot,
     },
     resilience::FailureBackoff,
     venue::VenueAdapter,
@@ -36,6 +36,7 @@ use super::{
 };
 
 const BYBIT_MAX_SUBSCRIBE_TOPICS_PER_MESSAGE: usize = 100;
+const BYBIT_PERP_LIQUIDITY_CACHE_TTL_MS: i64 = 60 * 1_000;
 
 pub struct BybitLiveAdapter {
     config: VenueConfig,
@@ -47,6 +48,7 @@ pub struct BybitLiveAdapter {
     transfer_status_cache: Mutex<Option<BybitTransferStatusCache>>,
     time_offset_ms: Mutex<Option<i64>>,
     position_modes: Arc<Mutex<HashMap<String, BybitPositionMode>>>,
+    perp_liquidity_cache: Mutex<HashMap<String, PerpLiquiditySnapshot>>,
     market_ws: Arc<WsMarketState>,
     market_subscription_symbols: Mutex<Vec<String>>,
     private_ws: Arc<WsPrivateState>,
@@ -99,6 +101,7 @@ impl BybitLiveAdapter {
             transfer_status_cache: Mutex::new(transfer_status_cache),
             time_offset_ms: Mutex::new(None),
             position_modes: Arc::new(Mutex::new(HashMap::new())),
+            perp_liquidity_cache: Mutex::new(HashMap::new()),
             market_ws,
             market_subscription_symbols: Mutex::new(Vec::new()),
             private_ws: WsPrivateState::new(),
@@ -137,6 +140,27 @@ impl BybitLiveAdapter {
             .lock()
             .expect("lock")
             .contains(symbol)
+    }
+
+    fn cached_perp_liquidity_snapshot(
+        &self,
+        symbol: &str,
+        observed_at_ms: i64,
+    ) -> Option<PerpLiquiditySnapshot> {
+        let snapshot = self
+            .perp_liquidity_cache
+            .lock()
+            .expect("lock")
+            .get(symbol)
+            .cloned()?;
+        if !cache_is_fresh(
+            snapshot.observed_at_ms,
+            observed_at_ms,
+            BYBIT_PERP_LIQUIDITY_CACHE_TTL_MS,
+        ) {
+            return None;
+        }
+        Some(snapshot)
     }
 
     fn prune_supported_symbol(&self, symbol: &str, reason: &str) {
@@ -1238,6 +1262,60 @@ impl VenueAdapter for BybitLiveAdapter {
         Ok(())
     }
 
+    async fn fetch_perp_liquidity_snapshot(
+        &self,
+        symbol: &str,
+    ) -> Result<Option<PerpLiquiditySnapshot>> {
+        if !self.supports_symbol(symbol) {
+            return Ok(None);
+        }
+        let observed_at_ms = now_ms();
+        if let Some(snapshot) = self.cached_perp_liquidity_snapshot(symbol, observed_at_ms) {
+            return Ok(Some(snapshot));
+        }
+
+        let venue_symbol = venue_symbol(&self.config, symbol);
+        let response = self
+            .client
+            .get(format!("{}/v5/market/tickers", self.base_url))
+            .query(&[("category", "linear"), ("symbol", venue_symbol.as_str())])
+            .send()
+            .await
+            .context("failed to request bybit tickers for liquidity")?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(format_bybit_http_error(status, &body));
+        }
+        let response = response
+            .json::<BybitApiResponse<BybitTickerList>>()
+            .await
+            .context("failed to decode bybit liquidity tickers")?;
+        if response.ret_code != 0 {
+            return Err(format_bybit_api_error(
+                "bybit liquidity tickers failed",
+                response.ret_code,
+                &response.ret_msg,
+            ));
+        }
+        let ticker = response
+            .result
+            .and_then(|result| result.list.into_iter().next())
+            .ok_or_else(|| anyhow!("bybit ticker missing for {venue_symbol}"))?;
+        let snapshot = PerpLiquiditySnapshot {
+            venue: Venue::Bybit,
+            symbol: symbol.to_string(),
+            volume_24h_quote: parse_f64(&ticker.turnover_24h)?,
+            open_interest_quote: parse_f64(&ticker.open_interest_value)?,
+            observed_at_ms,
+        };
+        self.perp_liquidity_cache
+            .lock()
+            .expect("lock")
+            .insert(symbol.to_string(), snapshot.clone());
+        Ok(Some(snapshot))
+    }
+
     fn supports_market_data_activity_control(&self) -> bool {
         true
     }
@@ -1730,6 +1808,10 @@ struct BybitTicker {
     funding_rate: String,
     #[serde(rename = "nextFundingTime")]
     next_funding_time: String,
+    #[serde(rename = "turnover24h", default)]
+    turnover_24h: String,
+    #[serde(rename = "openInterestValue", default)]
+    open_interest_value: String,
 }
 
 #[derive(Debug, Deserialize)]

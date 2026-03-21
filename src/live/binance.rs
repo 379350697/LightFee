@@ -20,8 +20,8 @@ use crate::{
     config::{RuntimeConfig, VenueConfig},
     models::{
         AccountBalanceSnapshot, AssetTransferStatus, OrderExecutionTiming, OrderFill,
-        OrderFillReconciliation, OrderRequest, PositionSnapshot, Side, SymbolMarketSnapshot, Venue,
-        VenueMarketSnapshot,
+        OrderFillReconciliation, OrderRequest, PerpLiquiditySnapshot, PositionSnapshot, Side,
+        SymbolMarketSnapshot, Venue, VenueMarketSnapshot,
     },
     resilience::FailureBackoff,
     venue::VenueAdapter,
@@ -38,6 +38,7 @@ use super::{
 
 const BINANCE_MAX_SUBSCRIBE_STREAMS_PER_MESSAGE: usize = 150;
 const BINANCE_RECV_WINDOW_MS: &str = "10000";
+const BINANCE_PERP_LIQUIDITY_CACHE_TTL_MS: i64 = 60 * 1_000;
 
 pub struct BinanceLiveAdapter {
     config: VenueConfig,
@@ -53,6 +54,7 @@ pub struct BinanceLiveAdapter {
     market_subscription_symbols: Mutex<Vec<String>>,
     private_ws: Arc<WsPrivateState>,
     transfer_status_cache: Mutex<Option<VenueTransferStatusCache>>,
+    perp_liquidity_cache: Mutex<HashMap<String, PerpLiquiditySnapshot>>,
 }
 
 impl BinanceLiveAdapter {
@@ -112,6 +114,7 @@ impl BinanceLiveAdapter {
             market_subscription_symbols: Mutex::new(Vec::new()),
             private_ws: WsPrivateState::new(),
             transfer_status_cache: Mutex::new(transfer_status_cache),
+            perp_liquidity_cache: Mutex::new(HashMap::new()),
         };
         if let Err(error) = adapter.refresh_symbol_catalog().await {
             if adapter.supported_symbols.lock().expect("lock").is_empty() {
@@ -164,6 +167,27 @@ impl BinanceLiveAdapter {
             return None;
         }
         Some(filter_transfer_statuses(cache, wanted))
+    }
+
+    fn cached_perp_liquidity_snapshot(
+        &self,
+        symbol: &str,
+        observed_at_ms: i64,
+    ) -> Option<PerpLiquiditySnapshot> {
+        let snapshot = self
+            .perp_liquidity_cache
+            .lock()
+            .expect("lock")
+            .get(symbol)
+            .cloned()?;
+        if !cache_is_fresh(
+            snapshot.observed_at_ms,
+            observed_at_ms,
+            BINANCE_PERP_LIQUIDITY_CACHE_TTL_MS,
+        ) {
+            return None;
+        }
+        Some(snapshot)
     }
 
     fn start_market_ws(&self, symbols: &[String]) {
@@ -1192,6 +1216,85 @@ impl VenueAdapter for BinanceLiveAdapter {
         Ok(())
     }
 
+    async fn fetch_perp_liquidity_snapshot(
+        &self,
+        symbol: &str,
+    ) -> Result<Option<PerpLiquiditySnapshot>> {
+        if !self.supports_symbol(symbol) {
+            return Ok(None);
+        }
+        let observed_at_ms = now_ms();
+        if let Some(snapshot) = self.cached_perp_liquidity_snapshot(symbol, observed_at_ms) {
+            return Ok(Some(snapshot));
+        }
+
+        let venue_symbol = venue_symbol(&self.config, symbol);
+        let ticker_response = self
+            .client
+            .get(format!("{}/fapi/v1/ticker/24hr", self.base_url))
+            .query(&[("symbol", venue_symbol.as_str())])
+            .send()
+            .await
+            .context("failed to request binance 24h ticker")?;
+        let status = ticker_response.status();
+        if !status.is_success() {
+            let body = ticker_response.text().await.unwrap_or_default();
+            return Err(format_binance_http_error(status, &body));
+        }
+        let ticker = ticker_response
+            .json::<BinanceTicker24h>()
+            .await
+            .context("failed to decode binance 24h ticker")?;
+
+        let open_interest_response = self
+            .client
+            .get(format!("{}/fapi/v1/openInterest", self.base_url))
+            .query(&[("symbol", venue_symbol.as_str())])
+            .send()
+            .await
+            .context("failed to request binance open interest")?;
+        let status = open_interest_response.status();
+        if !status.is_success() {
+            let body = open_interest_response.text().await.unwrap_or_default();
+            return Err(format_binance_http_error(status, &body));
+        }
+        let open_interest = open_interest_response
+            .json::<BinanceOpenInterest>()
+            .await
+            .context("failed to decode binance open interest")?;
+
+        let premium = self
+            .client
+            .get(format!("{}/fapi/v1/premiumIndex", self.base_url))
+            .query(&[("symbol", venue_symbol.as_str())])
+            .send()
+            .await
+            .context("failed to request binance premium index for liquidity")?;
+        let status = premium.status();
+        if !status.is_success() {
+            let body = premium.text().await.unwrap_or_default();
+            return Err(format_binance_http_error(status, &body));
+        }
+        let premium = premium
+            .json::<BinancePremiumIndex>()
+            .await
+            .context("failed to decode binance premium index for liquidity")?;
+
+        let snapshot = PerpLiquiditySnapshot {
+            venue: Venue::Binance,
+            symbol: symbol.to_string(),
+            volume_24h_quote: parse_f64(&ticker.quote_volume)?,
+            open_interest_quote: parse_f64(&open_interest.open_interest)?
+                * parse_f64(&premium.mark_price)?,
+            observed_at_ms,
+        };
+        self.perp_liquidity_cache
+            .lock()
+            .expect("lock")
+            .insert(symbol.to_string(), snapshot.clone());
+        Ok(Some(snapshot))
+    }
+
     async fn shutdown(&self) -> Result<()> {
         self.market_ws.abort_worker();
         self.private_ws.abort_workers();
@@ -1250,6 +1353,24 @@ struct BinancePremiumIndex {
         deserialize_with = "deserialize_string_or_number"
     )]
     next_funding_time: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BinanceTicker24h {
+    #[serde(
+        rename = "quoteVolume",
+        deserialize_with = "deserialize_string_or_number"
+    )]
+    quote_volume: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BinanceOpenInterest {
+    #[serde(
+        rename = "openInterest",
+        deserialize_with = "deserialize_string_or_number"
+    )]
+    open_interest: String,
 }
 
 #[derive(Debug, Deserialize)]
