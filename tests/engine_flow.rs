@@ -1119,6 +1119,222 @@ async fn close_reconciliation_runs_after_close_outside_entry_window() {
 }
 
 #[tokio::test]
+async fn tiny_close_reconciliation_delta_emits_summary_payload() {
+    let temp = TempDir::new().expect("tempdir");
+    let mut config = test_config(&temp, true);
+    config.runtime.mode = RuntimeMode::Live;
+    config.runtime.max_order_quote_age_ms = 0;
+    config.strategy.max_scan_minutes_before_funding = 25;
+    config.strategy.min_scan_minutes_before_funding = 5;
+    config.strategy.stop_loss_quote = 1_000.0;
+    config.strategy.profit_take_quote = 1_000.0;
+    config.strategy.trailing_drawdown_quote = 1_000.0;
+    config.venues = vec![venue(Venue::Binance, 0.0), venue(Venue::Okx, 0.0)];
+    config.directed_pairs = vec![DirectedPairConfig {
+        long: Venue::Binance,
+        short: Venue::Okx,
+        symbols: vec!["BTCUSDT".to_string()],
+    }];
+
+    let binance = Arc::new(TimedFillAdapter::new(
+        Venue::Binance,
+        vec![
+            snapshot(
+                Venue::Binance,
+                0,
+                100.0,
+                100.0,
+                200.0,
+                200.0,
+                -0.0005,
+                360_000,
+            ),
+            snapshot(
+                Venue::Binance,
+                361_000,
+                100.0,
+                100.0,
+                200.0,
+                200.0,
+                -0.0005,
+                360_000,
+            ),
+            snapshot(
+                Venue::Binance,
+                361_000,
+                100.0,
+                100.0,
+                200.0,
+                200.0,
+                -0.0005,
+                360_000,
+            ),
+            snapshot(
+                Venue::Binance,
+                1_561_000,
+                105.0,
+                106.0,
+                200.0,
+                200.0,
+                -0.0005,
+                360_000,
+            ),
+            snapshot(
+                Venue::Binance,
+                1_561_000,
+                105.0,
+                106.0,
+                200.0,
+                200.0,
+                -0.0005,
+                360_000,
+            ),
+            snapshot(
+                Venue::Binance,
+                1_562_000,
+                105.0,
+                106.0,
+                200.0,
+                200.0,
+                -0.0005,
+                360_000,
+            ),
+        ],
+        None,
+    ));
+    let okx = Arc::new(TimedFillAdapter::new(
+        Venue::Okx,
+        vec![
+            snapshot(Venue::Okx, 0, 100.0, 100.0, 200.0, 200.0, 0.0015, 360_000),
+            snapshot(
+                Venue::Okx,
+                361_000,
+                100.0,
+                100.0,
+                200.0,
+                200.0,
+                0.0015,
+                360_000,
+            ),
+            snapshot(
+                Venue::Okx,
+                361_000,
+                100.0,
+                100.0,
+                200.0,
+                200.0,
+                0.0015,
+                360_000,
+            ),
+            snapshot(
+                Venue::Okx,
+                1_561_000,
+                94.0,
+                95.0,
+                200.0,
+                200.0,
+                0.0015,
+                360_000,
+            ),
+            snapshot(
+                Venue::Okx,
+                1_561_000,
+                94.0,
+                95.0,
+                200.0,
+                200.0,
+                0.0015,
+                360_000,
+            ),
+            snapshot(
+                Venue::Okx,
+                1_562_000,
+                94.0,
+                95.0,
+                200.0,
+                200.0,
+                0.0015,
+                360_000,
+            ),
+        ],
+        None,
+    ));
+
+    let mut engine = Engine::new(
+        config.clone(),
+        vec![
+            binance.clone() as Arc<dyn VenueAdapter>,
+            okx.clone() as Arc<dyn VenueAdapter>,
+        ],
+    )
+    .await
+    .expect("engine");
+
+    engine.tick().await.expect("entry tick");
+    engine.tick().await.expect("settlement half close tick");
+    engine.tick().await.expect("post-settlement wait tick");
+    engine.tick().await.expect("final close tick");
+
+    let records = read_event_records(&config.persistence.event_log_path);
+    let exit_closed = records
+        .iter()
+        .find(|record| record_kind(record) == Some("exit.closed"))
+        .expect("exit closed");
+    let long_order_id = exit_closed["payload"]["long_exit_order_id"]
+        .as_str()
+        .expect("long exit order id");
+    let short_order_id = exit_closed["payload"]["short_exit_order_id"]
+        .as_str()
+        .expect("short exit order id");
+    let long_exit_average_price = exit_closed["payload"]["long_exit_average_price"]
+        .as_f64()
+        .expect("long exit average price");
+    let short_exit_average_price = exit_closed["payload"]["short_exit_average_price"]
+        .as_f64()
+        .expect("short exit average price");
+    let long_exit_quantity = exit_closed["payload"]["long_exit_quantity"]
+        .as_f64()
+        .expect("long exit quantity");
+    let short_exit_quantity = exit_closed["payload"]["short_exit_quantity"]
+        .as_f64()
+        .expect("short exit quantity");
+
+    binance.set_reconciled_fill(
+        long_order_id,
+        OrderFillReconciliation {
+            order_id: long_order_id.to_string(),
+            client_order_id: Some("close-long-recon".to_string()),
+            quantity: long_exit_quantity,
+            average_price: long_exit_average_price,
+            fee_quote: Some(0.0),
+            filled_at_ms: 361_500,
+        },
+    );
+    okx.set_reconciled_fill(
+        short_order_id,
+        OrderFillReconciliation {
+            order_id: short_order_id.to_string(),
+            client_order_id: Some("close-short-recon".to_string()),
+            quantity: short_exit_quantity,
+            average_price: short_exit_average_price,
+            fee_quote: Some(0.0),
+            filled_at_ms: 361_550,
+        },
+    );
+
+    engine.tick().await.expect("reconciliation tick");
+
+    let records = read_event_records(&config.persistence.event_log_path);
+    let reconciled = records
+        .iter()
+        .find(|record| record_kind(record) == Some("exit.reconciled"))
+        .expect("exit reconciled");
+    assert_eq!(reconciled["payload"]["summary_only"].as_bool(), Some(true));
+    assert!(reconciled["payload"].get("long_leg").is_none());
+    assert!(reconciled["payload"].get("short_leg").is_none());
+}
+
+#[tokio::test]
 async fn settlement_half_close_below_exchange_minimum_skips_partial_and_keeps_full_position() {
     let temp = TempDir::new().expect("tempdir");
     let mut config = test_config(&temp, true);
@@ -1406,6 +1622,38 @@ async fn no_entry_window_emits_candidate_checklist_diagnostics() {
     assert!(checklist.iter().any(|item| {
         item["key"].as_str() == Some("market_fresh_long") && item["ok"].as_bool() == Some(true)
     }));
+}
+
+#[tokio::test]
+async fn repeated_no_entry_diagnostics_are_sampled_across_cycles() {
+    let temp = TempDir::new().expect("tempdir");
+    let mut config = test_config(&temp, true);
+    config.strategy.min_funding_edge_bps = 50.0;
+    config.strategy.min_expected_edge_bps = 50.0;
+    config.strategy.min_worst_case_edge_bps = 50.0;
+    let mut engine = Engine::new(config.clone(), to_dyn(adapters_for_ranking()))
+        .await
+        .expect("engine");
+
+    for _ in 0..11 {
+        engine.tick().await.expect("tick");
+    }
+    sleep(Duration::from_millis(300)).await;
+
+    let records = read_event_records(&config.persistence.event_log_path);
+    let diagnostics = records
+        .iter()
+        .filter(|record| record_kind(record) == Some("scan.no_entry_diagnostics"))
+        .collect::<Vec<_>>();
+    assert_eq!(diagnostics.len(), 2);
+    assert_eq!(
+        diagnostics[0]["payload"]["suppressed_repeat_count"].as_u64(),
+        Some(0)
+    );
+    assert_eq!(
+        diagnostics[1]["payload"]["suppressed_repeat_count"].as_u64(),
+        Some(9)
+    );
 }
 
 #[tokio::test]
@@ -2477,6 +2725,40 @@ async fn soft_market_failures_on_all_venues_still_record_empty_scan() {
     assert!(has_event(&records, "scan.completed"));
     assert!(has_event(&records, "scan.no_entry_diagnostics"));
     assert!(has_event(&records, "market.fetch_failed"));
+}
+
+#[tokio::test]
+async fn repeated_soft_market_failures_are_aggregated_across_ticks() {
+    let temp = TempDir::new().expect("tempdir");
+    let config = test_config(&temp, false);
+
+    let adapters: Vec<Arc<dyn VenueAdapter>> = vec![
+        Arc::new(SoftFailingMarketAdapter::new(
+            Venue::Binance,
+            "binance ticker missing for FETUSDT",
+        )),
+        Arc::new(SoftFailingMarketAdapter::new(
+            Venue::Okx,
+            "okx instrument metadata missing for FET-USDT-SWAP",
+        )),
+        Arc::new(SoftFailingMarketAdapter::new(
+            Venue::Bybit,
+            "bybit ticker missing for FETUSDT",
+        )),
+        Arc::new(SoftFailingMarketAdapter::new(
+            Venue::Hyperliquid,
+            "hyperliquid symbol not supported for FETUSDT",
+        )),
+    ];
+
+    let mut engine = Engine::new(config.clone(), adapters).await.expect("engine");
+    for _ in 0..3 {
+        engine.tick().await.expect("tick");
+    }
+
+    sleep(Duration::from_millis(250)).await;
+    let records = read_event_records(&config.persistence.event_log_path);
+    assert_eq!(event_count(&records, "market.fetch_failed"), 4);
 }
 
 #[tokio::test]

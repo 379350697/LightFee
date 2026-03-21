@@ -168,6 +168,8 @@ pub struct Engine {
     venue_health_updated_at_ms: BTreeMap<Venue, i64>,
     cached_transfer_status_view: Option<CachedTransferStatusView>,
     scan_symbols: Vec<String>,
+    last_no_entry_diagnostics: Option<NoEntryDiagnosticsLogState>,
+    repeated_failure_logs: BTreeMap<String, RepeatedFailureLogState>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -386,15 +388,33 @@ struct NoEntryDiagnostics {
     remaining_slots: usize,
     candidate_detail_count: usize,
     omitted_candidate_count: usize,
+    suppressed_repeat_count: usize,
     blocked_reason_counts: BTreeMap<String, usize>,
     advisory_counts: BTreeMap<String, usize>,
     candidates: Vec<OpportunityCandidateChecklist>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct NoEntryDiagnosticsLogState {
+    fingerprint: String,
+    last_emitted_cycle: u64,
+    suppressed_count: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RepeatedFailureLogState {
+    last_emitted_cycle: u64,
+    suppressed_count: usize,
 }
 
 const FLAT_RECOVERY_PROBE_INTERVAL_MS: i64 = 30_000;
 const RUNNING_SLOT_RECONCILE_INTERVAL_MS: i64 = 10_000;
 const ORDER_HEALTH_WINDOW_SIZE: usize = 20;
 const NO_ENTRY_DIAGNOSTIC_CANDIDATE_LIMIT: usize = 8;
+const NO_ENTRY_DIAGNOSTIC_SAMPLE_INTERVAL_CYCLES: u64 = 10;
+const REPEATED_FAILURE_LOG_SAMPLE_INTERVAL_CYCLES: u64 = 20;
+const REPEATED_FAILURE_LOG_RETENTION_CYCLES: u64 = 200;
+const RECONCILIATION_SUMMARY_ONLY_DELTA_QUOTE: f64 = 0.05;
 
 fn default_exit_after_first_stage() -> bool {
     true
@@ -461,6 +481,8 @@ impl Engine {
             venue_health_updated_at_ms,
             cached_transfer_status_view: None,
             scan_symbols: initial_scan_symbols,
+            last_no_entry_diagnostics: None,
+            repeated_failure_logs: BTreeMap::new(),
         };
         engine.finalize_startup_position_recovery().await?;
         engine.initialize_scan_symbols(cached_scan_symbol_state.as_ref());
@@ -724,6 +746,8 @@ impl Engine {
                 };
                 if selected.is_empty() {
                     self.log_no_entry_diagnostics(&market, &candidates, &selected);
+                } else {
+                    self.last_no_entry_diagnostics = None;
                 }
                 selected
             } else {
@@ -814,8 +838,9 @@ impl Engine {
                     }
                     self.state.last_error =
                         Some(format!("market fetch failed on {venue}: {error:#}"));
-                    self.log_event(
+                    self.log_repeated_failure_event(
                         "market.fetch_failed",
+                        format!("market.fetch_failed:{venue}:{soft_failure}:{}", error),
                         &json!({
                             "venue": venue,
                             "error": error.to_string(),
@@ -853,8 +878,9 @@ impl Engine {
             Ok(_) => None,
             Err(error) => {
                 self.state.last_error = Some(format!("opportunity source failed: {error:#}"));
-                self.log_event(
+                self.log_repeated_failure_event(
                     "hint_source.failed",
+                    format!("hint_source.failed:{error}"),
                     &json!({
                         "error": error.to_string(),
                     }),
@@ -909,8 +935,9 @@ impl Engine {
                 Ok(_) => {}
                 Err(error) => {
                     self.state.last_error = Some(format!("transfer source failed: {error:#}"));
-                    self.log_event(
+                    self.log_repeated_failure_event(
                         "transfer_source.failed",
+                        format!("transfer_source.failed:{error}"),
                         &json!({
                             "error": error.to_string(),
                         }),
@@ -933,8 +960,9 @@ impl Engine {
                     self.state.last_error = Some(format!(
                         "transfer status fetch failed on {venue}: {error:#}"
                     ));
-                    self.log_event(
+                    self.log_repeated_failure_event(
                         "transfer.fetch_failed",
+                        format!("transfer.fetch_failed:{venue}:{error}"),
                         &json!({
                             "venue": venue,
                             "error": error.to_string(),
@@ -1025,7 +1053,9 @@ impl Engine {
         {
             match self.reconcile_pending_close(task.clone(), market).await {
                 Ok(Some((event_kind, payload))) => {
-                    self.log_critical_event(event_kind, &payload)?;
+                    let compacted_payload =
+                        self.compact_reconciliation_payload(event_kind, &payload);
+                    self.log_critical_event(event_kind, &compacted_payload)?;
                     self.state.pending_close_reconciliations.retain(|item| {
                         !(item.position_id == task.position_id
                             && item.kind == task.kind
@@ -1141,7 +1171,11 @@ impl Engine {
             None
         };
         if let Some(payload) = log_payload {
-            self.log_event("exit.reconciliation_failed", &payload);
+            let key = format!(
+                "exit.reconciliation_failed:{}:{:?}:{}",
+                task.position_id, task.kind, error
+            );
+            self.log_repeated_failure_event("exit.reconciliation_failed", key, &payload);
         }
     }
 
@@ -1230,7 +1264,7 @@ impl Engine {
     }
 
     fn log_no_entry_diagnostics(
-        &self,
+        &mut self,
         market: &MarketView,
         candidates: &[CandidateOpportunity],
         selected_candidates: &[CandidateOpportunity],
@@ -1255,9 +1289,50 @@ impl Engine {
                 .iter()
                 .flat_map(|candidate| candidate.advisories.iter().cloned()),
         );
+        let reason = self.no_entry_reason(candidates, selected_candidates, remaining_slots);
+        let fingerprint = no_entry_diagnostics_fingerprint(
+            &reason,
+            candidates.len(),
+            tradeable_count,
+            selected_candidates.len(),
+            self.active_position_count(),
+            remaining_slots,
+            &blocked_reason_counts,
+            &advisory_counts,
+        );
+        let suppressed_repeat_count = match self.last_no_entry_diagnostics.as_mut() {
+            Some(state)
+                if state.fingerprint == fingerprint
+                    && self.state.cycle.saturating_sub(state.last_emitted_cycle)
+                        < NO_ENTRY_DIAGNOSTIC_SAMPLE_INTERVAL_CYCLES =>
+            {
+                state.suppressed_count = state.suppressed_count.saturating_add(1);
+                return;
+            }
+            Some(state) if state.fingerprint == fingerprint => {
+                let suppressed = state.suppressed_count;
+                state.last_emitted_cycle = self.state.cycle;
+                state.suppressed_count = 0;
+                suppressed
+            }
+            Some(state) => {
+                state.fingerprint = fingerprint.clone();
+                state.last_emitted_cycle = self.state.cycle;
+                state.suppressed_count = 0;
+                0
+            }
+            None => {
+                self.last_no_entry_diagnostics = Some(NoEntryDiagnosticsLogState {
+                    fingerprint: fingerprint.clone(),
+                    last_emitted_cycle: self.state.cycle,
+                    suppressed_count: 0,
+                });
+                0
+            }
+        };
         let candidate_detail_count = candidates.len().min(NO_ENTRY_DIAGNOSTIC_CANDIDATE_LIMIT);
         let diagnostics = NoEntryDiagnostics {
-            reason: self.no_entry_reason(candidates, selected_candidates, remaining_slots),
+            reason,
             candidate_count: candidates.len(),
             tradeable_count,
             selected_candidate_count: selected_candidates.len(),
@@ -1265,6 +1340,7 @@ impl Engine {
             remaining_slots,
             candidate_detail_count,
             omitted_candidate_count: candidates.len().saturating_sub(candidate_detail_count),
+            suppressed_repeat_count,
             blocked_reason_counts,
             advisory_counts,
             candidates: candidates
@@ -1281,6 +1357,110 @@ impl Engine {
                 .collect(),
         };
         self.log_event("scan.no_entry_diagnostics", &diagnostics);
+    }
+
+    fn log_repeated_failure_event(
+        &mut self,
+        kind: &'static str,
+        key: String,
+        payload: &serde_json::Value,
+    ) {
+        self.prune_repeated_failure_logs();
+        let suppressed_repeat_count = match self.repeated_failure_logs.get_mut(key.as_str()) {
+            Some(state)
+                if self.state.cycle.saturating_sub(state.last_emitted_cycle)
+                    < REPEATED_FAILURE_LOG_SAMPLE_INTERVAL_CYCLES =>
+            {
+                state.suppressed_count = state.suppressed_count.saturating_add(1);
+                return;
+            }
+            Some(state) => {
+                let suppressed = state.suppressed_count;
+                state.last_emitted_cycle = self.state.cycle;
+                state.suppressed_count = 0;
+                suppressed
+            }
+            None => {
+                self.repeated_failure_logs.insert(
+                    key,
+                    RepeatedFailureLogState {
+                        last_emitted_cycle: self.state.cycle,
+                        suppressed_count: 0,
+                    },
+                );
+                0
+            }
+        };
+        let payload = append_object_field(
+            payload,
+            "suppressed_repeat_count",
+            json!(suppressed_repeat_count),
+        );
+        self.log_event(kind, &payload);
+    }
+
+    fn prune_repeated_failure_logs(&mut self) {
+        let current_cycle = self.state.cycle;
+        self.repeated_failure_logs.retain(|_, state| {
+            current_cycle.saturating_sub(state.last_emitted_cycle)
+                <= REPEATED_FAILURE_LOG_RETENTION_CYCLES
+        });
+    }
+
+    fn compact_reconciliation_payload(
+        &self,
+        event_kind: &'static str,
+        payload: &serde_json::Value,
+    ) -> serde_json::Value {
+        if !should_compact_reconciliation_payload(payload) {
+            return payload.clone();
+        }
+
+        let mut summary = serde_json::Map::new();
+        summary.insert("summary_only".to_string(), json!(true));
+        summary.insert("event_kind".to_string(), json!(event_kind));
+        for key in [
+            "position_id",
+            "symbol",
+            "reason",
+            "closed_at_ms",
+            "reconciled_at_ms",
+            "net_quote",
+            "realized_price_pnl_quote",
+            "total_exit_fee_quote",
+            "partial_realized_price_pnl_quote",
+            "partial_exit_fee_quote",
+            "closed_quantity",
+            "long_exit_average_price",
+            "short_exit_average_price",
+            "long_exit_quantity",
+            "short_exit_quantity",
+            "reconciliation_delta_quote",
+            "remaining_reconciliation_delta_quote",
+        ] {
+            if let Some(value) = payload.get(key) {
+                summary.insert(key.to_string(), value.clone());
+            }
+        }
+        if let Some(value) = payload.get("outcome_diagnostics") {
+            summary.insert(
+                "outcome_summary".to_string(),
+                compact_outcome_diagnostics(Some(value)).unwrap_or_else(|| value.clone()),
+            );
+        }
+        if let Some(value) = payload.get("remaining_outcome_diagnostics") {
+            summary.insert(
+                "remaining_outcome_summary".to_string(),
+                compact_outcome_diagnostics(Some(value)).unwrap_or_else(|| value.clone()),
+            );
+        }
+        if let Some(value) = payload.get("settlement_half_outcome_diagnostics") {
+            summary.insert(
+                "settlement_half_outcome_summary".to_string(),
+                compact_outcome_diagnostics(Some(value)).unwrap_or_else(|| value.clone()),
+            );
+        }
+        serde_json::Value::Object(summary)
     }
 
     fn no_entry_reason(
@@ -3703,24 +3883,7 @@ impl Engine {
         if diagnostics.get("outcome").and_then(|value| value.as_str()) != Some("loss") {
             return None;
         }
-
-        let mut payload = serde_json::Map::new();
-        for key in [
-            "segment_kind",
-            "outcome",
-            "primary_reason",
-            "contributing_reasons",
-            "net_quote",
-            "loss_quote",
-            "current_total_funding_edge_bps",
-            "entry_total_funding_edge_bps",
-            "exit_reason",
-        ] {
-            if let Some(value) = diagnostics.get(key) {
-                payload.insert(key.to_string(), value.clone());
-            }
-        }
-        Some(serde_json::Value::Object(payload))
+        compact_outcome_diagnostics(Some(diagnostics))
     }
 
     async fn flatten_single_leg(
@@ -5108,6 +5271,83 @@ fn close_reconciliation_retry_delay_ms(attempt_count: u32) -> i64 {
     let exponent = attempt_count.saturating_sub(1).min(4);
     let multiplier = 1_i64 << exponent;
     (CLOSE_RECONCILIATION_RETRY_BASE_MS * multiplier).min(CLOSE_RECONCILIATION_RETRY_MAX_MS)
+}
+
+fn no_entry_diagnostics_fingerprint(
+    reason: &str,
+    candidate_count: usize,
+    tradeable_count: usize,
+    selected_candidate_count: usize,
+    active_position_count: usize,
+    remaining_slots: usize,
+    blocked_reason_counts: &BTreeMap<String, usize>,
+    advisory_counts: &BTreeMap<String, usize>,
+) -> String {
+    json!({
+        "reason": reason,
+        "candidate_count": candidate_count,
+        "tradeable_count": tradeable_count,
+        "selected_candidate_count": selected_candidate_count,
+        "active_position_count": active_position_count,
+        "remaining_slots": remaining_slots,
+        "blocked_reason_counts": blocked_reason_counts,
+        "advisory_counts": advisory_counts,
+    })
+    .to_string()
+}
+
+fn append_object_field(
+    payload: &serde_json::Value,
+    key: &str,
+    value: serde_json::Value,
+) -> serde_json::Value {
+    match payload {
+        serde_json::Value::Object(object) => {
+            let mut object = object.clone();
+            object.insert(key.to_string(), value);
+            serde_json::Value::Object(object)
+        }
+        _ => payload.clone(),
+    }
+}
+
+fn compact_outcome_diagnostics(
+    diagnostics: Option<&serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let diagnostics = diagnostics?;
+    let mut payload = serde_json::Map::new();
+    for key in [
+        "segment_kind",
+        "outcome",
+        "primary_reason",
+        "contributing_reasons",
+        "net_quote",
+        "profit_quote",
+        "loss_quote",
+        "current_total_funding_edge_bps",
+        "entry_total_funding_edge_bps",
+        "exit_reason",
+    ] {
+        if let Some(value) = diagnostics.get(key) {
+            payload.insert(key.to_string(), value.clone());
+        }
+    }
+    Some(serde_json::Value::Object(payload))
+}
+
+fn should_compact_reconciliation_payload(payload: &serde_json::Value) -> bool {
+    let reconciliation_delta = payload
+        .get("reconciliation_delta_quote")
+        .and_then(|value| value.as_f64())
+        .unwrap_or(f64::INFINITY)
+        .abs();
+    let remaining_delta = payload
+        .get("remaining_reconciliation_delta_quote")
+        .and_then(|value| value.as_f64())
+        .unwrap_or_default()
+        .abs();
+    reconciliation_delta <= RECONCILIATION_SUMMARY_ONLY_DELTA_QUOTE
+        && remaining_delta <= RECONCILIATION_SUMMARY_ONLY_DELTA_QUOTE
 }
 
 fn count_strings(items: impl IntoIterator<Item = String>) -> BTreeMap<String, usize> {
