@@ -775,6 +775,22 @@ impl BybitLiveAdapter {
         Ok(now_ms() + offset_ms)
     }
 
+    async fn resolve_position_mode_for_symbol(&self, symbol: &str) -> BybitPositionMode {
+        if let Some(mode) = bybit_position_mode_for_symbol(&self.position_modes, symbol) {
+            return mode;
+        }
+
+        if let Err(error) = self.fetch_position(symbol).await {
+            warn!(
+                symbol,
+                ?error,
+                "bybit position mode hydrate failed before order placement; falling back to cached/default mode"
+            );
+        }
+
+        self.position_mode_for_symbol(symbol)
+    }
+
     fn position_mode_for_symbol(&self, symbol: &str) -> BybitPositionMode {
         bybit_position_mode_for_symbol(&self.position_modes, symbol)
             .unwrap_or(BybitPositionMode::OneWay)
@@ -869,33 +885,35 @@ impl VenueAdapter for BybitLiveAdapter {
         validate_bybit_order_request(&meta, &request.symbol, quantity, request.price_hint)?;
         let order_prepare_ms = elapsed_ms(order_prepare_started_at);
 
-        let initial_mode = self.position_mode_for_symbol(&request.symbol);
+        let mut submit_mode = self.resolve_position_mode_for_symbol(&request.symbol).await;
         let submit_started_at = Instant::now();
-        let mut response = self
-            .submit_order_once(&request, &meta, quantity, initial_mode)
-            .await?;
-        if response.response.ret_code != 0
-            && bybit_position_mode_retry_allowed(
-                response.response.ret_code,
-                &response.response.ret_msg,
-            )
-        {
-            let fallback_mode = initial_mode.alternate();
-            let fallback_response = self
-                .submit_order_once(&request, &meta, quantity, fallback_mode)
-                .await?;
-            if fallback_response.response.ret_code == 0 {
-                update_bybit_position_mode_slot(
-                    &self.position_modes,
-                    &request.symbol,
-                    Some(fallback_mode),
-                );
-                response.request_sign_ms += fallback_response.request_sign_ms;
-                response.submit_http_ms += fallback_response.submit_http_ms;
-                response.response_decode_ms += fallback_response.response_decode_ms;
-                response.response = fallback_response.response;
+        let mut attempted_mode_retry = false;
+        let response = loop {
+            match self
+                .submit_order_once(&request, &meta, quantity, submit_mode)
+                .await
+            {
+                Ok(response)
+                    if response.response.ret_code != 0
+                        && !attempted_mode_retry
+                        && bybit_position_mode_retry_allowed(
+                            response.response.ret_code,
+                            &response.response.ret_msg,
+                        ) =>
+                {
+                    submit_mode = submit_mode.alternate();
+                    attempted_mode_retry = true;
+                    continue;
+                }
+                Ok(response) => break response,
+                Err(error) if !attempted_mode_retry && should_retry_bybit_order_error(&error) => {
+                    submit_mode = submit_mode.alternate();
+                    attempted_mode_retry = true;
+                    continue;
+                }
+                Err(error) => return Err(error),
             }
-        }
+        };
         let submit_ack_ms = elapsed_ms(submit_started_at);
         if response.response.ret_code != 0 {
             return Err(format_bybit_api_error(
@@ -904,6 +922,7 @@ impl VenueAdapter for BybitLiveAdapter {
                 &response.response.ret_msg,
             ));
         }
+        update_bybit_position_mode_slot(&self.position_modes, &request.symbol, Some(submit_mode));
         let order_id = response
             .response
             .result
@@ -1552,11 +1571,12 @@ fn bybit_position_idx(mode: BybitPositionMode, side: Side, reduce_only: bool) ->
 }
 
 fn bybit_position_mode_retry_allowed(ret_code: i64, ret_msg: &str) -> bool {
-    let normalized = ret_msg.to_ascii_lowercase();
-    (ret_code == 10001
-        || normalized.contains("position idx")
-        || normalized.contains("position mode"))
-        && (normalized.contains("position idx") || normalized.contains("position mode"))
+    ret_code == 10001 || should_retry_bybit_order_error(&anyhow!(ret_msg.to_string()))
+}
+
+fn should_retry_bybit_order_error(error: &anyhow::Error) -> bool {
+    let normalized = error.to_string().to_ascii_lowercase();
+    normalized.contains("position idx") && normalized.contains("position mode")
 }
 
 fn validate_bybit_order_request(
@@ -1882,6 +1902,8 @@ mod tests {
     use std::collections::{BTreeSet, HashMap, HashSet};
     use std::sync::{Arc, Mutex};
 
+    use anyhow::anyhow;
+
     use crate::models::Venue;
 
     use super::{
@@ -1889,9 +1911,9 @@ mod tests {
         bybit_position_mode_from_position_idx, bybit_position_mode_retry_allowed,
         bybit_transfer_status_cache_is_fresh, ensure_bybit_order_link_id,
         filter_bybit_transfer_statuses, format_bybit_api_error, format_bybit_http_error,
-        prune_bybit_symbol_catalog_entry, update_bybit_position_mode_slot,
-        validate_bybit_order_request, BybitCoinChain, BybitCoinInfo, BybitInstrumentMeta,
-        BybitPositionMode,
+        prune_bybit_symbol_catalog_entry, should_retry_bybit_order_error,
+        update_bybit_position_mode_slot, validate_bybit_order_request, BybitCoinChain,
+        BybitCoinInfo, BybitInstrumentMeta, BybitPositionMode,
     };
 
     #[test]
@@ -2048,6 +2070,16 @@ mod tests {
             110001,
             "order not found"
         ));
+    }
+
+    #[test]
+    fn http_mode_mismatch_errors_are_retryable() {
+        assert!(should_retry_bybit_order_error(&anyhow!(
+            "bybit private endpoint returned non-success status: status=400 Bad Request ret_code=10001 ret_msg=position idx not match position mode"
+        )));
+        assert!(!should_retry_bybit_order_error(&anyhow!(
+            "bybit private endpoint returned non-success status: status=400 Bad Request ret_code=110007 ret_msg=insufficient available balance"
+        )));
     }
 
     #[test]
