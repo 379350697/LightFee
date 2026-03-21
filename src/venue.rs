@@ -49,6 +49,10 @@ pub trait VenueAdapter: Send + Sync {
         Ok(quantity)
     }
 
+    async fn ensure_entry_leverage(&self, _symbol: &str, _leverage: u32) -> Result<()> {
+        Ok(())
+    }
+
     async fn fetch_perp_liquidity_snapshot(
         &self,
         _symbol: &str,

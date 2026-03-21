@@ -10,10 +10,10 @@ use anyhow::{anyhow, Context, Result};
 use futures::future::join_all;
 use lightfee::{
     config::RuntimeMode, strategy::discover_candidates, AppConfig, AsterLiveAdapter,
-    BinanceLiveAdapter, BitgetLiveAdapter, BybitLiveAdapter, CandidateOpportunity, ChillybotOpportunitySource,
-    FeedgrabChillybotSource, FundingOpportunityType, GateLiveAdapter, MarketView,
-    OkxLiveAdapter, OpportunityHintSource, OrderFill, OrderRequest, Side, TransferStatusSource,
-    TransferStatusView, Venue, VenueAdapter,
+    BinanceLiveAdapter, BitgetLiveAdapter, BybitLiveAdapter, CandidateOpportunity,
+    ChillybotOpportunitySource, FeedgrabChillybotSource, FundingOpportunityType, GateLiveAdapter,
+    MarketView, OkxLiveAdapter, OpportunityHintSource, OrderFill, OrderRequest, Side,
+    TransferStatusSource, TransferStatusView, Venue, VenueAdapter,
 };
 use tokio::time::{sleep, Duration};
 

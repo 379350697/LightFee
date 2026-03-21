@@ -3,11 +3,11 @@ use async_trait::async_trait;
 
 use crate::{
     config::{RuntimeConfig, VenueConfig},
+    live::BinanceLiveAdapter,
     models::{
         AccountBalanceSnapshot, AssetTransferStatus, OrderFill, OrderFillReconciliation,
         OrderRequest, PerpLiquiditySnapshot, PositionSnapshot, Venue, VenueMarketSnapshot,
     },
-    live::BinanceLiveAdapter,
     venue::VenueAdapter,
 };
 
@@ -62,9 +62,7 @@ impl AsterLiveAdapter {
         reconciliation
     }
 
-    fn rewrite_transfer_statuses(
-        statuses: Vec<AssetTransferStatus>,
-    ) -> Vec<AssetTransferStatus> {
+    fn rewrite_transfer_statuses(statuses: Vec<AssetTransferStatus>) -> Vec<AssetTransferStatus> {
         statuses
             .into_iter()
             .map(|mut status| {
@@ -107,11 +105,15 @@ impl VenueAdapter for AsterLiveAdapter {
     }
 
     fn cached_position(&self, symbol: &str) -> Option<PositionSnapshot> {
-        self.inner.cached_position(symbol).map(Self::rewrite_position)
+        self.inner
+            .cached_position(symbol)
+            .map(Self::rewrite_position)
     }
 
     async fn fetch_position(&self, symbol: &str) -> Result<PositionSnapshot> {
-        Ok(Self::rewrite_position(self.inner.fetch_position(symbol).await?))
+        Ok(Self::rewrite_position(
+            self.inner.fetch_position(symbol).await?,
+        ))
     }
 
     async fn fetch_all_positions(&self) -> Result<Option<Vec<PositionSnapshot>>> {
@@ -151,6 +153,10 @@ impl VenueAdapter for AsterLiveAdapter {
         self.inner.normalize_quantity(symbol, quantity).await
     }
 
+    async fn ensure_entry_leverage(&self, symbol: &str, leverage: u32) -> Result<()> {
+        self.inner.ensure_entry_leverage(symbol, leverage).await
+    }
+
     async fn fetch_perp_liquidity_snapshot(
         &self,
         symbol: &str,
@@ -160,18 +166,11 @@ impl VenueAdapter for AsterLiveAdapter {
         ))
     }
 
-    fn min_entry_notional_quote_hint(
-        &self,
-        symbol: &str,
-        price_hint: Option<f64>,
-    ) -> Option<f64> {
+    fn min_entry_notional_quote_hint(&self, symbol: &str, price_hint: Option<f64>) -> Option<f64> {
         self.inner.min_entry_notional_quote_hint(symbol, price_hint)
     }
 
-    async fn fetch_transfer_statuses(
-        &self,
-        assets: &[String],
-    ) -> Result<Vec<AssetTransferStatus>> {
+    async fn fetch_transfer_statuses(&self, assets: &[String]) -> Result<Vec<AssetTransferStatus>> {
         Ok(Self::rewrite_transfer_statuses(
             self.inner.fetch_transfer_statuses(assets).await?,
         ))

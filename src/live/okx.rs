@@ -53,6 +53,7 @@ pub struct OkxLiveAdapter {
     private_ws: Arc<WsPrivateState>,
     transfer_status_cache: Mutex<Option<VenueTransferStatusCache>>,
     perp_liquidity_cache: Mutex<HashMap<String, PerpLiquiditySnapshot>>,
+    configured_leverage: Mutex<HashMap<String, u32>>,
 }
 
 impl OkxLiveAdapter {
@@ -103,6 +104,7 @@ impl OkxLiveAdapter {
             private_ws: WsPrivateState::new(),
             transfer_status_cache: Mutex::new(transfer_status_cache),
             perp_liquidity_cache: Mutex::new(HashMap::new()),
+            configured_leverage: Mutex::new(HashMap::new()),
         };
         if let Err(error) = adapter.refresh_symbol_catalog().await {
             if adapter.supported_symbols.lock().expect("lock").is_empty() {
@@ -812,6 +814,34 @@ impl OkxLiveAdapter {
         Ok(response)
     }
 
+    async fn set_cross_leverage(
+        &self,
+        inst_id: &str,
+        leverage: u32,
+        pos_side: Option<&str>,
+    ) -> Result<()> {
+        let body = serde_json::json!({
+            "instId": inst_id,
+            "lever": leverage.to_string(),
+            "mgnMode": "cross",
+            "posSide": pos_side,
+        })
+        .to_string();
+        let response = self
+            .signed_request(
+                reqwest::Method::POST,
+                "/api/v5/account/set-leverage",
+                None,
+                Some(body),
+            )
+            .await?
+            .json::<OkxApiResponse<serde_json::Value>>()
+            .await
+            .context("failed to decode okx set leverage response")?;
+        ensure_okx_api_success("okx set leverage failed", response)?;
+        Ok(())
+    }
+
     async fn submit_order_once(
         &self,
         request: &OrderRequest,
@@ -1271,6 +1301,39 @@ impl VenueAdapter for OkxLiveAdapter {
             available_balance_quote: row.avail_eq.as_deref().map(parse_f64).transpose()?,
             observed_at_ms: now_ms(),
         }))
+    }
+
+    async fn ensure_entry_leverage(&self, symbol: &str, leverage: u32) -> Result<()> {
+        if self
+            .configured_leverage
+            .lock()
+            .expect("lock")
+            .get(symbol)
+            .copied()
+            == Some(leverage)
+        {
+            return Ok(());
+        }
+
+        let position_mode = self.position_mode().await?;
+        let inst_id = venue_symbol(&self.config, symbol);
+        match position_mode {
+            OkxPositionMode::Net => {
+                self.set_cross_leverage(&inst_id, leverage, None).await?;
+            }
+            OkxPositionMode::LongShort => {
+                self.set_cross_leverage(&inst_id, leverage, Some("long"))
+                    .await?;
+                self.set_cross_leverage(&inst_id, leverage, Some("short"))
+                    .await?;
+            }
+        }
+
+        self.configured_leverage
+            .lock()
+            .expect("lock")
+            .insert(symbol.to_string(), leverage);
+        Ok(())
     }
 
     fn enforces_entry_balance_gate(&self) -> bool {

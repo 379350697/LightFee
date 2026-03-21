@@ -199,6 +199,10 @@ pub fn discover_candidates(
 pub fn effective_max_entry_notional(config: &AppConfig) -> f64 {
     match config.runtime.mode {
         RuntimeMode::Live => {
+            let forced_live_notional = config.strategy.forced_live_entry_notional_quote;
+            if forced_live_notional > 0.0 {
+                return forced_live_notional;
+            }
             let live_cap = config.strategy.live_max_entry_notional;
             if live_cap <= 0.0 {
                 config.strategy.max_entry_notional
@@ -564,6 +568,7 @@ mod tests {
             strategy: StrategyConfig {
                 max_entry_notional: 120.0,
                 live_max_entry_notional: 0.0,
+                forced_live_entry_notional_quote: 0.0,
                 min_funding_edge_bps: 0.0,
                 min_expected_edge_bps: -1_000.0,
                 min_worst_case_edge_bps: -1_000.0,

@@ -55,6 +55,7 @@ pub struct BinanceLiveAdapter {
     private_ws: Arc<WsPrivateState>,
     transfer_status_cache: Mutex<Option<VenueTransferStatusCache>>,
     perp_liquidity_cache: Mutex<HashMap<String, PerpLiquiditySnapshot>>,
+    configured_leverage: Mutex<HashMap<String, u32>>,
 }
 
 impl BinanceLiveAdapter {
@@ -115,6 +116,7 @@ impl BinanceLiveAdapter {
             private_ws: WsPrivateState::new(),
             transfer_status_cache: Mutex::new(transfer_status_cache),
             perp_liquidity_cache: Mutex::new(HashMap::new()),
+            configured_leverage: Mutex::new(HashMap::new()),
         };
         if let Err(error) = adapter.refresh_symbol_catalog().await {
             if adapter.supported_symbols.lock().expect("lock").is_empty() {
@@ -1007,6 +1009,56 @@ impl VenueAdapter for BinanceLiveAdapter {
             available_balance_quote: Some(parse_f64(&account.available_balance)?),
             observed_at_ms: now_ms(),
         }))
+    }
+
+    async fn ensure_entry_leverage(&self, symbol: &str, leverage: u32) -> Result<()> {
+        if self
+            .configured_leverage
+            .lock()
+            .expect("lock")
+            .get(symbol)
+            .copied()
+            == Some(leverage)
+        {
+            return Ok(());
+        }
+
+        let set_once = || async {
+            let params = vec![
+                ("symbol", venue_symbol(&self.config, symbol)),
+                ("leverage", leverage.to_string()),
+                ("recvWindow", BINANCE_RECV_WINDOW_MS.to_string()),
+                ("timestamp", self.server_timestamp_ms().await?.to_string()),
+            ];
+            self.signed_request(
+                reqwest::Method::POST,
+                "/fapi/v1/leverage",
+                params,
+                None,
+                &self.base_url,
+            )
+            .await?
+            .json::<serde_json::Value>()
+            .await
+            .context("failed to decode binance leverage response")?;
+            Ok::<(), anyhow::Error>(())
+        };
+
+        match set_once().await {
+            Ok(()) => {}
+            Err(error) if should_retry_binance_order_error(&error) => {
+                self.clear_server_time_offset();
+                sleep(Duration::from_millis(100)).await;
+                set_once().await?;
+            }
+            Err(error) => return Err(error),
+        }
+
+        self.configured_leverage
+            .lock()
+            .expect("lock")
+            .insert(symbol.to_string(), leverage);
+        Ok(())
     }
 
     fn enforces_entry_balance_gate(&self) -> bool {

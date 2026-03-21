@@ -49,6 +49,7 @@ pub struct BybitLiveAdapter {
     time_offset_ms: Mutex<Option<i64>>,
     position_modes: Arc<Mutex<HashMap<String, BybitPositionMode>>>,
     perp_liquidity_cache: Mutex<HashMap<String, PerpLiquiditySnapshot>>,
+    configured_leverage: Mutex<HashMap<String, u32>>,
     market_ws: Arc<WsMarketState>,
     market_subscription_symbols: Mutex<Vec<String>>,
     private_ws: Arc<WsPrivateState>,
@@ -102,6 +103,7 @@ impl BybitLiveAdapter {
             time_offset_ms: Mutex::new(None),
             position_modes: Arc::new(Mutex::new(HashMap::new())),
             perp_liquidity_cache: Mutex::new(HashMap::new()),
+            configured_leverage: Mutex::new(HashMap::new()),
             market_ws,
             market_subscription_symbols: Mutex::new(Vec::new()),
             private_ws: WsPrivateState::new(),
@@ -1130,6 +1132,50 @@ impl VenueAdapter for BybitLiveAdapter {
                 .transpose()?,
             observed_at_ms: now_ms(),
         }))
+    }
+
+    async fn ensure_entry_leverage(&self, symbol: &str, leverage: u32) -> Result<()> {
+        if self
+            .configured_leverage
+            .lock()
+            .expect("lock")
+            .get(symbol)
+            .copied()
+            == Some(leverage)
+        {
+            return Ok(());
+        }
+
+        let body = serde_json::json!({
+            "category": "linear",
+            "symbol": venue_symbol(&self.config, symbol),
+            "buyLeverage": leverage.to_string(),
+            "sellLeverage": leverage.to_string(),
+        })
+        .to_string();
+        let response = self
+            .signed_request(
+                reqwest::Method::POST,
+                "/v5/position/set-leverage",
+                None,
+                Some(body),
+            )
+            .await?
+            .json::<BybitApiResponse<serde_json::Value>>()
+            .await
+            .context("failed to decode bybit set leverage response")?;
+        if response.ret_code != 0 {
+            return Err(format_bybit_api_error(
+                "bybit set leverage failed",
+                response.ret_code,
+                &response.ret_msg,
+            ));
+        }
+        self.configured_leverage
+            .lock()
+            .expect("lock")
+            .insert(symbol.to_string(), leverage);
+        Ok(())
     }
 
     fn enforces_entry_balance_gate(&self) -> bool {

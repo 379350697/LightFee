@@ -844,7 +844,11 @@ impl Engine {
                 None
             };
         let market = match self
-            .fetch_market_view(live_entry_venue_filter.as_ref().map(|item| &item.eligible_venues))
+            .fetch_market_view(
+                live_entry_venue_filter
+                    .as_ref()
+                    .map(|item| &item.eligible_venues),
+            )
             .await
         {
             Ok(market) => market,
@@ -947,6 +951,9 @@ impl Engine {
             }
             self.apply_perp_liquidity_guards(&market, &mut candidates)
                 .await?;
+            self.apply_live_entry_leverage_guards(&mut candidates)
+                .await?;
+            sort_candidates(&mut candidates);
             let tradeable_count = candidates
                 .iter()
                 .filter(|candidate| candidate.is_tradeable())
@@ -1101,11 +1108,9 @@ impl Engine {
         scan_config
             .venues
             .retain(|venue| eligible_venues.contains(&venue.venue));
-        scan_config
-            .directed_pairs
-            .retain(|pair| {
-                eligible_venues.contains(&pair.long) && eligible_venues.contains(&pair.short)
-            });
+        scan_config.directed_pairs.retain(|pair| {
+            eligible_venues.contains(&pair.long) && eligible_venues.contains(&pair.short)
+        });
     }
 
     async fn live_entry_venue_filter(&mut self, now_ms: i64) -> CachedLiveEntryVenueFilter {
@@ -4649,6 +4654,104 @@ impl Engine {
             }
             Some((leg.leg.entry_stage(), leg.venue, leg_notional, min_notional))
         })
+    }
+
+    async fn apply_live_entry_leverage_guards(
+        &mut self,
+        candidates: &mut [CandidateOpportunity],
+    ) -> Result<()> {
+        if !matches!(self.config.runtime.mode, RuntimeMode::Live) {
+            return Ok(());
+        }
+        let target_leverage = self.config.strategy.live_target_leverage;
+        if target_leverage == 0 {
+            return Ok(());
+        }
+        let prep_limit = self
+            .config
+            .strategy
+            .max_concurrent_positions
+            .max(1)
+            .saturating_mul(2)
+            .max(4);
+        let mut prepared = 0usize;
+        for candidate in candidates.iter_mut() {
+            if !candidate.is_tradeable() {
+                continue;
+            }
+            if prepared >= prep_limit {
+                break;
+            }
+            let started_at = Instant::now();
+            match self
+                .ensure_live_entry_leverage_for_symbol(
+                    target_leverage,
+                    candidate.long_venue,
+                    candidate.short_venue,
+                    &candidate.symbol,
+                )
+                .await
+            {
+                Ok(()) => {
+                    prepared += 1;
+                    self.log_event(
+                        "execution.entry_candidate_leverage_ready",
+                        &json!({
+                            "pair_id": &candidate.pair_id,
+                            "symbol": &candidate.symbol,
+                            "long_venue": candidate.long_venue,
+                            "short_venue": candidate.short_venue,
+                            "target_leverage": target_leverage,
+                            "setup_ms": duration_ms_u64(started_at.elapsed()),
+                        }),
+                    );
+                }
+                Err(error) => {
+                    candidate
+                        .blocked_reasons
+                        .push("entry_leverage_unavailable".to_string());
+                    self.log_event(
+                        "execution.entry_leverage_unavailable",
+                        &json!({
+                            "pair_id": &candidate.pair_id,
+                            "symbol": &candidate.symbol,
+                            "long_venue": candidate.long_venue,
+                            "short_venue": candidate.short_venue,
+                            "target_leverage": target_leverage,
+                            "setup_ms": duration_ms_u64(started_at.elapsed()),
+                            "error": error.to_string(),
+                        }),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn ensure_live_entry_leverage_for_symbol(
+        &self,
+        target_leverage: u32,
+        long_venue: Venue,
+        short_venue: Venue,
+        symbol: &str,
+    ) -> Result<()> {
+        if !matches!(self.config.runtime.mode, RuntimeMode::Live) || target_leverage == 0 {
+            return Ok(());
+        }
+        if long_venue == short_venue {
+            return self
+                .adapter(long_venue)?
+                .ensure_entry_leverage(symbol, target_leverage)
+                .await;
+        }
+
+        let first_adapter = self.adapter(long_venue)?;
+        let second_adapter = self.adapter(short_venue)?;
+        tokio::try_join!(
+            first_adapter.ensure_entry_leverage(symbol, target_leverage),
+            second_adapter.ensure_entry_leverage(symbol, target_leverage),
+        )?;
+        Ok(())
     }
 
     fn persist_state(&mut self) -> Result<()> {

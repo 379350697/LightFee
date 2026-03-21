@@ -138,7 +138,7 @@ pub fn venue_symbol(config: &VenueConfig, symbol: &str) -> String {
     match config.venue {
         Venue::Binance | Venue::Bybit | Venue::Aster => format!("{base}{quote}"),
         Venue::Okx => format!("{base}-{quote}-SWAP"),
-        Venue::Bitget => format!("{base}{quote}_UMCBL"),
+        Venue::Bitget => format!("{base}{quote}"),
         Venue::Gate => format!("{base}_{quote}"),
         Venue::Hyperliquid => base,
     }
@@ -219,7 +219,7 @@ mod tests {
             live: LiveVenueConfig::default(),
         };
 
-        assert_eq!(venue_symbol(&bitget, "BTCUSDT"), "BTCUSDT_UMCBL");
+        assert_eq!(venue_symbol(&bitget, "BTCUSDT"), "BTCUSDT");
         assert_eq!(venue_symbol(&gate, "BTCUSDT"), "BTC_USDT");
     }
 }

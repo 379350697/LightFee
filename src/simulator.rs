@@ -21,6 +21,7 @@ struct Inner {
     perp_liquidity_errors: BTreeMap<String, String>,
     fail_next_orders: usize,
     next_order_id: u64,
+    ensured_leverages: Vec<(String, u32)>,
 }
 
 #[derive(Debug)]
@@ -31,6 +32,7 @@ pub struct ScriptedVenueAdapter {
     balance_snapshot: Option<AccountBalanceSnapshot>,
     balance_fetch_error: Option<String>,
     enforce_entry_balance_gate: bool,
+    leverage_error: Option<String>,
     inner: Mutex<Inner>,
 }
 
@@ -43,6 +45,7 @@ impl ScriptedVenueAdapter {
             balance_snapshot: None,
             balance_fetch_error: None,
             enforce_entry_balance_gate: false,
+            leverage_error: None,
             inner: Mutex::new(Inner {
                 snapshots,
                 cursor: 0,
@@ -52,6 +55,7 @@ impl ScriptedVenueAdapter {
                 perp_liquidity_errors: BTreeMap::new(),
                 fail_next_orders: 0,
                 next_order_id: 1,
+                ensured_leverages: Vec::new(),
             }),
         }
     }
@@ -92,6 +96,11 @@ impl ScriptedVenueAdapter {
 
     pub fn with_entry_balance_gate(mut self) -> Self {
         self.enforce_entry_balance_gate = true;
+        self
+    }
+
+    pub fn with_leverage_error(mut self, error: &str) -> Self {
+        self.leverage_error = Some(error.to_string());
         self
     }
 
@@ -144,6 +153,10 @@ impl ScriptedVenueAdapter {
     pub fn position_size(&self, symbol: &str) -> f64 {
         let inner = self.inner.lock().expect("lock");
         inner.positions.get(symbol).copied().unwrap_or_default()
+    }
+
+    pub fn ensured_leverages(&self) -> Vec<(String, u32)> {
+        self.inner.lock().expect("lock").ensured_leverages.clone()
     }
 
     fn current_snapshot(inner: &Inner) -> Result<&VenueMarketSnapshot> {
@@ -279,6 +292,18 @@ impl VenueAdapter for ScriptedVenueAdapter {
 
     async fn normalize_quantity(&self, _symbol: &str, quantity: f64) -> Result<f64> {
         Ok(quantity)
+    }
+
+    async fn ensure_entry_leverage(&self, symbol: &str, leverage: u32) -> Result<()> {
+        if let Some(error) = self.leverage_error.as_ref() {
+            return Err(anyhow!(error.clone()));
+        }
+        self.inner
+            .lock()
+            .expect("lock")
+            .ensured_leverages
+            .push((symbol.to_string(), leverage));
+        Ok(())
     }
 
     async fn fetch_perp_liquidity_snapshot(

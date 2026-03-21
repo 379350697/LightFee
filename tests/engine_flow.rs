@@ -2355,8 +2355,10 @@ async fn uncertain_first_leg_is_flattened_before_engine_continues() {
             post_funding_hold_secs: 0,
             max_entry_notional: 1_000.0,
             live_max_entry_notional: 30.0,
+            forced_live_entry_notional_quote: 50.0,
             min_entry_leg_notional_quote: 8.0,
             max_concurrent_positions: 1,
+            live_target_leverage: 4,
             max_scan_minutes_before_funding: 0,
             min_scan_minutes_before_funding: 0,
             max_stagger_gap_minutes: 480,
@@ -2464,8 +2466,10 @@ async fn uncertain_venue_is_cooled_down_before_next_entry_attempt() {
             post_funding_hold_secs: 0,
             max_entry_notional: 1_000.0,
             live_max_entry_notional: 30.0,
+            forced_live_entry_notional_quote: 50.0,
             min_entry_leg_notional_quote: 8.0,
             max_concurrent_positions: 1,
+            live_target_leverage: 4,
             max_scan_minutes_before_funding: 0,
             min_scan_minutes_before_funding: 0,
             max_stagger_gap_minutes: 480,
@@ -2562,6 +2566,7 @@ async fn live_cached_positions_block_entry_when_pair_is_not_flat() {
     config.runtime.mode = RuntimeMode::Live;
     config.runtime.max_order_quote_age_ms = 0;
     config.strategy.max_entry_notional = 10.0;
+    config.strategy.forced_live_entry_notional_quote = 0.0;
     config.directed_pairs = vec![DirectedPairConfig {
         long: Venue::Binance,
         short: Venue::Okx,
@@ -2857,10 +2862,7 @@ async fn live_scan_skips_venues_with_balance_below_minimum() {
         .expect("okx status");
     assert_eq!(okx_status["eligible"], false);
     assert_eq!(okx_status["reason"], "balance_below_minimum");
-    assert_eq!(
-        okx_status["effective_balance_quote"].as_f64(),
-        Some(40.0)
-    );
+    assert_eq!(okx_status["effective_balance_quote"].as_f64(), Some(40.0));
 }
 
 #[tokio::test]
@@ -2953,12 +2955,10 @@ async fn live_scan_skips_venues_with_balance_fetch_failures() {
         .expect("okx status");
     assert_eq!(okx_status["eligible"], false);
     assert_eq!(okx_status["reason"], "account_balance_fetch_failed");
-    assert!(
-        okx_status["error"]
-            .as_str()
-            .expect("error")
-            .contains("code=50113")
-    );
+    assert!(okx_status["error"]
+        .as_str()
+        .expect("error")
+        .contains("code=50113"));
 }
 
 #[tokio::test]
@@ -3002,6 +3002,7 @@ fn live_candidate_sizing_is_capped_to_30_quote_per_leg() {
     config.runtime.mode = RuntimeMode::Live;
     config.strategy.max_entry_notional = 1_000.0;
     config.strategy.live_max_entry_notional = 30.0;
+    config.strategy.forced_live_entry_notional_quote = 0.0;
     config.strategy.entry_window_secs = 3_600;
 
     let market = MarketView::from_snapshots(vec![
@@ -3491,6 +3492,7 @@ async fn entry_is_blocked_when_effective_leg_notional_falls_below_global_minimum
     config.strategy.entry_window_secs = 3_600;
     config.strategy.max_entry_notional = 30.0;
     config.strategy.live_max_entry_notional = 30.0;
+    config.strategy.forced_live_entry_notional_quote = 0.0;
 
     let now_ms = chrono::Utc::now().timestamp_millis();
     let funding_timestamp_ms = now_ms + 60_000;
@@ -3911,8 +3913,10 @@ fn test_config(temp: &TempDir, auto_trade_enabled: bool) -> AppConfig {
             post_funding_hold_secs: 0,
             max_entry_notional: 1_000.0,
             live_max_entry_notional: 30.0,
+            forced_live_entry_notional_quote: 50.0,
             min_entry_leg_notional_quote: 8.0,
             max_concurrent_positions: 1,
+            live_target_leverage: 4,
             max_scan_minutes_before_funding: 0,
             min_scan_minutes_before_funding: 0,
             max_stagger_gap_minutes: 480,

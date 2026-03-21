@@ -69,6 +69,7 @@ pub struct HyperliquidLiveAdapter {
     market_subscription_symbols: Mutex<Vec<String>>,
     private_ws: Arc<WsPrivateState>,
     perp_liquidity_cache: Arc<Mutex<HashMap<String, PerpLiquiditySnapshot>>>,
+    configured_leverage: Mutex<HashMap<String, u32>>,
     order_ws: HyperliquidWsPostClient,
 }
 
@@ -136,6 +137,7 @@ impl HyperliquidLiveAdapter {
             market_subscription_symbols: Mutex::new(Vec::new()),
             private_ws: WsPrivateState::new(),
             perp_liquidity_cache: Arc::new(Mutex::new(HashMap::new())),
+            configured_leverage: Mutex::new(HashMap::new()),
             order_ws: HyperliquidWsPostClient::new(hyperliquid_ws_url(base_url)),
         };
         if let Err(error) = adapter.refresh_symbol_catalog().await {
@@ -998,6 +1000,37 @@ impl VenueAdapter for HyperliquidLiveAdapter {
             available_balance_quote: Some(parse_f64(&user_state.withdrawable)?),
             observed_at_ms: now_ms(),
         }))
+    }
+
+    async fn ensure_entry_leverage(&self, symbol: &str, leverage: u32) -> Result<()> {
+        if self
+            .configured_leverage
+            .lock()
+            .expect("lock")
+            .get(symbol)
+            .copied()
+            == Some(leverage)
+        {
+            return Ok(());
+        }
+
+        let response = self
+            .exchange_client
+            .update_leverage(leverage, &venue_symbol(&self.config, symbol), true, None)
+            .await
+            .context("failed to submit hyperliquid leverage update")?;
+        match response {
+            ExchangeResponseStatus::Ok(_) => {
+                self.configured_leverage
+                    .lock()
+                    .expect("lock")
+                    .insert(symbol.to_string(), leverage);
+                Ok(())
+            }
+            ExchangeResponseStatus::Err(error) => {
+                Err(anyhow!("hyperliquid set leverage failed: {error}"))
+            }
+        }
     }
 
     fn enforces_entry_balance_gate(&self) -> bool {

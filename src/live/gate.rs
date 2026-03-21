@@ -1,27 +1,420 @@
-use anyhow::{anyhow, Result};
+use std::{
+    collections::{BTreeSet, HashMap, HashSet},
+    sync::Mutex,
+    time::Instant,
+};
+
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
+use hmac::{Hmac, Mac};
+use reqwest::{
+    header::{HeaderMap, HeaderValue},
+    Client, Method, StatusCode,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha512};
+use tokio::time::{sleep, Duration};
+use tracing::{debug, warn};
 
 use crate::{
     config::{RuntimeConfig, VenueConfig},
     models::{
-        AccountBalanceSnapshot, AssetTransferStatus, OrderFill, OrderFillReconciliation,
-        OrderRequest, PerpLiquiditySnapshot, PositionSnapshot, Venue, VenueMarketSnapshot,
+        AccountBalanceSnapshot, AssetTransferStatus, OrderExecutionTiming, OrderFill,
+        OrderFillReconciliation, OrderRequest, PerpLiquiditySnapshot, PositionSnapshot, Side,
+        SymbolMarketSnapshot, Venue, VenueMarketSnapshot,
     },
     venue::VenueAdapter,
 };
 
-pub struct GateLiveAdapter;
+use super::{
+    base_asset, build_http_client, build_query, cache_is_fresh, estimate_fee_quote,
+    filter_transfer_statuses, floor_to_step, format_decimal, load_json_cache, now_ms, parse_f64,
+    parse_i64, store_json_cache, transfer_cache_ttl_ms, venue_symbol, VenueTransferStatusCache,
+    SYMBOL_CACHE_TTL_MS,
+};
+
+const GATE_SETTLE: &str = "usdt";
+const GATE_PERP_LIQUIDITY_CACHE_TTL_MS: i64 = 60 * 1_000;
+const GATE_CLIENT_TEXT_PREFIX: &str = "t-";
+
+type HmacSha512 = Hmac<Sha512>;
+
+pub struct GateLiveAdapter {
+    config: VenueConfig,
+    runtime: RuntimeConfig,
+    client: Client,
+    base_url: String,
+    wallet_base_url: String,
+    metadata: Mutex<HashMap<String, GateContractMeta>>,
+    supported_symbols: Mutex<HashSet<String>>,
+    transfer_status_cache: Mutex<Option<VenueTransferStatusCache>>,
+    perp_liquidity_cache: Mutex<HashMap<String, PerpLiquiditySnapshot>>,
+    configured_leverage: Mutex<HashMap<String, u32>>,
+}
 
 impl GateLiveAdapter {
     pub async fn new(
         config: &VenueConfig,
-        _runtime: &RuntimeConfig,
+        runtime: &RuntimeConfig,
         _symbols: &[String],
     ) -> Result<Self> {
         if config.venue != Venue::Gate {
             return Err(anyhow!("gate live adapter requires gate config"));
         }
-        Ok(Self)
+
+        let persisted_catalog = load_json_cache::<GateSymbolCatalogCache>("gate-symbols.json");
+        let persisted_transfer_cache =
+            load_json_cache::<VenueTransferStatusCache>("gate-transfer-status.json");
+        let mut metadata = HashMap::new();
+        let mut supported_symbols = HashSet::new();
+        if let Some(cache) = persisted_catalog {
+            if !cache_is_fresh(cache.updated_at_ms, now_ms(), SYMBOL_CACHE_TTL_MS) {
+                debug!("gate symbol catalog cache is stale; using as fallback seed");
+            }
+            metadata.extend(cache.metadata);
+            supported_symbols.extend(cache.supported_symbols);
+        }
+        let transfer_status_cache = persisted_transfer_cache.filter(|cache| {
+            cache_is_fresh(
+                cache.observed_at_ms,
+                now_ms(),
+                transfer_cache_ttl_ms(runtime.transfer_status_cache_ms),
+            )
+        });
+
+        let adapter = Self {
+            config: config.clone(),
+            runtime: runtime.clone(),
+            client: build_http_client(runtime.exchange_http_timeout_ms)?,
+            base_url: config
+                .live
+                .base_url
+                .clone()
+                .unwrap_or_else(|| "https://api.gateio.ws".to_string()),
+            wallet_base_url: config
+                .live
+                .wallet_base_url
+                .clone()
+                .unwrap_or_else(|| "https://api.gateio.ws".to_string()),
+            metadata: Mutex::new(metadata),
+            supported_symbols: Mutex::new(supported_symbols),
+            transfer_status_cache: Mutex::new(transfer_status_cache),
+            perp_liquidity_cache: Mutex::new(HashMap::new()),
+            configured_leverage: Mutex::new(HashMap::new()),
+        };
+        if let Err(error) = adapter.refresh_symbol_catalog().await {
+            if adapter.supported_symbols.lock().expect("lock").is_empty() {
+                return Err(error);
+            }
+            warn!(
+                ?error,
+                "gate symbol catalog refresh failed; using persisted cache"
+            );
+        }
+        Ok(adapter)
+    }
+
+    fn tracked_symbols(&self, requested_symbols: &[String]) -> Vec<String> {
+        requested_symbols
+            .iter()
+            .filter(|symbol| {
+                self.supported_symbols
+                    .lock()
+                    .expect("lock")
+                    .contains(symbol.as_str())
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn supports_symbol(&self, symbol: &str) -> bool {
+        self.supported_symbols
+            .lock()
+            .expect("lock")
+            .contains(symbol)
+    }
+
+    fn cached_transfer_statuses(
+        &self,
+        wanted: &BTreeSet<String>,
+        now_ms: i64,
+    ) -> Option<Vec<AssetTransferStatus>> {
+        let cache = self.transfer_status_cache.lock().expect("lock");
+        let cache = cache.as_ref()?;
+        if !cache_is_fresh(
+            cache.observed_at_ms,
+            now_ms,
+            transfer_cache_ttl_ms(self.runtime.transfer_status_cache_ms),
+        ) {
+            return None;
+        }
+        Some(filter_transfer_statuses(cache, wanted))
+    }
+
+    fn cached_perp_liquidity_snapshot(
+        &self,
+        symbol: &str,
+        observed_at_ms: i64,
+    ) -> Option<PerpLiquiditySnapshot> {
+        let snapshot = self
+            .perp_liquidity_cache
+            .lock()
+            .expect("lock")
+            .get(symbol)
+            .cloned()?;
+        if !cache_is_fresh(
+            snapshot.observed_at_ms,
+            observed_at_ms,
+            GATE_PERP_LIQUIDITY_CACHE_TTL_MS,
+        ) {
+            return None;
+        }
+        Some(snapshot)
+    }
+
+    fn persist_symbol_catalog(&self) {
+        let metadata = self.metadata.lock().expect("lock").clone();
+        let supported_symbols = self
+            .supported_symbols
+            .lock()
+            .expect("lock")
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        store_json_cache(
+            "gate-symbols.json",
+            &GateSymbolCatalogCache {
+                updated_at_ms: now_ms(),
+                supported_symbols,
+                metadata,
+            },
+        );
+    }
+
+    async fn refresh_symbol_catalog(&self) -> Result<()> {
+        let payload = self
+            .public_request_json(
+                &self.base_url,
+                Method::GET,
+                &format!("/api/v4/futures/{GATE_SETTLE}/contracts"),
+                None,
+                "failed to request gate futures contracts",
+            )
+            .await?;
+        let rows = payload
+            .as_array()
+            .ok_or_else(|| anyhow!("gate futures contracts response is not an array"))?;
+        let mut metadata = HashMap::new();
+        let mut supported_symbols = HashSet::new();
+        for row in rows {
+            if !gate_contract_is_tradeable(row) {
+                continue;
+            }
+            let (symbol, meta) = parse_gate_contract_meta(row)?;
+            metadata.insert(symbol.clone(), meta);
+            supported_symbols.insert(symbol);
+        }
+        *self.metadata.lock().expect("lock") = metadata;
+        *self.supported_symbols.lock().expect("lock") = supported_symbols;
+        self.persist_symbol_catalog();
+        Ok(())
+    }
+
+    async fn symbol_meta(&self, symbol: &str) -> Result<GateContractMeta> {
+        if let Some(meta) = self.metadata.lock().expect("lock").get(symbol).cloned() {
+            return Ok(meta);
+        }
+        self.refresh_symbol_catalog().await?;
+        self.metadata
+            .lock()
+            .expect("lock")
+            .get(symbol)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow!(
+                    "gate contract metadata missing for {}",
+                    venue_symbol(&self.config, symbol)
+                )
+            })
+    }
+
+    async fn public_request_json(
+        &self,
+        base_url: &str,
+        method: Method,
+        path: &str,
+        query: Option<String>,
+        context: &str,
+    ) -> Result<Value> {
+        let url = if let Some(query) = query.as_ref() {
+            format!("{base_url}{path}?{query}")
+        } else {
+            format!("{base_url}{path}")
+        };
+        let response = self
+            .client
+            .request(method, url)
+            .send()
+            .await
+            .with_context(|| context.to_string())?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(format_gate_http_error(status, &body));
+        }
+        response
+            .json::<Value>()
+            .await
+            .with_context(|| context.to_string())
+    }
+
+    async fn signed_request_json(
+        &self,
+        base_url: &str,
+        method: Method,
+        path: &str,
+        query: Option<String>,
+        body: Option<String>,
+        context: &str,
+    ) -> Result<Value> {
+        let api_key = self
+            .config
+            .live
+            .resolved_api_key()
+            .ok_or_else(|| anyhow!("gate api key is not configured"))?;
+        let api_secret = self
+            .config
+            .live
+            .resolved_api_secret()
+            .ok_or_else(|| anyhow!("gate api secret is not configured"))?;
+        let timestamp = (now_ms() / 1_000).to_string();
+        let query_payload = query.clone().unwrap_or_default();
+        let body_payload = body.clone().unwrap_or_default();
+        let body_hash = hex::encode(Sha512::digest(body_payload.as_bytes()));
+        let sign_payload = format!(
+            "{}\n{}\n{}\n{}\n{}",
+            method.as_str(),
+            path,
+            query_payload,
+            body_hash,
+            timestamp
+        );
+        let mut mac = HmacSha512::new_from_slice(api_secret.as_bytes())
+            .context("failed to init gate hmac")?;
+        mac.update(sign_payload.as_bytes());
+        let signature = hex::encode(mac.finalize().into_bytes());
+
+        let mut headers = HeaderMap::new();
+        headers.insert("KEY", HeaderValue::from_str(&api_key)?);
+        headers.insert("Timestamp", HeaderValue::from_str(&timestamp)?);
+        headers.insert("SIGN", HeaderValue::from_str(&signature)?);
+        headers.insert("Content-Type", HeaderValue::from_static("application/json"));
+
+        let url = if query_payload.is_empty() {
+            format!("{base_url}{path}")
+        } else {
+            format!("{base_url}{path}?{query_payload}")
+        };
+        let request = self.client.request(method, url).headers(headers);
+        let request = if let Some(body) = body {
+            request.body(body)
+        } else {
+            request
+        };
+        let response = request.send().await.with_context(|| context.to_string())?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(format_gate_http_error(status, &body));
+        }
+        response
+            .json::<Value>()
+            .await
+            .with_context(|| context.to_string())
+    }
+
+    async fn fetch_tickers_map(&self) -> Result<HashMap<String, Value>> {
+        let payload = self
+            .public_request_json(
+                &self.base_url,
+                Method::GET,
+                &format!("/api/v4/futures/{GATE_SETTLE}/tickers"),
+                None,
+                "failed to request gate futures tickers",
+            )
+            .await?;
+        let rows = payload
+            .as_array()
+            .ok_or_else(|| anyhow!("gate futures tickers response is not an array"))?;
+        let mut by_symbol = HashMap::new();
+        for row in rows {
+            let Some(contract) = json_string(row, &["contract", "name"]) else {
+                continue;
+            };
+            by_symbol.insert(normalize_gate_contract(&contract), row.clone());
+        }
+        Ok(by_symbol)
+    }
+
+    async fn submit_order_once(
+        &self,
+        request: &OrderRequest,
+        contracts: f64,
+        meta: &GateContractMeta,
+    ) -> Result<GateOrderResponseWithTiming> {
+        let sign_started_at = Instant::now();
+        let size = match request.side {
+            Side::Buy => contracts,
+            Side::Sell => -contracts,
+        };
+        let body = serde_json::json!({
+            "contract": venue_symbol(&self.config, &request.symbol),
+            "size": format_decimal(size, meta.contract_step),
+            "price": "0",
+            "tif": "ioc",
+            "reduce_only": request.reduce_only,
+            "text": gate_client_text(&request.client_order_id),
+        })
+        .to_string();
+        let request_sign_ms = elapsed_ms(sign_started_at);
+        let submit_started_at = Instant::now();
+        let payload = self
+            .signed_request_json(
+                &self.base_url,
+                Method::POST,
+                &format!("/api/v4/futures/{GATE_SETTLE}/orders"),
+                None,
+                Some(body),
+                "failed to submit gate futures order",
+            )
+            .await?;
+        let submit_http_ms = elapsed_ms(submit_started_at);
+        let response_decode_ms = 0;
+        Ok(GateOrderResponseWithTiming {
+            response: payload,
+            request_sign_ms,
+            submit_http_ms,
+            response_decode_ms,
+        })
+    }
+
+    async fn fetch_order_reconciliation_with_retry(
+        &self,
+        symbol: &str,
+        order_id: &str,
+        client_order_id: Option<&str>,
+    ) -> Result<Option<OrderFillReconciliation>> {
+        for attempt in 0..3 {
+            if let Some(reconciliation) = self
+                .fetch_order_fill_reconciliation(symbol, order_id, client_order_id)
+                .await?
+            {
+                return Ok(Some(reconciliation));
+            }
+            sleep(Duration::from_millis(50 * (attempt + 1) as u64)).await;
+        }
+        Ok(None)
     }
 }
 
@@ -31,24 +424,228 @@ impl VenueAdapter for GateLiveAdapter {
         Venue::Gate
     }
 
-    async fn fetch_market_snapshot(&self, _symbols: &[String]) -> Result<VenueMarketSnapshot> {
-        Err(anyhow!("gate live adapter not yet implemented"))
+    async fn fetch_market_snapshot(&self, symbols: &[String]) -> Result<VenueMarketSnapshot> {
+        let tracked = self.tracked_symbols(symbols);
+        if tracked.is_empty() {
+            return Err(anyhow!(
+                "gate market snapshot unavailable for requested symbols"
+            ));
+        }
+        let rows = self.fetch_tickers_map().await?;
+        let observed_at_ms = now_ms();
+        let mut snapshots = Vec::new();
+        for symbol in tracked {
+            let Some(row) = rows.get(&symbol) else {
+                continue;
+            };
+            let meta = self.symbol_meta(&symbol).await?;
+            snapshots.push(parse_gate_market_snapshot(&symbol, row, &meta)?);
+        }
+        if snapshots.is_empty() {
+            return Err(anyhow!(
+                "gate market snapshot unavailable for requested symbols"
+            ));
+        }
+        Ok(VenueMarketSnapshot {
+            venue: Venue::Gate,
+            observed_at_ms,
+            symbols: snapshots,
+        })
     }
 
-    async fn place_order(&self, _request: OrderRequest) -> Result<OrderFill> {
-        Err(anyhow!("gate live adapter not yet implemented"))
+    async fn place_order(&self, request: OrderRequest) -> Result<OrderFill> {
+        let order_prepare_started_at = Instant::now();
+        let meta = self.symbol_meta(&request.symbol).await?;
+        let contracts = floor_to_step(
+            request.quantity / meta.contract_multiplier,
+            meta.contract_step,
+        );
+        if contracts < meta.min_contracts {
+            return Err(anyhow!(
+                "gate quantity rounded below minimum contract size for {}",
+                request.symbol
+            ));
+        }
+        let quantity = contracts * meta.contract_multiplier;
+        if let Some(price_hint) = request
+            .price_hint
+            .filter(|price| price.is_finite() && *price > 0.0)
+        {
+            let min_notional =
+                meta.min_contracts.max(meta.contract_step) * meta.contract_multiplier * price_hint;
+            if quantity * price_hint + 1e-9 < min_notional {
+                return Err(anyhow!(
+                    "gate notional below minimum for {}",
+                    request.symbol
+                ));
+            }
+        }
+        let order_prepare_ms = elapsed_ms(order_prepare_started_at);
+        let submit_started_at = Instant::now();
+        let response = self.submit_order_once(&request, contracts, &meta).await?;
+        let submit_ack_ms = elapsed_ms(submit_started_at);
+        let order_id =
+            json_string(&response.response, &["id"]).unwrap_or_else(|| "gate-unknown".to_string());
+        let mut fill = OrderFill {
+            venue: Venue::Gate,
+            symbol: request.symbol.clone(),
+            side: request.side,
+            quantity,
+            average_price: request.price_hint.unwrap_or_default(),
+            fee_quote: estimate_fee_quote(
+                request.price_hint.unwrap_or_default(),
+                quantity,
+                self.config.taker_fee_bps,
+            ),
+            order_id: order_id.clone(),
+            filled_at_ms: now_ms(),
+            timing: Some(OrderExecutionTiming {
+                quote_resolve_ms: None,
+                order_prepare_ms: Some(order_prepare_ms),
+                request_sign_ms: Some(response.request_sign_ms),
+                submit_http_ms: Some(response.submit_http_ms),
+                response_decode_ms: Some(response.response_decode_ms),
+                private_fill_wait_ms: None,
+                submit_ack_ms: Some(submit_ack_ms),
+            }),
+        };
+        let reconcile_started_at = Instant::now();
+        if let Some(reconciliation) = self
+            .fetch_order_reconciliation_with_retry(
+                &request.symbol,
+                &order_id,
+                Some(&request.client_order_id),
+            )
+            .await?
+        {
+            fill.quantity = reconciliation.quantity;
+            fill.average_price = reconciliation.average_price;
+            fill.fee_quote = reconciliation.fee_quote.unwrap_or_else(|| {
+                estimate_fee_quote(fill.average_price, fill.quantity, self.config.taker_fee_bps)
+            });
+            fill.filled_at_ms = reconciliation.filled_at_ms;
+        } else if let Some(price_hint) = request.price_hint {
+            fill.average_price = price_hint;
+            fill.filled_at_ms = request.observed_at_ms.unwrap_or_else(now_ms);
+        } else {
+            let snapshot = self
+                .fetch_market_snapshot(&[request.symbol.clone()])
+                .await?;
+            let (price, ts_ms) = match request.side {
+                Side::Buy => {
+                    let quote = snapshot
+                        .symbols
+                        .first()
+                        .ok_or_else(|| anyhow!("gate fallback quote missing"))?;
+                    (
+                        quote.best_ask,
+                        snapshot
+                            .observed_at_ms
+                            .max(quote.funding_timestamp_ms.min(now_ms())),
+                    )
+                }
+                Side::Sell => {
+                    let quote = snapshot
+                        .symbols
+                        .first()
+                        .ok_or_else(|| anyhow!("gate fallback quote missing"))?;
+                    (
+                        quote.best_bid,
+                        snapshot
+                            .observed_at_ms
+                            .max(quote.funding_timestamp_ms.min(now_ms())),
+                    )
+                }
+            };
+            fill.average_price = price;
+            fill.filled_at_ms = ts_ms;
+        }
+        if let Some(timing) = fill.timing.as_mut() {
+            timing.private_fill_wait_ms = Some(elapsed_ms(reconcile_started_at));
+        }
+        Ok(fill)
     }
 
-    async fn fetch_position(&self, _symbol: &str) -> Result<PositionSnapshot> {
-        Err(anyhow!("gate live adapter not yet implemented"))
+    async fn fetch_position(&self, symbol: &str) -> Result<PositionSnapshot> {
+        let positions = self.fetch_all_positions().await?.unwrap_or_default();
+        Ok(positions
+            .into_iter()
+            .find(|position| position.symbol == symbol)
+            .unwrap_or(PositionSnapshot {
+                venue: Venue::Gate,
+                symbol: symbol.to_string(),
+                size: 0.0,
+                updated_at_ms: now_ms(),
+            }))
     }
 
     async fn fetch_all_positions(&self) -> Result<Option<Vec<PositionSnapshot>>> {
-        Err(anyhow!("gate live adapter not yet implemented"))
+        let payload = self
+            .signed_request_json(
+                &self.base_url,
+                Method::GET,
+                &format!("/api/v4/futures/{GATE_SETTLE}/positions"),
+                None,
+                None,
+                "failed to request gate futures positions",
+            )
+            .await?;
+        let rows = payload
+            .as_array()
+            .ok_or_else(|| anyhow!("gate positions response is not an array"))?;
+        let mut positions = Vec::new();
+        for row in rows {
+            let Some(contract) = json_string(row, &["contract"]) else {
+                continue;
+            };
+            let symbol = normalize_gate_contract(&contract);
+            let Some(meta) = self.metadata.lock().expect("lock").get(&symbol).cloned() else {
+                continue;
+            };
+            let contracts = json_f64(row, &["size"]).unwrap_or_default();
+            if contracts.abs() <= 0.0 {
+                continue;
+            }
+            positions.push(PositionSnapshot {
+                venue: Venue::Gate,
+                symbol,
+                size: contracts * meta.contract_multiplier,
+                updated_at_ms: json_i64(row, &["update_time_ms", "update_time"])
+                    .map(|value| {
+                        if value < 10_000_000_000 {
+                            value * 1_000
+                        } else {
+                            value
+                        }
+                    })
+                    .unwrap_or_else(now_ms),
+            });
+        }
+        Ok(Some(positions))
     }
 
     async fn fetch_account_balance_snapshot(&self) -> Result<Option<AccountBalanceSnapshot>> {
-        Err(anyhow!("gate live adapter not yet implemented"))
+        let payload = self
+            .signed_request_json(
+                &self.base_url,
+                Method::GET,
+                &format!("/api/v4/futures/{GATE_SETTLE}/accounts"),
+                None,
+                None,
+                "failed to request gate futures account",
+            )
+            .await?;
+        Ok(Some(AccountBalanceSnapshot {
+            venue: Venue::Gate,
+            equity_quote: json_required_f64(
+                &payload,
+                &["total", "total_usdt", "equity"],
+                "gate total equity",
+            )?,
+            wallet_balance_quote: json_f64(&payload, &["total", "total_usdt", "equity"]),
+            available_balance_quote: json_f64(&payload, &["available", "available_balance"]),
+            observed_at_ms: now_ms(),
+        }))
     }
 
     fn enforces_entry_balance_gate(&self) -> bool {
@@ -57,28 +654,475 @@ impl VenueAdapter for GateLiveAdapter {
 
     async fn fetch_order_fill_reconciliation(
         &self,
-        _symbol: &str,
-        _order_id: &str,
+        symbol: &str,
+        order_id: &str,
         _client_order_id: Option<&str>,
     ) -> Result<Option<OrderFillReconciliation>> {
-        Err(anyhow!("gate live adapter not yet implemented"))
+        let contract = venue_symbol(&self.config, symbol);
+        let query = build_query(&[
+            ("order", order_id.to_string()),
+            ("contract", contract.clone()),
+        ]);
+        let payload = self
+            .signed_request_json(
+                &self.base_url,
+                Method::GET,
+                &format!("/api/v4/futures/{GATE_SETTLE}/my_trades"),
+                Some(query),
+                None,
+                "failed to request gate futures trades",
+            )
+            .await?;
+        let rows = payload
+            .as_array()
+            .ok_or_else(|| anyhow!("gate my_trades response is not an array"))?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        let meta = self.symbol_meta(symbol).await?;
+        let mut total_quantity = 0.0;
+        let mut weighted_notional = 0.0;
+        let mut total_fee_quote = 0.0;
+        let mut latest_fill_ms = 0_i64;
+        for row in rows {
+            let contracts = json_f64(row, &["size", "fill_size"])
+                .unwrap_or_default()
+                .abs();
+            if contracts <= 0.0 {
+                continue;
+            }
+            let quantity = contracts * meta.contract_multiplier;
+            let price = json_required_f64(row, &["price", "fill_price"], "gate trade price")?;
+            total_quantity += quantity;
+            weighted_notional += quantity * price;
+            total_fee_quote += json_f64(row, &["fee"]).unwrap_or_default().abs();
+            latest_fill_ms = latest_fill_ms.max(
+                json_i64(row, &["create_time_ms", "create_time"])
+                    .map(|value| {
+                        if value < 10_000_000_000 {
+                            value * 1_000
+                        } else {
+                            value
+                        }
+                    })
+                    .unwrap_or_else(now_ms),
+            );
+        }
+        if total_quantity <= 0.0 {
+            return Ok(None);
+        }
+        Ok(Some(OrderFillReconciliation {
+            order_id: order_id.to_string(),
+            client_order_id: None,
+            quantity: total_quantity,
+            average_price: weighted_notional / total_quantity,
+            fee_quote: Some(total_fee_quote).filter(|value| *value > 0.0),
+            filled_at_ms: latest_fill_ms.max(now_ms()),
+        }))
     }
 
-    async fn normalize_quantity(&self, _symbol: &str, quantity: f64) -> Result<f64> {
-        Ok(quantity)
+    async fn normalize_quantity(&self, symbol: &str, quantity: f64) -> Result<f64> {
+        let meta = self.symbol_meta(symbol).await?;
+        let contracts = floor_to_step(quantity / meta.contract_multiplier, meta.contract_step);
+        if contracts < meta.min_contracts {
+            return Ok(0.0);
+        }
+        Ok(contracts * meta.contract_multiplier)
+    }
+
+    async fn ensure_entry_leverage(&self, symbol: &str, leverage: u32) -> Result<()> {
+        if self
+            .configured_leverage
+            .lock()
+            .expect("lock")
+            .get(symbol)
+            .copied()
+            == Some(leverage)
+        {
+            return Ok(());
+        }
+        let body = serde_json::json!({
+            "leverage": leverage.to_string(),
+        })
+        .to_string();
+        let payload = self
+            .signed_request_json(
+                &self.base_url,
+                Method::POST,
+                &format!(
+                    "/api/v4/futures/{GATE_SETTLE}/positions/{}/leverage",
+                    venue_symbol(&self.config, symbol)
+                ),
+                None,
+                Some(body),
+                "failed to set gate leverage",
+            )
+            .await?;
+        let _ = payload;
+        self.configured_leverage
+            .lock()
+            .expect("lock")
+            .insert(symbol.to_string(), leverage);
+        Ok(())
+    }
+
+    fn min_entry_notional_quote_hint(&self, symbol: &str, price_hint: Option<f64>) -> Option<f64> {
+        let price_hint = price_hint.filter(|price| price.is_finite() && *price > 0.0)?;
+        let meta = self.metadata.lock().expect("lock").get(symbol)?.clone();
+        Some(meta.min_contracts.max(meta.contract_step) * meta.contract_multiplier * price_hint)
     }
 
     async fn fetch_perp_liquidity_snapshot(
         &self,
-        _symbol: &str,
+        symbol: &str,
     ) -> Result<Option<PerpLiquiditySnapshot>> {
-        Err(anyhow!("gate live adapter not yet implemented"))
+        if !self.supports_symbol(symbol) {
+            return Ok(None);
+        }
+        let observed_at_ms = now_ms();
+        if let Some(snapshot) = self.cached_perp_liquidity_snapshot(symbol, observed_at_ms) {
+            return Ok(Some(snapshot));
+        }
+        let rows = self.fetch_tickers_map().await?;
+        let Some(row) = rows.get(symbol) else {
+            return Ok(None);
+        };
+        let snapshot = parse_gate_liquidity_snapshot(symbol, row)?;
+        self.perp_liquidity_cache
+            .lock()
+            .expect("lock")
+            .insert(symbol.to_string(), snapshot.clone());
+        Ok(Some(snapshot))
     }
 
-    async fn fetch_transfer_statuses(
-        &self,
-        _assets: &[String],
-    ) -> Result<Vec<AssetTransferStatus>> {
-        Err(anyhow!("gate live adapter not yet implemented"))
+    async fn fetch_transfer_statuses(&self, assets: &[String]) -> Result<Vec<AssetTransferStatus>> {
+        let wanted = assets
+            .iter()
+            .map(|asset| base_asset(asset))
+            .collect::<BTreeSet<_>>();
+        if wanted.is_empty() {
+            return Ok(Vec::new());
+        }
+        let observed_at_ms = now_ms();
+        if let Some(statuses) = self.cached_transfer_statuses(&wanted, observed_at_ms) {
+            return Ok(statuses);
+        }
+        let payload = self
+            .public_request_json(
+                &self.wallet_base_url,
+                Method::GET,
+                "/api/v4/wallet/currency_chains",
+                None,
+                "failed to request gate currency chains",
+            )
+            .await?;
+        let rows = payload
+            .as_array()
+            .ok_or_else(|| anyhow!("gate currency chains response is not an array"))?;
+        let statuses = rows
+            .iter()
+            .fold(
+                HashMap::<String, AssetTransferStatus>::new(),
+                |mut acc, row| {
+                    let Some(asset) = json_string(row, &["currency"]) else {
+                        return acc;
+                    };
+                    let asset = base_asset(&asset);
+                    if !wanted.contains(asset.as_str()) {
+                        return acc;
+                    }
+                    let entry = acc.entry(asset.clone()).or_insert(AssetTransferStatus {
+                        venue: Venue::Gate,
+                        asset,
+                        deposit_enabled: false,
+                        withdraw_enabled: false,
+                        observed_at_ms,
+                        source: "gate".to_string(),
+                    });
+                    entry.deposit_enabled |=
+                        !json_bool(row, &["is_deposit_disabled", "deposit_disabled"])
+                            .unwrap_or(false);
+                    entry.withdraw_enabled |=
+                        !json_bool(row, &["is_withdraw_disabled", "withdraw_disabled"])
+                            .unwrap_or(false);
+                    acc
+                },
+            )
+            .into_values()
+            .collect::<Vec<_>>();
+        let cache = VenueTransferStatusCache {
+            observed_at_ms,
+            statuses: statuses.clone(),
+        };
+        store_json_cache("gate-transfer-status.json", &cache);
+        self.transfer_status_cache
+            .lock()
+            .expect("lock")
+            .replace(cache);
+        Ok(statuses)
+    }
+
+    fn supported_symbols(&self, requested_symbols: &[String]) -> Option<Vec<String>> {
+        Some(self.tracked_symbols(requested_symbols))
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct GateContractMeta {
+    contract_multiplier: f64,
+    min_contracts: f64,
+    contract_step: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct GateSymbolCatalogCache {
+    updated_at_ms: i64,
+    supported_symbols: Vec<String>,
+    metadata: HashMap<String, GateContractMeta>,
+}
+
+struct GateOrderResponseWithTiming {
+    response: Value,
+    request_sign_ms: u64,
+    submit_http_ms: u64,
+    response_decode_ms: u64,
+}
+
+fn parse_gate_contract_meta(row: &Value) -> Result<(String, GateContractMeta)> {
+    let symbol = normalize_gate_contract(&json_required_string(
+        row,
+        &["name", "contract"],
+        "gate contract name",
+    )?);
+    Ok((
+        symbol,
+        GateContractMeta {
+            contract_multiplier: json_required_f64(
+                row,
+                &["quanto_multiplier", "quantoMultiplier"],
+                "gate quanto multiplier",
+            )?,
+            min_contracts: json_required_f64(
+                row,
+                &["order_size_min", "orderSizeMin"],
+                "gate minimum order size",
+            )?,
+            contract_step: json_f64(row, &["order_size_round", "orderSizeRound"]).unwrap_or(1.0),
+        },
+    ))
+}
+
+fn parse_gate_liquidity_snapshot(symbol: &str, row: &Value) -> Result<PerpLiquiditySnapshot> {
+    let volume_24h_quote = json_required_f64(
+        row,
+        &["volume_24h_quote", "volume_24h_usd", "turnover_24h"],
+        "gate 24h quote volume",
+    )?;
+    let mark_price =
+        json_required_f64(row, &["mark_price", "markPrice", "last"], "gate mark price")?;
+    let open_interest_contracts = json_required_f64(
+        row,
+        &["open_interest", "openInterest"],
+        "gate open interest",
+    )?;
+    let contract_multiplier = json_f64(row, &["quanto_multiplier"]).unwrap_or(1.0);
+    let observed_at_ms = json_i64(row, &["funding_next_apply", "funding_next_time"])
+        .map(|value| {
+            if value < 10_000_000_000 {
+                value * 1_000
+            } else {
+                value
+            }
+        })
+        .unwrap_or_else(now_ms);
+    Ok(PerpLiquiditySnapshot {
+        venue: Venue::Gate,
+        symbol: symbol.to_string(),
+        volume_24h_quote,
+        open_interest_quote: open_interest_contracts * contract_multiplier * mark_price,
+        observed_at_ms,
+    })
+}
+
+fn parse_gate_market_snapshot(
+    symbol: &str,
+    row: &Value,
+    meta: &GateContractMeta,
+) -> Result<SymbolMarketSnapshot> {
+    let highest_size = json_f64(row, &["highest_size", "highestSize"]).unwrap_or_default();
+    let lowest_size = json_f64(row, &["lowest_size", "lowestSize"]).unwrap_or_default();
+    Ok(SymbolMarketSnapshot {
+        symbol: symbol.to_string(),
+        best_bid: json_required_f64(row, &["highest_bid", "highestBid"], "gate best bid")?,
+        best_ask: json_required_f64(row, &["lowest_ask", "lowestAsk"], "gate best ask")?,
+        bid_size: highest_size * meta.contract_multiplier,
+        ask_size: lowest_size * meta.contract_multiplier,
+        mark_price: json_f64(row, &["mark_price", "markPrice", "last"]),
+        funding_rate: json_f64(row, &["funding_rate", "fundingRate"]).unwrap_or_default(),
+        funding_timestamp_ms: json_i64(row, &["funding_next_apply", "funding_next_time"])
+            .map(|value| {
+                if value < 10_000_000_000 {
+                    value * 1_000
+                } else {
+                    value
+                }
+            })
+            .unwrap_or_else(|| now_ms() + 8 * 60 * 60 * 1_000),
+    })
+}
+
+fn gate_contract_is_tradeable(row: &Value) -> bool {
+    if json_bool(row, &["in_delisting", "delisted"]).unwrap_or(false) {
+        return false;
+    }
+    match json_string(row, &["status", "trade_status"]) {
+        Some(status) => {
+            let status = status.to_ascii_lowercase();
+            matches!(
+                status.as_str(),
+                "trading" | "tradable" | "open" | "online" | "normal"
+            )
+        }
+        None => true,
+    }
+}
+
+fn gate_client_text(client_order_id: &str) -> String {
+    let mut sanitized = client_order_id
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '_')
+        .collect::<String>();
+    if sanitized.len() > 24 {
+        sanitized.truncate(24);
+    }
+    format!("{GATE_CLIENT_TEXT_PREFIX}{sanitized}")
+}
+
+fn normalize_gate_contract(raw: &str) -> String {
+    raw.trim()
+        .to_ascii_uppercase()
+        .replace('_', "")
+        .replace('-', "")
+}
+
+fn format_gate_http_error(status: StatusCode, body: &str) -> anyhow::Error {
+    let payload = serde_json::from_str::<Value>(body).ok();
+    let label = payload
+        .as_ref()
+        .and_then(|value| json_string(value, &["label"]))
+        .unwrap_or_default();
+    let message = payload
+        .as_ref()
+        .and_then(|value| json_string(value, &["message", "detail"]))
+        .unwrap_or_else(|| body.trim().to_string());
+    anyhow!(
+        "gate private/public endpoint returned non-success status: status={} label={} msg={}",
+        status,
+        label,
+        message
+    )
+}
+
+fn json_string(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        let value = value.get(*key)?;
+        match value {
+            Value::String(raw) => Some(raw.to_string()),
+            Value::Number(raw) => Some(raw.to_string()),
+            Value::Bool(raw) => Some(raw.to_string()),
+            _ => None,
+        }
+    })
+}
+
+fn json_f64(value: &Value, keys: &[&str]) -> Option<f64> {
+    keys.iter().find_map(|key| {
+        let value = value.get(*key)?;
+        match value {
+            Value::String(raw) => parse_f64(raw).ok(),
+            Value::Number(raw) => raw.as_f64(),
+            _ => None,
+        }
+    })
+}
+
+fn json_i64(value: &Value, keys: &[&str]) -> Option<i64> {
+    keys.iter().find_map(|key| {
+        let value = value.get(*key)?;
+        match value {
+            Value::String(raw) => parse_i64(raw).ok(),
+            Value::Number(raw) => raw
+                .as_i64()
+                .or_else(|| raw.as_f64().map(|value| value as i64)),
+            _ => None,
+        }
+    })
+}
+
+fn json_bool(value: &Value, keys: &[&str]) -> Option<bool> {
+    keys.iter().find_map(|key| {
+        let value = value.get(*key)?;
+        match value {
+            Value::Bool(raw) => Some(*raw),
+            Value::String(raw) => Some(matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "true" | "1" | "yes" | "on"
+            )),
+            Value::Number(raw) => Some(raw.as_i64().unwrap_or_default() != 0),
+            _ => None,
+        }
+    })
+}
+
+fn json_required_string(value: &Value, keys: &[&str], field: &str) -> Result<String> {
+    json_string(value, keys).ok_or_else(|| anyhow!("{field} missing"))
+}
+
+fn json_required_f64(value: &Value, keys: &[&str], field: &str) -> Result<f64> {
+    json_f64(value, keys).ok_or_else(|| anyhow!("{field} missing"))
+}
+
+fn elapsed_ms(started_at: Instant) -> u64 {
+    started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{parse_gate_contract_meta, parse_gate_liquidity_snapshot};
+
+    #[test]
+    fn parses_gate_contract_meta() {
+        let row = json!({
+            "name": "BTC_USDT",
+            "order_size_min": 1,
+            "order_size_round": 1,
+            "quanto_multiplier": "0.001"
+        });
+
+        let (symbol, meta) = parse_gate_contract_meta(&row).expect("parse contract");
+        assert_eq!(symbol, "BTCUSDT");
+        assert!((meta.min_contracts - 1.0).abs() < 1e-9);
+        assert!((meta.contract_step - 1.0).abs() < 1e-9);
+        assert!((meta.contract_multiplier - 0.001).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parses_gate_liquidity_snapshot() {
+        let row = json!({
+            "contract": "BTC_USDT",
+            "volume_24h_quote": "2500000",
+            "mark_price": "65000",
+            "open_interest": "20",
+            "quanto_multiplier": "1",
+            "funding_next_apply": 1710001234
+        });
+
+        let snapshot = parse_gate_liquidity_snapshot("BTCUSDT", &row).expect("parse liquidity");
+        assert_eq!(snapshot.symbol, "BTCUSDT");
+        assert!((snapshot.volume_24h_quote - 2_500_000.0).abs() < 1e-6);
+        assert!((snapshot.open_interest_quote - 1_300_000.0).abs() < 1e-6);
+        assert_eq!(snapshot.observed_at_ms, 1_710_001_234_000);
     }
 }
