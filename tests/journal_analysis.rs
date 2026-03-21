@@ -123,16 +123,39 @@ fn journal_analysis_reports_latency_failure_and_recovery_breakdown() {
         record(
             7,
             "run-a",
+            1_005,
+            "execution.partial_exit_triggered",
+            json!({
+                "position_id": "pos-1",
+                "reason": "settlement_half_close",
+            }),
+        ),
+        record(
+            8,
+            "run-a",
             1_006,
+            "exit.partial_closed",
+            json!({
+                "position_id": "pos-1",
+                "symbol": "BTCUSDT",
+                "reason": "settlement_half_close",
+                "closed_quantity": 0.05,
+                "remaining_quantity": 0.05
+            }),
+        ),
+        record(
+            9,
+            "run-a",
+            1_007,
             "execution.order_submitted",
             json!({
                 "venue": "okx",
             }),
         ),
         record(
-            8,
+            10,
             "run-a",
-            1_007,
+            1_008,
             "execution.order_failed",
             json!({
                 "venue": "okx",
@@ -141,45 +164,45 @@ fn journal_analysis_reports_latency_failure_and_recovery_breakdown() {
             }),
         ),
         record(
-            9,
+            11,
             "run-a",
-            1_008,
+            1_009,
             "recovery.resumed",
             json!({
                 "position_id": "pos-1",
             }),
         ),
         record(
-            10,
+            12,
             "run-a",
-            1_009,
+            1_010,
             "recovery.live_blocked",
             json!({
                 "mismatches": ["BTC:unexpected_leg_count:1"],
             }),
         ),
         record(
-            11,
+            13,
             "run-a",
-            1_010,
+            1_011,
             "execution.guard_failed",
             json!({
                 "reason": "stale_market_data",
             }),
         ),
         record(
-            12,
+            14,
             "run-a",
-            1_011,
+            1_012,
             "scan.runtime_gate_blocked",
             json!({
                 "reason": "venue_entry_cooldown:hyperliquid:uncertain_order_status",
             }),
         ),
         record(
-            13,
+            15,
             "run-a",
-            1_012,
+            1_013,
             "runtime.venue_cooldown_started",
             json!({
                 "venue": "hyperliquid",
@@ -187,9 +210,9 @@ fn journal_analysis_reports_latency_failure_and_recovery_breakdown() {
             }),
         ),
         record(
-            14,
+            16,
             "run-a",
-            1_013,
+            1_014,
             "scan.no_entry_diagnostics",
             json!({
                 "reason": "no_tradeable_candidates",
@@ -225,7 +248,7 @@ fn journal_analysis_reports_latency_failure_and_recovery_breakdown() {
 
     let report = analyze_journal_records(&records);
 
-    assert_eq!(report.total_records, 15);
+    assert_eq!(report.total_records, 17);
     assert_eq!(report.run_count, 1);
     assert_eq!(
         report
@@ -388,8 +411,17 @@ fn journal_analysis_reports_latency_failure_and_recovery_breakdown() {
     assert_eq!(replay.state, "open");
     assert_eq!(replay.pair_id.as_deref(), Some("btcusdt:binance->okx"));
     assert!(replay.entry_order_plan.is_some());
+    assert_eq!(replay.partial_close_summaries.len(), 1);
+    assert_eq!(
+        replay.partial_close_summaries[0]["reason"].as_str(),
+        Some("settlement_half_close")
+    );
     assert_eq!(replay.order_legs.len(), 2);
     assert!(replay.total_fee_quote > 0.0);
+    assert!(replay
+        .warnings
+        .iter()
+        .any(|warning| warning == "partial_exit_triggered:settlement_half_close"));
     assert!(report
         .recommendations
         .iter()

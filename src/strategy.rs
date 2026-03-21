@@ -9,6 +9,7 @@ use crate::{
 };
 
 const ALIGNED_FUNDING_TOLERANCE_MS: i64 = 60_000;
+const NEAR_TERM_SETTLEMENT_MAX_REMAINING_MS: i64 = 60 * 60 * 1_000;
 
 #[derive(Clone, Copy)]
 struct FundingOpportunityProfile {
@@ -61,8 +62,12 @@ pub fn discover_candidates(
             let remaining_ms = funding_profile
                 .first_funding_timestamp_ms
                 .saturating_sub(market.now_ms());
+            let near_term_settlement_leg =
+                has_near_term_settlement_leg(funding_profile.first_funding_timestamp_ms, market);
             if remaining_ms <= 0 {
                 blocked_reasons.push("funding_window_passed".to_string());
+            } else if !near_term_settlement_leg {
+                blocked_reasons.push("no_near_term_settlement_leg".to_string());
             } else if !is_within_funding_scan_window_ms(config, remaining_ms) {
                 blocked_reasons.push("outside_entry_window".to_string());
             }
@@ -226,6 +231,11 @@ pub fn is_within_funding_scan_window_ms(config: &AppConfig, remaining_ms: i64) -
     }
 
     remaining_ms <= config.strategy.entry_window_secs.saturating_mul(1_000)
+}
+
+pub fn has_near_term_settlement_leg(funding_timestamp_ms: i64, market: &MarketView) -> bool {
+    let remaining_ms = funding_timestamp_ms.saturating_sub(market.now_ms());
+    remaining_ms > 0 && remaining_ms <= NEAR_TERM_SETTLEMENT_MAX_REMAINING_MS
 }
 
 pub fn sort_candidates(candidates: &mut [CandidateOpportunity]) {
@@ -791,6 +801,87 @@ mod tests {
             .any(|item| item == "expected_edge_below_floor"));
         assert!((candidate.funding_edge_bps - 4.0).abs() < 1e-9);
         assert!((candidate.total_funding_edge_bps - 24.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn candidate_is_blocked_when_no_leg_settles_within_next_hour() {
+        let config = AppConfig {
+            runtime: RuntimeConfig::default(),
+            strategy: StrategyConfig {
+                max_scan_minutes_before_funding: 0,
+                min_scan_minutes_before_funding: 0,
+                min_funding_edge_bps: -1_000.0,
+                min_expected_edge_bps: -1_000.0,
+                min_worst_case_edge_bps: -1_000.0,
+                ..StrategyConfig::default()
+            },
+            persistence: PersistenceConfig::default(),
+            venues: vec![
+                VenueConfig {
+                    venue: Venue::Binance,
+                    enabled: true,
+                    taker_fee_bps: 0.0,
+                    max_notional: 1_000.0,
+                    market_data_file: None,
+                    live: Default::default(),
+                },
+                VenueConfig {
+                    venue: Venue::Okx,
+                    enabled: true,
+                    taker_fee_bps: 0.0,
+                    max_notional: 1_000.0,
+                    market_data_file: None,
+                    live: Default::default(),
+                },
+            ],
+            symbols: vec!["BTCUSDT".to_string()],
+            directed_pairs: vec![crate::config::DirectedPairConfig {
+                long: Venue::Binance,
+                short: Venue::Okx,
+                symbols: vec!["BTCUSDT".to_string()],
+            }],
+        };
+        let market = MarketView::from_snapshots(vec![
+            VenueMarketSnapshot {
+                venue: Venue::Binance,
+                observed_at_ms: 0,
+                symbols: vec![crate::models::SymbolMarketSnapshot {
+                    symbol: "BTCUSDT".to_string(),
+                    best_bid: 100.0,
+                    best_ask: 100.0,
+                    bid_size: 500.0,
+                    ask_size: 500.0,
+                    mark_price: None,
+                    funding_rate: -0.0005,
+                    funding_timestamp_ms: 2 * 60 * 60 * 1_000,
+                }],
+            },
+            VenueMarketSnapshot {
+                venue: Venue::Okx,
+                observed_at_ms: 0,
+                symbols: vec![crate::models::SymbolMarketSnapshot {
+                    symbol: "BTCUSDT".to_string(),
+                    best_bid: 100.2,
+                    best_ask: 100.2,
+                    bid_size: 500.0,
+                    ask_size: 500.0,
+                    mark_price: None,
+                    funding_rate: 0.0008,
+                    funding_timestamp_ms: 4 * 60 * 60 * 1_000,
+                }],
+            },
+        ]);
+
+        let candidate = discover_candidates(&config, &market, None, None)
+            .into_iter()
+            .find(|item| item.long_venue == Venue::Binance && item.short_venue == Venue::Okx)
+            .expect("candidate");
+
+        assert!(!candidate.is_tradeable());
+        assert!(candidate
+            .blocked_reasons
+            .iter()
+            .any(|item| item == "no_near_term_settlement_leg"));
     }
 
     #[test]

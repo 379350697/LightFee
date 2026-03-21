@@ -55,4 +55,12 @@ impl MarketView {
             .map(|observed_at| self.now_ms.saturating_sub(*observed_at) <= max_age_ms)
             .unwrap_or(false)
     }
+
+    pub fn venue_symbol_snapshot(&self, venue: Venue, symbol: &str) -> Option<VenueMarketSnapshot> {
+        Some(VenueMarketSnapshot {
+            venue,
+            observed_at_ms: self.observed_at_ms(venue)?,
+            symbols: vec![self.symbol(venue, symbol)?.clone()],
+        })
+    }
 }

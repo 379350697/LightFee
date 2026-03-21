@@ -83,6 +83,7 @@ pub struct TradeReplay {
     pub entry_latency_summary: Option<serde_json::Value>,
     pub exit_latency_summary: Option<serde_json::Value>,
     pub opened_position: Option<serde_json::Value>,
+    pub partial_close_summaries: Vec<serde_json::Value>,
     pub close_summary: Option<serde_json::Value>,
     pub order_legs: Vec<TradeLegReplay>,
     pub warnings: Vec<String>,
@@ -112,6 +113,7 @@ struct TradeReplayAccumulator {
     entry_latency_summary: Option<serde_json::Value>,
     exit_latency_summary: Option<serde_json::Value>,
     opened_position: Option<serde_json::Value>,
+    partial_close_summaries: Vec<serde_json::Value>,
     close_summary: Option<serde_json::Value>,
     order_legs: BTreeMap<String, TradeLegReplay>,
     warnings: Vec<String>,
@@ -403,6 +405,9 @@ fn update_trade_replay(replay: &mut TradeReplayAccumulator, record: &JournalReco
         "entry.opened" => {
             replay.opened_position = Some(record.payload.clone());
         }
+        "exit.partial_closed" => {
+            replay.partial_close_summaries.push(record.payload.clone());
+        }
         "exit.closed" => {
             replay.close_summary = Some(record.payload.clone());
         }
@@ -430,6 +435,13 @@ fn update_trade_replay(replay: &mut TradeReplayAccumulator, record: &JournalReco
         "execution.exit_triggered" => {
             if let Some(reason) = payload_string(record, "reason") {
                 replay.warnings.push(format!("exit_triggered:{reason}"));
+            }
+        }
+        "execution.partial_exit_triggered" => {
+            if let Some(reason) = payload_string(record, "reason") {
+                replay
+                    .warnings
+                    .push(format!("partial_exit_triggered:{reason}"));
             }
         }
         "execution.order_submitted"
@@ -522,6 +534,7 @@ fn finalize_trade_replay(mut accumulator: TradeReplayAccumulator) -> TradeReplay
         entry_latency_summary: accumulator.entry_latency_summary,
         exit_latency_summary: accumulator.exit_latency_summary,
         opened_position: accumulator.opened_position,
+        partial_close_summaries: accumulator.partial_close_summaries,
         close_summary: accumulator.close_summary,
         order_legs: accumulator.order_legs.into_values().collect(),
         warnings: accumulator.warnings,

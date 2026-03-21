@@ -439,7 +439,7 @@ fn default_max_concurrent_positions() -> usize {
 }
 
 fn default_max_scan_minutes_before_funding() -> i64 {
-    15
+    25
 }
 
 fn default_min_scan_minutes_before_funding() -> i64 {

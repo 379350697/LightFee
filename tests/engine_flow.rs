@@ -53,7 +53,9 @@ async fn opens_then_exits_after_funding_capture() {
     engine.tick().await.expect("entry tick");
     assert!(engine.state().open_position.is_some());
 
-    engine.tick().await.expect("exit tick");
+    engine.tick().await.expect("settlement half close tick");
+    assert!(engine.state().open_position.is_some());
+    engine.tick().await.expect("final exit tick");
     assert!(engine.state().open_position.is_none());
     assert_eq!(engine.state().mode, EngineMode::Running);
 
@@ -65,7 +67,8 @@ async fn opens_then_exits_after_funding_capture() {
     assert!(has_event(&records, "execution.order_filled"));
     assert!(has_event(&records, "execution.entry_latency_summary"));
     assert!(has_event(&records, "execution.exit_latency_summary"));
-    assert_eq!(event_count(&records, "execution.order_filled"), 4);
+    assert_eq!(event_count(&records, "execution.order_filled"), 6);
+    assert!(has_event(&records, "exit.partial_closed"));
 
     let first = records.first().expect("first record");
     assert!(first.get("seq").and_then(Value::as_u64).unwrap_or_default() >= 1);
@@ -96,6 +99,561 @@ async fn opens_then_exits_after_funding_capture() {
 }
 
 #[tokio::test]
+async fn exit_closed_net_quote_uses_realized_exit_fills() {
+    let temp = TempDir::new().expect("tempdir");
+    let config = test_config(&temp, true);
+    let binance = Arc::new(ScriptedVenueAdapter::new(
+        Venue::Binance,
+        0.5,
+        vec![
+            venue_snapshot(
+                Venue::Binance,
+                0,
+                vec![symbol_snapshot(
+                    "BTCUSDT", 100.0, 101.0, 200.0, 200.0, -0.0005, 60_000,
+                )],
+            ),
+            venue_snapshot(
+                Venue::Binance,
+                61_000,
+                vec![symbol_snapshot(
+                    "BTCUSDT", 105.0, 106.0, 200.0, 200.0, -0.0005, 60_000,
+                )],
+            ),
+        ],
+    ));
+    let okx = Arc::new(ScriptedVenueAdapter::new(
+        Venue::Okx,
+        0.5,
+        vec![
+            venue_snapshot(
+                Venue::Okx,
+                0,
+                vec![symbol_snapshot(
+                    "BTCUSDT", 100.0, 101.0, 200.0, 200.0, 0.0015, 60_000,
+                )],
+            ),
+            venue_snapshot(
+                Venue::Okx,
+                61_000,
+                vec![symbol_snapshot(
+                    "BTCUSDT", 95.0, 96.0, 200.0, 200.0, 0.0015, 60_000,
+                )],
+            ),
+        ],
+    ));
+    let bybit = Arc::new(ScriptedVenueAdapter::new(
+        Venue::Bybit,
+        0.6,
+        vec![venue_snapshot(Venue::Bybit, 0, vec![])],
+    ));
+    let hyper = Arc::new(ScriptedVenueAdapter::new(
+        Venue::Hyperliquid,
+        0.3,
+        vec![venue_snapshot(Venue::Hyperliquid, 0, vec![])],
+    ));
+    let mut engine = Engine::new(
+        config.clone(),
+        vec![
+            binance as Arc<dyn VenueAdapter>,
+            okx as Arc<dyn VenueAdapter>,
+            bybit as Arc<dyn VenueAdapter>,
+            hyper as Arc<dyn VenueAdapter>,
+        ],
+    )
+    .await
+    .expect("engine");
+
+    engine.tick().await.expect("entry tick");
+    engine.tick().await.expect("settlement half close tick");
+    engine.tick().await.expect("final exit tick");
+
+    let records = read_event_records(&config.persistence.event_log_path);
+    let entry_long = records
+        .iter()
+        .find(|record| {
+            record_kind(record) == Some("execution.order_filled")
+                && record["payload"]["stage"].as_str() == Some("entry_long")
+        })
+        .expect("entry long fill");
+    let entry_short = records
+        .iter()
+        .find(|record| {
+            record_kind(record) == Some("execution.order_filled")
+                && record["payload"]["stage"].as_str() == Some("entry_short")
+        })
+        .expect("entry short fill");
+    let long_exit_fills: Vec<_> = records
+        .iter()
+        .filter(|record| {
+            record_kind(record) == Some("execution.order_filled")
+                && matches!(
+                    record["payload"]["stage"].as_str(),
+                    Some("partial_exit_long" | "exit_long")
+                )
+        })
+        .collect();
+    let short_exit_fills: Vec<_> = records
+        .iter()
+        .filter(|record| {
+            record_kind(record) == Some("execution.order_filled")
+                && matches!(
+                    record["payload"]["stage"].as_str(),
+                    Some("partial_exit_short" | "exit_short")
+                )
+        })
+        .collect();
+    let exit_triggered = records
+        .iter()
+        .find(|record| record_kind(record) == Some("execution.exit_triggered"))
+        .expect("exit trigger");
+    let exit_closed = records
+        .iter()
+        .find(|record| record_kind(record) == Some("exit.closed"))
+        .expect("exit closed");
+
+    let entry_long_average_price = entry_long["payload"]["average_price"]
+        .as_f64()
+        .expect("entry long avg");
+    let entry_short_average_price = entry_short["payload"]["average_price"]
+        .as_f64()
+        .expect("entry short avg");
+    let realized_price_pnl = long_exit_fills
+        .iter()
+        .map(|fill| {
+            (fill["payload"]["average_price"]
+                .as_f64()
+                .expect("exit long avg")
+                - entry_long_average_price)
+                * fill["payload"]["executed_quantity"]
+                    .as_f64()
+                    .expect("exit long qty")
+        })
+        .sum::<f64>()
+        + short_exit_fills
+            .iter()
+            .map(|fill| {
+                (entry_short_average_price
+                    - fill["payload"]["average_price"]
+                        .as_f64()
+                        .expect("exit short avg"))
+                    * fill["payload"]["executed_quantity"]
+                        .as_f64()
+                        .expect("exit short qty")
+            })
+            .sum::<f64>();
+    let captured_funding_quote = exit_triggered["payload"]["captured_funding_quote"]
+        .as_f64()
+        .expect("captured funding");
+    let second_stage_funding_quote = exit_triggered["payload"]["second_stage_funding_quote"]
+        .as_f64()
+        .expect("second stage funding");
+    let total_entry_fee_quote = entry_long["payload"]["fee_quote"]
+        .as_f64()
+        .expect("entry long fee")
+        + entry_short["payload"]["fee_quote"]
+            .as_f64()
+            .expect("entry short fee");
+    let total_exit_fee_quote = exit_closed["payload"]["total_exit_fee_quote"]
+        .as_f64()
+        .expect("total exit fee");
+    let expected_realized_net_quote =
+        realized_price_pnl + captured_funding_quote + second_stage_funding_quote
+            - total_entry_fee_quote
+            - total_exit_fee_quote;
+    let actual_net_quote = exit_closed["payload"]["net_quote"]
+        .as_f64()
+        .expect("exit net quote");
+
+    assert!(
+        (actual_net_quote - expected_realized_net_quote).abs() < 1e-9,
+        "expected realized net {expected_realized_net_quote}, got {actual_net_quote}"
+    );
+    assert_ne!(
+        exit_closed["payload"]["mark_to_market_net_quote"].as_f64(),
+        Some(actual_net_quote)
+    );
+    assert_eq!(
+        exit_closed["payload"]["outcome_diagnostics"]["outcome"].as_str(),
+        Some("profit")
+    );
+    assert_eq!(
+        exit_closed["payload"]["outcome_diagnostics"]["primary_reason"].as_str(),
+        Some("favorable_price_move")
+    );
+    assert_eq!(
+        exit_closed["payload"]["settlement_half_outcome_diagnostics"]["segment_kind"].as_str(),
+        Some("settlement_half_close")
+    );
+    assert_eq!(
+        exit_closed["payload"]["remaining_outcome_diagnostics"]["segment_kind"].as_str(),
+        Some("post_settlement_remaining_close")
+    );
+    let contributing = exit_closed["payload"]["outcome_diagnostics"]["contributing_reasons"]
+        .as_array()
+        .expect("profit contributing reasons");
+    assert!(contributing
+        .iter()
+        .any(|item| item.as_str() == Some("favorable_price_move")));
+    assert!(contributing
+        .iter()
+        .any(|item| item.as_str() == Some("funding_realized")));
+}
+
+#[tokio::test]
+async fn exit_closed_records_loss_diagnostics_for_losing_trade() {
+    let temp = TempDir::new().expect("tempdir");
+    let mut config = test_config(&temp, true);
+    config.strategy.stop_loss_quote = 1.0;
+    let binance = Arc::new(ScriptedVenueAdapter::new(
+        Venue::Binance,
+        0.5,
+        vec![
+            venue_snapshot(
+                Venue::Binance,
+                0,
+                vec![symbol_snapshot(
+                    "BTCUSDT", 100.0, 101.0, 0.1, 0.1, -0.0002, 60_000,
+                )],
+            ),
+            venue_snapshot(
+                Venue::Binance,
+                1_000,
+                vec![symbol_snapshot(
+                    "BTCUSDT", 89.0, 90.0, 0.1, 0.1, 0.0002, 60_000,
+                )],
+            ),
+        ],
+    ));
+    let okx = Arc::new(ScriptedVenueAdapter::new(
+        Venue::Okx,
+        0.5,
+        vec![
+            venue_snapshot(
+                Venue::Okx,
+                0,
+                vec![symbol_snapshot(
+                    "BTCUSDT", 100.0, 101.0, 0.1, 0.1, 0.0008, 60_000,
+                )],
+            ),
+            venue_snapshot(
+                Venue::Okx,
+                1_000,
+                vec![symbol_snapshot(
+                    "BTCUSDT", 111.0, 112.0, 0.1, 0.1, 0.0002, 60_000,
+                )],
+            ),
+        ],
+    ));
+    let bybit = Arc::new(ScriptedVenueAdapter::new(
+        Venue::Bybit,
+        0.6,
+        vec![venue_snapshot(Venue::Bybit, 0, vec![])],
+    ));
+    let hyper = Arc::new(ScriptedVenueAdapter::new(
+        Venue::Hyperliquid,
+        0.3,
+        vec![venue_snapshot(Venue::Hyperliquid, 0, vec![])],
+    ));
+
+    let mut engine = Engine::new(
+        config.clone(),
+        vec![
+            binance as Arc<dyn VenueAdapter>,
+            okx as Arc<dyn VenueAdapter>,
+            bybit as Arc<dyn VenueAdapter>,
+            hyper as Arc<dyn VenueAdapter>,
+        ],
+    )
+    .await
+    .expect("engine");
+
+    engine.tick().await.expect("entry tick");
+    engine.tick().await.expect("settlement half close tick");
+    engine.tick().await.expect("remaining close tick");
+
+    let records = read_event_records(&config.persistence.event_log_path);
+    let exit_closed = records
+        .iter()
+        .find(|record| record_kind(record) == Some("exit.closed"))
+        .expect("exit closed");
+
+    assert!(
+        exit_closed["payload"]["net_quote"]
+            .as_f64()
+            .expect("net quote")
+            < 0.0
+    );
+    assert_eq!(
+        exit_closed["payload"]["outcome_diagnostics"]["outcome"].as_str(),
+        Some("loss")
+    );
+    assert_eq!(
+        exit_closed["payload"]["outcome_diagnostics"]["primary_reason"].as_str(),
+        Some("entry_timing_unfavorable")
+    );
+    let contributing = exit_closed["payload"]["outcome_diagnostics"]["contributing_reasons"]
+        .as_array()
+        .expect("contributing reasons");
+    assert!(contributing
+        .iter()
+        .any(|item| item.as_str() == Some("adverse_price_move")));
+    assert!(contributing
+        .iter()
+        .any(|item| item.as_str() == Some("funding_edge_narrowed")));
+    assert!(contributing
+        .iter()
+        .any(|item| item.as_str() == Some("entry_depth_constrained")));
+    assert!(
+        exit_closed["payload"]["outcome_diagnostics"]["current_total_funding_edge_bps"]
+            .as_f64()
+            .expect("current funding edge")
+            < exit_closed["payload"]["outcome_diagnostics"]["entry_total_funding_edge_bps"]
+                .as_f64()
+                .expect("entry funding edge")
+    );
+    assert_eq!(
+        exit_closed["payload"]["loss_diagnostics"]["primary_reason"].as_str(),
+        Some("entry_timing_unfavorable")
+    );
+}
+
+#[tokio::test]
+async fn aligned_position_half_closes_at_settlement_then_force_closes_remainder() {
+    let temp = TempDir::new().expect("tempdir");
+    let mut config = test_config(&temp, true);
+    config.strategy.stop_loss_quote = 1_000.0;
+    config.strategy.profit_take_quote = 1_000.0;
+    config.strategy.trailing_drawdown_quote = 1_000.0;
+    let binance = Arc::new(ScriptedVenueAdapter::new(
+        Venue::Binance,
+        0.5,
+        vec![
+            snapshot(
+                Venue::Binance,
+                0,
+                100.0,
+                100.0,
+                200.0,
+                200.0,
+                -0.0005,
+                60_000,
+            ),
+            snapshot(
+                Venue::Binance,
+                60_000,
+                90.0,
+                90.0,
+                200.0,
+                200.0,
+                -0.0005,
+                60_000,
+            ),
+            snapshot(
+                Venue::Binance,
+                1_260_000,
+                89.0,
+                89.0,
+                200.0,
+                200.0,
+                -0.0005,
+                60_000,
+            ),
+        ],
+    ));
+    let okx = Arc::new(ScriptedVenueAdapter::new(
+        Venue::Okx,
+        0.5,
+        vec![
+            snapshot(Venue::Okx, 0, 100.0, 100.0, 200.0, 200.0, 0.0015, 60_000),
+            snapshot(
+                Venue::Okx,
+                60_000,
+                110.0,
+                110.0,
+                200.0,
+                200.0,
+                0.0015,
+                60_000,
+            ),
+            snapshot(
+                Venue::Okx,
+                1_260_000,
+                111.0,
+                111.0,
+                200.0,
+                200.0,
+                0.0015,
+                60_000,
+            ),
+        ],
+    ));
+    let bybit = Arc::new(ScriptedVenueAdapter::new(
+        Venue::Bybit,
+        0.6,
+        vec![venue_snapshot(Venue::Bybit, 0, vec![])],
+    ));
+    let hyper = Arc::new(ScriptedVenueAdapter::new(
+        Venue::Hyperliquid,
+        0.3,
+        vec![venue_snapshot(Venue::Hyperliquid, 0, vec![])],
+    ));
+
+    let mut engine = Engine::new(
+        config.clone(),
+        vec![
+            binance.clone() as Arc<dyn VenueAdapter>,
+            okx.clone() as Arc<dyn VenueAdapter>,
+            bybit as Arc<dyn VenueAdapter>,
+            hyper as Arc<dyn VenueAdapter>,
+        ],
+    )
+    .await
+    .expect("engine");
+
+    engine.tick().await.expect("entry tick");
+    let opened = engine
+        .state()
+        .open_position
+        .as_ref()
+        .expect("opened position")
+        .clone();
+
+    engine.tick().await.expect("settlement tick");
+    let after_half = engine
+        .state()
+        .open_position
+        .as_ref()
+        .expect("position remains after half close")
+        .clone();
+    assert!(after_half.quantity < opened.quantity);
+    assert!(after_half.quantity > 0.0);
+    assert!((after_half.quantity - (opened.quantity * 0.5)).abs() < 1e-9);
+
+    engine.tick().await.expect("forced close tick");
+    assert!(engine.state().open_position.is_none());
+
+    let records = read_event_records(&config.persistence.event_log_path);
+    let partial = records
+        .iter()
+        .find(|record| record_kind(record) == Some("exit.partial_closed"))
+        .expect("partial close event");
+    assert_eq!(
+        partial["payload"]["reason"].as_str(),
+        Some("settlement_half_close")
+    );
+    assert_eq!(
+        partial["payload"]["remaining_quantity"].as_f64(),
+        Some(after_half.quantity)
+    );
+    assert_eq!(
+        partial["payload"]["outcome_diagnostics"]["segment_kind"].as_str(),
+        Some("settlement_half_close")
+    );
+    assert_eq!(
+        partial["payload"]["outcome_diagnostics"]["closed_quantity"].as_f64(),
+        Some(opened.quantity * 0.5)
+    );
+    let exit_closed = records
+        .iter()
+        .find(|record| record_kind(record) == Some("exit.closed"))
+        .expect("exit closed");
+    assert_eq!(
+        exit_closed["payload"]["reason"].as_str(),
+        Some("settlement_force_close")
+    );
+    assert_eq!(
+        exit_closed["payload"]["settlement_half_outcome_diagnostics"]["segment_kind"].as_str(),
+        Some("settlement_half_close")
+    );
+    assert_eq!(
+        exit_closed["payload"]["remaining_outcome_diagnostics"]["segment_kind"].as_str(),
+        Some("post_settlement_remaining_close")
+    );
+}
+
+#[tokio::test]
+async fn settlement_half_close_does_not_fail_closed_on_stale_market_data() {
+    let temp = TempDir::new().expect("tempdir");
+    let mut config = test_config(&temp, true);
+    config.runtime.max_market_age_ms = 10_000;
+    config.strategy.stop_loss_quote = 1_000.0;
+    config.strategy.profit_take_quote = 1_000.0;
+    config.strategy.trailing_drawdown_quote = 1_000.0;
+    let binance = Arc::new(ScriptedVenueAdapter::new(
+        Venue::Binance,
+        0.5,
+        vec![
+            snapshot(
+                Venue::Binance,
+                0,
+                100.0,
+                100.0,
+                200.0,
+                200.0,
+                -0.0005,
+                60_000,
+            ),
+            snapshot(
+                Venue::Binance,
+                60_000,
+                90.0,
+                90.0,
+                200.0,
+                200.0,
+                -0.0005,
+                60_000,
+            ),
+        ],
+    ));
+    let okx = Arc::new(ScriptedVenueAdapter::new(
+        Venue::Okx,
+        0.5,
+        vec![
+            snapshot(Venue::Okx, 0, 100.0, 100.0, 200.0, 200.0, 0.0015, 60_000),
+            snapshot(Venue::Okx, 0, 110.0, 110.0, 200.0, 200.0, 0.0015, 60_000),
+        ],
+    ));
+    let bybit = Arc::new(ScriptedVenueAdapter::new(
+        Venue::Bybit,
+        0.6,
+        vec![venue_snapshot(Venue::Bybit, 0, vec![])],
+    ));
+    let hyper = Arc::new(ScriptedVenueAdapter::new(
+        Venue::Hyperliquid,
+        0.3,
+        vec![venue_snapshot(Venue::Hyperliquid, 0, vec![])],
+    ));
+
+    let mut engine = Engine::new(
+        config.clone(),
+        vec![
+            binance as Arc<dyn VenueAdapter>,
+            okx as Arc<dyn VenueAdapter>,
+            bybit as Arc<dyn VenueAdapter>,
+            hyper as Arc<dyn VenueAdapter>,
+        ],
+    )
+    .await
+    .expect("engine");
+
+    engine.tick().await.expect("entry tick");
+    engine.tick().await.expect("settlement tick");
+
+    assert_eq!(engine.state().mode, EngineMode::Running);
+    let remaining = engine
+        .state()
+        .open_position
+        .as_ref()
+        .expect("position remains")
+        .quantity;
+    assert!(remaining > 0.0);
+
+    let records = read_event_records(&config.persistence.event_log_path);
+    assert!(has_event(&records, "exit.partial_closed"));
+}
+
+#[tokio::test]
 async fn staggered_position_exits_after_first_stage_capture_by_default() {
     let temp = TempDir::new().expect("tempdir");
     let mut config = test_config(&temp, true);
@@ -118,11 +676,17 @@ async fn staggered_position_exits_after_first_stage_capture_by_default() {
         .clone();
     assert_eq!(position.opportunity_type, FundingOpportunityType::Staggered);
 
-    engine.tick().await.expect("exit tick");
+    engine.tick().await.expect("first stage half close tick");
+    assert!(engine.state().open_position.is_some());
+    engine
+        .tick()
+        .await
+        .expect("first stage remaining close tick");
     assert!(engine.state().open_position.is_none());
     assert_eq!(engine.state().mode, EngineMode::Running);
 
     let records = read_event_records(&config.persistence.event_log_path);
+    assert!(has_event(&records, "exit.partial_closed"));
     let exit_record = records
         .iter()
         .find(|record| record_kind(record) == Some("exit.closed"))
@@ -159,13 +723,14 @@ async fn staggered_position_can_continue_until_second_stage_when_configured() {
     assert!(!position.exit_after_first_stage);
     assert!(position.second_stage_enabled_at_entry);
 
-    engine.tick().await.expect("first stage tick");
+    engine.tick().await.expect("first stage half close tick");
     assert!(engine.state().open_position.is_some());
 
-    engine.tick().await.expect("second stage tick");
+    engine.tick().await.expect("force close tick");
     assert!(engine.state().open_position.is_none());
 
     let records = read_event_records(&config.persistence.event_log_path);
+    assert!(has_event(&records, "exit.partial_closed"));
     let exit_record = records
         .iter()
         .rev()
@@ -173,7 +738,7 @@ async fn staggered_position_can_continue_until_second_stage_when_configured() {
         .expect("exit record");
     assert_eq!(
         exit_record["payload"]["reason"].as_str(),
-        Some("second_stage_capture")
+        Some("settlement_force_close")
     );
 }
 
@@ -399,7 +964,8 @@ async fn restart_restores_venue_health_snapshot_for_hyperliquid_gate() {
     .expect("engine");
 
     engine.tick().await.expect("entry tick");
-    engine.tick().await.expect("exit tick");
+    engine.tick().await.expect("settlement half close tick");
+    engine.tick().await.expect("final exit tick");
     assert!(engine.state().open_position.is_none());
     drop(engine);
 
@@ -1213,7 +1779,7 @@ async fn outside_funding_scan_window_skips_entry_discovery() {
     let temp = TempDir::new().expect("tempdir");
     let mut config = test_config(&temp, true);
     config.strategy.entry_window_secs = 3_600;
-    config.strategy.max_scan_minutes_before_funding = 15;
+    config.strategy.max_scan_minutes_before_funding = 25;
     config.strategy.min_scan_minutes_before_funding = 5;
 
     let adapters = VenueSet(
@@ -1224,7 +1790,7 @@ async fn outside_funding_scan_window_skips_entry_discovery() {
                 Venue::Binance,
                 0,
                 vec![symbol_snapshot(
-                    "BTCUSDT", 100.0, 100.0, 200.0, 200.0, -0.0005, 1_200_000,
+                    "BTCUSDT", 100.0, 100.0, 200.0, 200.0, -0.0005, 1_800_000,
                 )],
             )],
         )),
@@ -1235,7 +1801,7 @@ async fn outside_funding_scan_window_skips_entry_discovery() {
                 Venue::Okx,
                 0,
                 vec![symbol_snapshot(
-                    "BTCUSDT", 100.0, 100.0, 200.0, 200.0, 0.0015, 1_200_000,
+                    "BTCUSDT", 100.0, 100.0, 200.0, 200.0, 0.0015, 1_800_000,
                 )],
             )],
         )),
@@ -1246,7 +1812,7 @@ async fn outside_funding_scan_window_skips_entry_discovery() {
                 Venue::Bybit,
                 0,
                 vec![symbol_snapshot(
-                    "BTCUSDT", 100.0, 100.0, 200.0, 200.0, 0.0002, 1_200_000,
+                    "BTCUSDT", 100.0, 100.0, 200.0, 200.0, 0.0002, 1_800_000,
                 )],
             )],
         )),
@@ -1257,7 +1823,7 @@ async fn outside_funding_scan_window_skips_entry_discovery() {
                 Venue::Hyperliquid,
                 0,
                 vec![symbol_snapshot(
-                    "BTCUSDT", 100.0, 100.0, 200.0, 200.0, 0.0001, 1_200_000,
+                    "BTCUSDT", 100.0, 100.0, 200.0, 200.0, 0.0001, 1_800_000,
                 )],
             )],
         )),

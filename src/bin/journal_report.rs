@@ -137,10 +137,28 @@ fn main() -> Result<()> {
                 replay.position_id, entry
             );
         }
+        if let Some(opened) = &replay.opened_position {
+            println!(
+                "trade_opened position_id={} summary={}",
+                replay.position_id, opened
+            );
+        }
+        for partial in &replay.partial_close_summaries {
+            println!(
+                "trade_partial_close position_id={} summary={}",
+                replay.position_id, partial
+            );
+        }
         if let Some(exit) = &replay.exit_latency_summary {
             println!(
                 "trade_exit_latency position_id={} summary={}",
                 replay.position_id, exit
+            );
+        }
+        if let Some(close) = &replay.close_summary {
+            println!(
+                "trade_closed position_id={} summary={}",
+                replay.position_id, close
             );
         }
         for leg in &replay.order_legs {
