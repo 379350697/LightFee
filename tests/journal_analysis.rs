@@ -1,7 +1,10 @@
 use lightfee::{
-    analyze_journal_records, JournalRecord, JournalRuntimeMetricsSnapshot, JsonlJournal, Venue,
+    analyze_daily_journal_file, analyze_journal_file, analyze_journal_file_in_range,
+    analyze_journal_records, JournalAnalysisTimeRange, JournalRecord,
+    JournalRuntimeMetricsSnapshot, JsonlJournal, Venue,
 };
 use serde_json::json;
+use std::fs;
 use tempfile::TempDir;
 
 #[test]
@@ -572,6 +575,199 @@ fn journal_analysis_reports_daily_profit_and_balance_snapshots() {
     assert_eq!(symbol.position_count, 1);
     assert!((symbol.realized_net_quote - 1.8).abs() < 1e-9);
     assert_eq!(symbol.closed_position_count, 1);
+}
+
+#[test]
+fn journal_analysis_file_streaming_matches_batch_analysis() {
+    let records = vec![
+        record(
+            0,
+            "run-a",
+            1000,
+            "execution.order_submitted",
+            json!({"venue": "binance"}),
+        ),
+        record(
+            1,
+            "run-a",
+            1001,
+            "execution.order_filled",
+            json!({"venue": "binance", "local_roundtrip_ms": 123_u64, "fee_quote": 0.01}),
+        ),
+        record(
+            2,
+            "run-a",
+            1002,
+            "entry.opened",
+            json!({"position_id": "pos-1", "symbol": "BTCUSDT"}),
+        ),
+        record(
+            3,
+            "run-a",
+            1003,
+            "exit.closed",
+            json!({
+                "position_id": "pos-1",
+                "symbol": "BTCUSDT",
+                "net_quote": 1.2,
+                "remaining_outcome_diagnostics": {"net_quote": 1.2, "outcome": "profit"},
+                "closed_at_ms": 1003_i64
+            }),
+        ),
+    ];
+    let temp = TempDir::new().expect("tempdir");
+    let path = temp.path().join("events.jsonl");
+    let raw = records
+        .iter()
+        .map(|record| serde_json::to_string(record).expect("serialize"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&path, format!("{raw}\n")).expect("write journal");
+
+    let batch = analyze_journal_records(&records);
+    let streamed = analyze_journal_file(&path).expect("streamed analysis");
+
+    assert_eq!(streamed, batch);
+}
+
+#[test]
+fn daily_journal_analysis_file_matches_full_report_daily_sections() {
+    let records = vec![
+        record(
+            0,
+            "run-a",
+            1_742_486_400_000,
+            "balance.snapshot",
+            json!({
+                "total_equity_quote": 120.0,
+                "venues": [
+                    {
+                        "venue": "binance",
+                        "equity_quote": 70.0,
+                        "wallet_balance_quote": 68.0,
+                        "available_balance_quote": 60.0,
+                        "observed_at_ms": 1_742_486_400_000_i64
+                    }
+                ],
+                "failed_venues": []
+            }),
+        ),
+        record(
+            1,
+            "run-a",
+            1_742_486_500_000,
+            "entry.opened",
+            json!({"position_id": "pos-2", "symbol": "XAIUSDT"}),
+        ),
+        record(
+            2,
+            "run-a",
+            1_742_486_600_000,
+            "exit.partial_closed",
+            json!({
+                "position_id": "pos-2",
+                "closed_at_ms": 1_742_486_600_000_i64,
+                "outcome_diagnostics": {"net_quote": 1.2, "outcome": "profit"}
+            }),
+        ),
+        record(
+            3,
+            "run-a",
+            1_742_486_700_000,
+            "exit.reconciled",
+            json!({
+                "position_id": "pos-2",
+                "closed_at_ms": 1_742_486_700_000_i64,
+                "remaining_outcome_diagnostics": {"net_quote": 0.6, "outcome": "profit"}
+            }),
+        ),
+    ];
+    let temp = TempDir::new().expect("tempdir");
+    let path = temp.path().join("events.jsonl");
+    let raw = records
+        .iter()
+        .map(|record| serde_json::to_string(record).expect("serialize"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&path, format!("{raw}\n")).expect("write journal");
+
+    let full = analyze_journal_records(&records);
+    let daily = analyze_daily_journal_file(&path).expect("daily streamed analysis");
+
+    assert_eq!(
+        daily.current_balance_snapshot,
+        full.current_balance_snapshot
+    );
+    assert_eq!(daily.daily_profit_summaries, full.daily_profit_summaries);
+}
+
+#[test]
+fn journal_analysis_file_range_filters_to_requested_window() {
+    let records = vec![
+        record(
+            0,
+            "run-a",
+            1_742_400_000_000,
+            "execution.order_filled",
+            json!({"venue": "binance", "local_roundtrip_ms": 100_u64, "fee_quote": 0.01}),
+        ),
+        record(
+            1,
+            "run-b",
+            1_742_486_400_000,
+            "execution.order_filled",
+            json!({"venue": "okx", "local_roundtrip_ms": 250_u64, "fee_quote": 0.02}),
+        ),
+    ];
+    let temp = TempDir::new().expect("tempdir");
+    let path = temp.path().join("events.jsonl");
+    let raw = records
+        .iter()
+        .map(|record| serde_json::to_string(record).expect("serialize"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&path, format!("{raw}\n")).expect("write journal");
+
+    let report = analyze_journal_file_in_range(
+        &path,
+        &JournalAnalysisTimeRange {
+            since_ts_ms: Some(1_742_486_400_000),
+            until_ts_ms: Some(1_742_486_400_000),
+        },
+    )
+    .expect("filtered analysis");
+
+    assert_eq!(report.total_records, 1);
+    assert_eq!(report.run_count, 1);
+    assert!(report.venue_stats.contains_key(&Venue::Okx));
+    assert!(!report.venue_stats.contains_key(&Venue::Binance));
+}
+
+#[test]
+fn journal_analysis_handles_large_latency_series() {
+    let records = (1_u64..=10_000_u64)
+        .enumerate()
+        .map(|(seq, latency)| {
+            record(
+                seq as u64,
+                "run-a",
+                1_000 + seq as i64,
+                "execution.order_filled",
+                json!({
+                    "venue": "binance",
+                    "local_roundtrip_ms": latency,
+                    "fee_quote": 0.0
+                }),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let report = analyze_journal_records(&records);
+    let stats = report.venue_stats.get(&Venue::Binance).expect("binance");
+    assert_eq!(stats.latency_ms_p50, Some(5_000));
+    assert_eq!(stats.latency_ms_p95, Some(9_500));
+    assert_eq!(stats.latency_ms_p99, Some(9_900));
+    assert_eq!(stats.latency_ms_max, Some(10_000));
 }
 
 fn record(

@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File, OpenOptions},
-    io::{BufWriter, Write},
+    io::{BufRead, BufReader, BufWriter, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -117,21 +117,36 @@ impl JsonlJournal {
     }
 
     pub fn read_records(&self) -> Result<Vec<JournalRecord>> {
-        let _ = self.flush();
-        if !self.path.exists() {
-            return Ok(Vec::new());
-        }
+        let mut records = Vec::new();
+        self.scan_records(|record| {
+            records.push(record);
+            Ok(())
+        })?;
+        Ok(records)
+    }
 
-        let raw = fs::read_to_string(&self.path)
-            .with_context(|| format!("failed to read journal {}", self.path.display()))?;
-        raw.lines()
-            .filter(|line| !line.trim().is_empty())
-            .map(|line| {
-                serde_json::from_str::<JournalRecord>(line).with_context(|| {
-                    format!("failed to parse journal record in {}", self.path.display())
-                })
-            })
-            .collect()
+    pub fn scan_records<F>(&self, visit: F) -> Result<()>
+    where
+        F: FnMut(JournalRecord) -> Result<()>,
+    {
+        let _ = self.flush();
+        scan_path_records(&self.path, visit)
+    }
+
+    pub fn scan_records_matching_kinds<F>(&self, kinds: &[&str], mut visit: F) -> Result<()>
+    where
+        F: FnMut(JournalRecord) -> Result<()>,
+    {
+        let _ = self.flush();
+        let patterns = kinds
+            .iter()
+            .map(|kind| format!("\"kind\":\"{kind}\""))
+            .collect::<Vec<_>>();
+        scan_path_records_with_filter(
+            &self.path,
+            |trimmed| patterns.iter().any(|pattern| trimmed.contains(pattern)),
+            |record| visit(record),
+        )
     }
 
     pub fn shutdown(&self) -> Result<()> {
@@ -252,9 +267,79 @@ impl JsonlJournal {
     }
 }
 
+pub fn scan_path_records<F>(path: impl AsRef<Path>, visit: F) -> Result<()>
+where
+    F: FnMut(JournalRecord) -> Result<()>,
+{
+    scan_path_records_with_filter(path, |_| true, visit)
+}
+
+fn scan_path_records_with_filter<F, P>(
+    path: P,
+    mut should_visit: impl FnMut(&str) -> bool,
+    mut visit: F,
+) -> Result<()>
+where
+    F: FnMut(JournalRecord) -> Result<()>,
+    P: AsRef<Path>,
+{
+    let path = path.as_ref();
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let file =
+        File::open(path).with_context(|| format!("failed to open journal {}", path.display()))?;
+    let reader = BufReader::new(file);
+    for line in reader.lines() {
+        let line = line.with_context(|| format!("failed to read journal {}", path.display()))?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() || !should_visit(trimmed) {
+            continue;
+        }
+        let record = serde_json::from_str::<JournalRecord>(trimmed)
+            .with_context(|| format!("failed to parse journal record in {}", path.display()))?;
+        visit(record)?;
+    }
+    Ok(())
+}
+
 impl Drop for JsonlJournal {
     fn drop(&mut self) {
         let _ = self.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::TempDir;
+
+    use super::JsonlJournal;
+
+    #[test]
+    fn scan_records_matching_kinds_streams_only_relevant_records() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("events.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"seq\":1,\"run_id\":\"r\",\"ts_ms\":1,\"kind\":\"scan.no_entry_diagnostics\",\"payload\":{\"x\":1}}\n",
+                "{\"seq\":2,\"run_id\":\"r\",\"ts_ms\":2,\"kind\":\"entry.opened\",\"payload\":{\"position_id\":\"pos-1\"}}\n",
+                "{\"seq\":3,\"run_id\":\"r\",\"ts_ms\":3,\"kind\":\"scan.completed\",\"payload\":{\"candidate_count\":1}}\n"
+            ),
+        )
+        .expect("write journal");
+        let journal = JsonlJournal::new(&path);
+
+        let mut kinds = Vec::new();
+        journal
+            .scan_records_matching_kinds(&["entry.opened", "exit.closed"], |record| {
+                kinds.push(record.kind);
+                Ok(())
+            })
+            .expect("scan records");
+
+        assert_eq!(kinds, vec!["entry.opened"]);
     }
 }
 

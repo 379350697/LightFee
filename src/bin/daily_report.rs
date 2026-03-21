@@ -1,9 +1,13 @@
-use std::{env, path::PathBuf, sync::Arc};
+use std::{
+    env,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{Duration, Local, NaiveDate};
 use lightfee::{
-    analyze_journal_records, config::RuntimeMode, AccountBalanceSnapshot, AppConfig,
+    analyze_daily_journal_file, config::RuntimeMode, AccountBalanceSnapshot, AppConfig,
     BalanceSnapshotFailure, BalanceSnapshotReport, BinanceLiveAdapter, BybitLiveAdapter,
     DailyProfitSummary, HyperliquidLiveAdapter, JsonlJournal, OkxLiveAdapter, ScriptedVenueAdapter,
     Venue, VenueAdapter,
@@ -79,8 +83,7 @@ async fn main() -> Result<()> {
     };
     journal.append_critical(generated_at_ms, "balance.snapshot", &snapshot_event)?;
 
-    let records = journal.read_records()?;
-    let analysis = analyze_journal_records(&records);
+    let analysis = analyze_daily_journal_file(Path::new(&config.persistence.event_log_path))?;
     let daily_profit_summary = analysis
         .daily_profit_summaries
         .into_iter()

@@ -5029,26 +5029,37 @@ fn normalize_engine_state_positions(state: &mut EngineState) {
 
 fn recover_open_positions_from_journal(journal: &JsonlJournal) -> Result<Vec<OpenPosition>> {
     let mut open_positions = BTreeMap::new();
-    for record in journal.read_records()? {
-        match record.kind.as_str() {
-            "entry.opened" | "recovery.live_detected" | "exit.partial_closed" => {
-                if let Ok(position) = serde_json::from_value::<OpenPosition>(record.payload.clone())
-                {
-                    open_positions.insert(position.position_id.clone(), position);
+    journal.scan_records_matching_kinds(
+        &[
+            "entry.opened",
+            "recovery.live_detected",
+            "exit.partial_closed",
+            "exit.closed",
+            "recovery.flat",
+        ],
+        |record| {
+            match record.kind.as_str() {
+                "entry.opened" | "recovery.live_detected" | "exit.partial_closed" => {
+                    if let Ok(position) =
+                        serde_json::from_value::<OpenPosition>(record.payload.clone())
+                    {
+                        open_positions.insert(position.position_id.clone(), position);
+                    }
                 }
-            }
-            "exit.closed" | "recovery.flat" => {
-                let closed_id = record
-                    .payload
-                    .get("position_id")
-                    .and_then(|value| value.as_str());
-                if let Some(closed_id) = closed_id {
-                    open_positions.remove(closed_id);
+                "exit.closed" | "recovery.flat" => {
+                    let closed_id = record
+                        .payload
+                        .get("position_id")
+                        .and_then(|value| value.as_str());
+                    if let Some(closed_id) = closed_id {
+                        open_positions.remove(closed_id);
+                    }
                 }
+                _ => {}
             }
-            _ => {}
-        }
-    }
+            Ok(())
+        },
+    )?;
     Ok(open_positions.into_values().collect())
 }
 

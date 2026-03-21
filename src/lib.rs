@@ -14,8 +14,10 @@ pub mod transfer;
 pub mod venue;
 
 pub use analysis::{
-    analyze_journal_records, BalanceSnapshotFailure, BalanceSnapshotReport, DailyProfitSummary,
-    DailySymbolRevenue, JournalAnalysisReport, JournalOptimizationStats,
+    analyze_daily_journal_file, analyze_daily_journal_records, analyze_journal_file,
+    analyze_journal_file_in_range, analyze_journal_records, BalanceSnapshotFailure,
+    BalanceSnapshotReport, DailyJournalAnalysisReport, DailyProfitSummary, DailySymbolRevenue,
+    JournalAnalysisReport, JournalAnalysisTimeRange, JournalOptimizationStats,
     OptimizationRecommendation, TradeLegReplay, TradeReplay, VenueJournalStats,
 };
 pub use config::{
@@ -23,7 +25,7 @@ pub use config::{
     StaggeredExitMode, StrategyConfig, VenueConfig,
 };
 pub use engine::{Engine, EngineMode, EngineState, OpenPosition, ScanSnapshot};
-pub use journal::{JournalRecord, JournalRuntimeMetricsSnapshot, JsonlJournal};
+pub use journal::{scan_path_records, JournalRecord, JournalRuntimeMetricsSnapshot, JsonlJournal};
 pub use live::{BinanceLiveAdapter, BybitLiveAdapter, HyperliquidLiveAdapter, OkxLiveAdapter};
 pub use market::MarketView;
 pub use models::{

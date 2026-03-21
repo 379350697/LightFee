@@ -1,24 +1,81 @@
-use std::{env, fs, path::PathBuf};
+use std::{env, path::PathBuf};
 
-use anyhow::{anyhow, Context, Result};
-use lightfee::{analyze_journal_records, JournalRecord};
+use anyhow::{anyhow, Result};
+use chrono::{Duration, Local, NaiveDate, TimeZone};
+use lightfee::{analyze_journal_file_in_range, JournalAnalysisTimeRange};
+
+const DEFAULT_REPORT_SINCE_HOURS: i64 = 72;
 
 fn main() -> Result<()> {
     let args = env::args().skip(1).collect::<Vec<_>>();
     if args.is_empty() {
         return Err(anyhow!(
-            "usage: cargo run --bin journal_report -- [--json] <event-log-path>"
+            "usage: cargo run --bin journal_report -- [--json] [--all | --date YYYY-MM-DD | --since <Ns|Nm|Nh|Nd>] <event-log-path>"
         ));
     }
 
-    let json_output = args.iter().any(|arg| arg == "--json");
-    let path_arg = args
-        .iter()
-        .find(|arg| arg.as_str() != "--json")
-        .ok_or_else(|| anyhow!("missing event log path"))?;
-    let path = PathBuf::from(path_arg);
-    let records = read_records(&path)?;
-    let report = analyze_journal_records(&records);
+    let mut json_output = false;
+    let mut include_all = false;
+    let mut date = None;
+    let mut since = None;
+    let mut path = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => {
+                json_output = true;
+                index += 1;
+            }
+            "--all" => {
+                include_all = true;
+                index += 1;
+            }
+            "--date" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| anyhow!("--date requires YYYY-MM-DD"))?;
+                date = Some(
+                    NaiveDate::parse_from_str(value, "%Y-%m-%d")
+                        .map_err(|_| anyhow!("invalid --date value: {value}"))?,
+                );
+                index += 2;
+            }
+            "--since" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| anyhow!("--since requires a relative duration like 24h"))?;
+                since = Some(parse_since_window(value)?);
+                index += 2;
+            }
+            value => {
+                if path.is_none() {
+                    path = Some(PathBuf::from(value));
+                }
+                index += 1;
+            }
+        }
+    }
+
+    if include_all && (date.is_some() || since.is_some()) {
+        return Err(anyhow!("--all cannot be combined with --date or --since"));
+    }
+    if date.is_some() && since.is_some() {
+        return Err(anyhow!("--date cannot be combined with --since"));
+    }
+
+    let path = path.ok_or_else(|| anyhow!("missing event log path"))?;
+    let range = if include_all {
+        JournalAnalysisTimeRange::default()
+    } else if let Some(date) = date {
+        local_day_range(date)?
+    } else {
+        let since_duration = since.unwrap_or_else(|| Duration::hours(DEFAULT_REPORT_SINCE_HOURS));
+        JournalAnalysisTimeRange {
+            since_ts_ms: Some((chrono::Utc::now() - since_duration).timestamp_millis()),
+            until_ts_ms: None,
+        }
+    };
+    let report = analyze_journal_file_in_range(&path, &range)?;
 
     if json_output {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -249,14 +306,46 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn read_records(path: &PathBuf) -> Result<Vec<JournalRecord>> {
-    let raw = fs::read_to_string(path)
-        .with_context(|| format!("failed to read journal {}", path.display()))?;
-    raw.lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| {
-            serde_json::from_str::<JournalRecord>(line)
-                .with_context(|| format!("failed to parse journal record in {}", path.display()))
-        })
-        .collect()
+fn parse_since_window(value: &str) -> Result<Duration> {
+    if value.len() < 2 {
+        return Err(anyhow!("invalid --since value: {value}"));
+    }
+    let (amount, unit) = value.split_at(value.len() - 1);
+    let amount = amount
+        .parse::<i64>()
+        .map_err(|_| anyhow!("invalid --since value: {value}"))?;
+    if amount <= 0 {
+        return Err(anyhow!("--since must be positive"));
+    }
+    let duration = match unit {
+        "s" => Duration::seconds(amount),
+        "m" => Duration::minutes(amount),
+        "h" => Duration::hours(amount),
+        "d" => Duration::days(amount),
+        _ => return Err(anyhow!("unsupported --since unit: {unit}")),
+    };
+    Ok(duration)
+}
+
+fn local_day_range(date: NaiveDate) -> Result<JournalAnalysisTimeRange> {
+    let start = Local
+        .from_local_datetime(
+            &date
+                .and_hms_opt(0, 0, 0)
+                .ok_or_else(|| anyhow!("invalid local start-of-day for {date}"))?,
+        )
+        .single()
+        .ok_or_else(|| anyhow!("ambiguous local start-of-day for {date}"))?;
+    let end = Local
+        .from_local_datetime(
+            &date
+                .and_hms_milli_opt(23, 59, 59, 999)
+                .ok_or_else(|| anyhow!("invalid local end-of-day for {date}"))?,
+        )
+        .single()
+        .ok_or_else(|| anyhow!("ambiguous local end-of-day for {date}"))?;
+    Ok(JournalAnalysisTimeRange {
+        since_ts_ms: Some(start.timestamp_millis()),
+        until_ts_ms: Some(end.timestamp_millis()),
+    })
 }
