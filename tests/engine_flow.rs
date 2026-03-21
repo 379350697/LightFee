@@ -2945,6 +2945,133 @@ async fn live_quote_refresh_unblocks_entry_after_stale_selection_snapshot() {
 }
 
 #[tokio::test]
+async fn entry_market_refresh_unblocks_candidate_stale_gate_before_order_submission() {
+    let temp = TempDir::new().expect("tempdir");
+    let mut config = test_config(&temp, true);
+    config.runtime.mode = RuntimeMode::Live;
+    config.runtime.max_order_quote_age_ms = 3_000;
+    config.runtime.max_market_age_ms = 60_000;
+    config.symbols = vec!["ENJUSDT".to_string()];
+    config.directed_pairs = vec![DirectedPairConfig {
+        long: Venue::Binance,
+        short: Venue::Okx,
+        symbols: config.symbols.clone(),
+    }];
+    config.strategy.entry_window_secs = 3_600;
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let stale_observed_at_ms = now_ms - 7_100;
+    let funding_timestamp_ms = now_ms + 60_000;
+
+    let binance = Arc::new(ScriptedVenueAdapter::new(
+        Venue::Binance,
+        0.5,
+        vec![
+            venue_snapshot(
+                Venue::Binance,
+                stale_observed_at_ms,
+                vec![symbol_snapshot(
+                    "ENJUSDT",
+                    100.0,
+                    100.1,
+                    500.0,
+                    500.0,
+                    -0.0005,
+                    funding_timestamp_ms,
+                )],
+            ),
+            venue_snapshot(
+                Venue::Binance,
+                now_ms,
+                vec![symbol_snapshot(
+                    "ENJUSDT",
+                    100.0,
+                    100.1,
+                    500.0,
+                    500.0,
+                    -0.0005,
+                    funding_timestamp_ms,
+                )],
+            ),
+        ],
+    ));
+    let okx = Arc::new(ScriptedVenueAdapter::new(
+        Venue::Okx,
+        0.5,
+        vec![
+            venue_snapshot(
+                Venue::Okx,
+                stale_observed_at_ms,
+                vec![symbol_snapshot(
+                    "ENJUSDT",
+                    100.2,
+                    100.3,
+                    500.0,
+                    500.0,
+                    0.0015,
+                    funding_timestamp_ms,
+                )],
+            ),
+            venue_snapshot(
+                Venue::Okx,
+                now_ms,
+                vec![symbol_snapshot(
+                    "ENJUSDT",
+                    100.2,
+                    100.3,
+                    500.0,
+                    500.0,
+                    0.0015,
+                    funding_timestamp_ms,
+                )],
+            ),
+        ],
+    ));
+    let bybit = Arc::new(ScriptedVenueAdapter::new(
+        Venue::Bybit,
+        0.6,
+        vec![venue_snapshot(Venue::Bybit, now_ms, Vec::new())],
+    ));
+    let hyper = Arc::new(ScriptedVenueAdapter::new(
+        Venue::Hyperliquid,
+        0.3,
+        vec![venue_snapshot(Venue::Hyperliquid, now_ms, Vec::new())],
+    ));
+
+    let mut engine = Engine::new(
+        config.clone(),
+        vec![
+            binance as Arc<dyn VenueAdapter>,
+            okx as Arc<dyn VenueAdapter>,
+            bybit as Arc<dyn VenueAdapter>,
+            hyper as Arc<dyn VenueAdapter>,
+        ],
+    )
+    .await
+    .expect("engine");
+
+    engine.tick().await.expect("tick");
+
+    sleep(Duration::from_millis(250)).await;
+    let records = read_event_records(&config.persistence.event_log_path);
+    assert!(
+        engine.state().open_position.is_some(),
+        "open position missing; last_error={:?} kinds={:?}",
+        engine.state().last_error,
+        records.iter().filter_map(record_kind).collect::<Vec<_>>()
+    );
+    assert!(has_event(&records, "execution.entry_quote_refreshed"));
+    assert!(has_event(&records, "execution.entry_prepare_timing"));
+    assert!(has_event(&records, "entry.opened"));
+    assert!(!records.iter().any(|record| {
+        record_kind(record) == Some("execution.entry_blocked")
+            && record["payload"]["reason"]
+                .as_str()
+                .map(|reason| reason.contains("entry_quote_stale"))
+                .unwrap_or(false)
+    }));
+}
+
+#[tokio::test]
 async fn backup_candidate_is_tried_after_first_candidate_rounds_to_zero() {
     let temp = TempDir::new().expect("tempdir");
     let mut config = test_config(&temp, true);

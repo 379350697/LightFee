@@ -194,6 +194,21 @@ struct CloseExecution {
     total_exit_fee_quote: f64,
 }
 
+struct EntryQuoteRefreshLeg {
+    venue: Venue,
+    side: Side,
+    stage: &'static str,
+    expired_reason: String,
+    age_ms: Option<i64>,
+}
+
+#[derive(Default)]
+struct EntryQuoteRefreshResult {
+    block_reason: Option<String>,
+    refreshed_leg_count: usize,
+    max_pre_refresh_age_ms: Option<i64>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum CloseReconciliationKind {
@@ -411,6 +426,7 @@ const FLAT_RECOVERY_PROBE_INTERVAL_MS: i64 = 30_000;
 const RUNNING_SLOT_RECONCILE_INTERVAL_MS: i64 = 10_000;
 const ORDER_HEALTH_WINDOW_SIZE: usize = 20;
 const NO_ENTRY_DIAGNOSTIC_CANDIDATE_LIMIT: usize = 8;
+const PROACTIVE_ENTRY_QUOTE_REFRESH_MULTIPLIER: i64 = 2;
 const NO_ENTRY_DIAGNOSTIC_SAMPLE_INTERVAL_CYCLES: u64 = 10;
 const REPEATED_FAILURE_LOG_SAMPLE_INTERVAL_CYCLES: u64 = 20;
 const REPEATED_FAILURE_LOG_RETENTION_CYCLES: u64 = 200;
@@ -2585,6 +2601,8 @@ impl Engine {
         candidate: CandidateOpportunity,
         market: &MarketView,
     ) -> Result<()> {
+        let mut entry_market = market.clone();
+        let entry_started_at = Instant::now();
         let position_id = format!("pos-{}-{}", self.state.cycle, candidate.pair_id);
         self.log_event(
             "execution.entry_selected",
@@ -2594,6 +2612,30 @@ impl Engine {
                 "candidate": &candidate,
             }),
         );
+        let quote_refresh_started_at = Instant::now();
+        let quote_refresh_result = self
+            .refresh_entry_candidate_quotes_if_needed(&candidate, &position_id, &mut entry_market)
+            .await?;
+        let proactive_entry_quote_refresh_ms = duration_ms_u64(quote_refresh_started_at.elapsed());
+        if let Some(reason) = quote_refresh_result.block_reason {
+            self.state.last_error = Some(format!(
+                "entry quote stale after refresh for {} on {} and {}",
+                candidate.symbol, candidate.long_venue, candidate.short_venue
+            ));
+            self.log_event(
+                "execution.entry_blocked",
+                &json!({
+                    "position_id": &position_id,
+                    "pair_id": &candidate.pair_id,
+                    "symbol": &candidate.symbol,
+                    "long_venue": candidate.long_venue,
+                    "short_venue": candidate.short_venue,
+                    "reason": reason,
+                }),
+            );
+            return Ok(());
+        }
+        let quantity_plan_started_at = Instant::now();
         let quantity_plan = self
             .plan_executable_quantity(
                 candidate.long_venue,
@@ -2602,6 +2644,7 @@ impl Engine {
                 candidate.quantity,
             )
             .await?;
+        let quantity_plan_ms = duration_ms_u64(quantity_plan_started_at.elapsed());
         let executable_quantity = quantity_plan.executable_quantity;
         let target_notional_quote = self
             .config
@@ -2655,17 +2698,17 @@ impl Engine {
             reduce_only: false,
             client_order_id: compact_client_order_id(position_id.as_str(), "entry_short"),
             price_hint: self.order_price_hint(
-                market,
+                &entry_market,
                 candidate.short_venue,
                 &candidate.symbol,
                 Side::Sell,
             ),
             mark_price_hint: self.order_mark_price_hint(
-                market,
+                &entry_market,
                 candidate.short_venue,
                 &candidate.symbol,
             ),
-            observed_at_ms: market.observed_at_ms(candidate.short_venue),
+            observed_at_ms: entry_market.observed_at_ms(candidate.short_venue),
         };
         let long_request = OrderRequest {
             symbol: candidate.symbol.clone(),
@@ -2674,17 +2717,17 @@ impl Engine {
             reduce_only: false,
             client_order_id: compact_client_order_id(position_id.as_str(), "entry_long"),
             price_hint: self.order_price_hint(
-                market,
+                &entry_market,
                 candidate.long_venue,
                 &candidate.symbol,
                 Side::Buy,
             ),
             mark_price_hint: self.order_mark_price_hint(
-                market,
+                &entry_market,
                 candidate.long_venue,
                 &candidate.symbol,
             ),
-            observed_at_ms: market.observed_at_ms(candidate.long_venue),
+            observed_at_ms: entry_market.observed_at_ms(candidate.long_venue),
         };
         let short_leg = EntryLegPlan {
             leg: HedgeLeg::Short,
@@ -2697,7 +2740,7 @@ impl Engine {
             request: long_request,
         };
         let long_risk = self.build_entry_leg_risk(
-            market,
+            &entry_market,
             HedgeLeg::Long,
             candidate.long_venue,
             &candidate.symbol,
@@ -2706,7 +2749,7 @@ impl Engine {
         );
         let long_leg_notional_quote = order_request_notional_quote(&long_leg.request);
         let short_risk = self.build_entry_leg_risk(
-            market,
+            &entry_market,
             HedgeLeg::Short,
             candidate.short_venue,
             &candidate.symbol,
@@ -2769,6 +2812,28 @@ impl Engine {
             );
             return Ok(());
         }
+        let selected_to_first_submit_ms = duration_ms_u64(entry_started_at.elapsed());
+        let request_build_ms = selected_to_first_submit_ms
+            .saturating_sub(proactive_entry_quote_refresh_ms)
+            .saturating_sub(quantity_plan_ms);
+        self.log_event(
+            "execution.entry_prepare_timing",
+            &json!({
+                "position_id": &position_id,
+                "pair_id": &candidate.pair_id,
+                "symbol": &candidate.symbol,
+                "first_stage": first_leg.leg.entry_stage(),
+                "first_venue": first_leg.venue,
+                "second_stage": second_leg.leg.entry_stage(),
+                "second_venue": second_leg.venue,
+                "selected_to_first_submit_ms": selected_to_first_submit_ms,
+                "proactive_entry_quote_refresh_ms": proactive_entry_quote_refresh_ms,
+                "proactive_entry_quote_refresh_count": quote_refresh_result.refreshed_leg_count,
+                "max_pre_refresh_quote_age_ms": quote_refresh_result.max_pre_refresh_age_ms,
+                "quantity_plan_ms": quantity_plan_ms,
+                "request_build_ms": request_build_ms,
+            }),
+        );
 
         let (first_fill, first_latency_ms) = match self
             .execute_order_leg(
@@ -2792,7 +2857,7 @@ impl Engine {
                         &position_id,
                         Some(&candidate.pair_id),
                         first_leg.leg.cleanup_stage(),
-                        market,
+                        &entry_market,
                     )
                     .await
                 } else {
@@ -2858,7 +2923,7 @@ impl Engine {
                         &position_id,
                         Some(&candidate.pair_id),
                         first_leg.leg.compensate_stage(),
-                        market,
+                        &entry_market,
                     )
                     .await;
                 let failed_leg_cleanup = if order_error_may_have_created_exposure(&error) {
@@ -2868,7 +2933,7 @@ impl Engine {
                         &position_id,
                         Some(&candidate.pair_id),
                         second_leg.leg.cleanup_stage(),
-                        market,
+                        &entry_market,
                     )
                     .await
                 } else {
@@ -4349,12 +4414,9 @@ impl Engine {
 
     fn runtime_entry_gate_reason(
         &self,
-        market: &MarketView,
+        _market: &MarketView,
         candidate: &CandidateOpportunity,
     ) -> Option<String> {
-        if let Some(reason) = self.runtime_entry_quote_freshness_reason(market, candidate) {
-            return Some(reason);
-        }
         if candidate.long_venue == Venue::Hyperliquid || candidate.short_venue == Venue::Hyperliquid
         {
             if let Some(samples) = self.recent_submit_ack_ms.get(&Venue::Hyperliquid) {
@@ -4380,6 +4442,154 @@ impl Engine {
         self.venue_entry_cooldown_reason(candidate.long_venue)
             .or_else(|| self.venue_entry_cooldown_reason(candidate.short_venue))
             .or_else(|| self.cached_entry_balance_reason(candidate))
+    }
+
+    async fn refresh_entry_candidate_quotes_if_needed(
+        &mut self,
+        candidate: &CandidateOpportunity,
+        position_id: &str,
+        market: &mut MarketView,
+    ) -> Result<EntryQuoteRefreshResult> {
+        let mut stale_legs = self.stale_entry_candidate_legs(market, candidate);
+        if stale_legs.is_empty() {
+            return Ok(EntryQuoteRefreshResult::default());
+        }
+        let max_pre_refresh_age_ms = stale_legs.iter().filter_map(|leg| leg.age_ms).max();
+        let mut refreshed_leg_count = 0;
+
+        for leg in stale_legs.drain(..) {
+            let venue = leg.venue;
+            let side = leg.side;
+            let stage = leg.stage;
+            let expired_reason = leg.expired_reason;
+            let snapshot = match self
+                .adapter(venue)?
+                .refresh_market_snapshot(&candidate.symbol)
+                .await
+            {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    self.log_event(
+                        "execution.entry_quote_refresh_failed",
+                        &json!({
+                            "position_id": position_id,
+                            "pair_id": &candidate.pair_id,
+                            "stage": stage,
+                            "venue": venue,
+                            "symbol": &candidate.symbol,
+                            "side": side,
+                            "expired_reason": expired_reason,
+                            "error": error.to_string(),
+                        }),
+                    );
+                    return Ok(EntryQuoteRefreshResult {
+                        block_reason: Some(format!("entry_quote_refresh_failed:{venue}:{error}")),
+                        refreshed_leg_count,
+                        max_pre_refresh_age_ms,
+                    });
+                }
+            };
+            let (price_hint, refreshed_observed_at_ms) =
+                match quote_fill(&snapshot, &candidate.symbol, side) {
+                    Ok(fill) => fill,
+                    Err(error) => {
+                        self.log_event(
+                            "execution.entry_quote_refresh_failed",
+                            &json!({
+                                "position_id": position_id,
+                                "pair_id": &candidate.pair_id,
+                                "stage": stage,
+                                "venue": venue,
+                                "symbol": &candidate.symbol,
+                                "side": side,
+                                "expired_reason": expired_reason,
+                                "error": error.to_string(),
+                            }),
+                        );
+                        return Ok(EntryQuoteRefreshResult {
+                            block_reason: Some(format!(
+                                "entry_quote_refresh_failed:{venue}:{error}"
+                            )),
+                            refreshed_leg_count,
+                            max_pre_refresh_age_ms,
+                        });
+                    }
+                };
+            let previous_observed_at_ms = market.observed_at_ms(venue);
+            market.merge_snapshot(snapshot);
+            refreshed_leg_count += 1;
+            self.log_event(
+                "execution.entry_quote_refreshed",
+                &json!({
+                    "position_id": position_id,
+                    "pair_id": &candidate.pair_id,
+                    "stage": stage,
+                    "venue": venue,
+                    "symbol": &candidate.symbol,
+                    "side": side,
+                    "expired_reason": expired_reason,
+                    "previous_observed_at_ms": previous_observed_at_ms,
+                    "refreshed_observed_at_ms": refreshed_observed_at_ms,
+                    "price_hint": price_hint,
+                }),
+            );
+        }
+
+        Ok(EntryQuoteRefreshResult {
+            block_reason: self.runtime_entry_quote_freshness_reason(market, candidate),
+            refreshed_leg_count,
+            max_pre_refresh_age_ms,
+        })
+    }
+
+    fn stale_entry_candidate_legs(
+        &self,
+        market: &MarketView,
+        candidate: &CandidateOpportunity,
+    ) -> Vec<EntryQuoteRefreshLeg> {
+        let max_order_quote_age_ms = self.config.runtime.max_order_quote_age_ms;
+        if !matches!(self.config.runtime.mode, crate::config::RuntimeMode::Live)
+            || max_order_quote_age_ms <= 0
+        {
+            return Vec::new();
+        }
+        let proactive_refresh_quote_age_ms =
+            max_order_quote_age_ms.saturating_mul(PROACTIVE_ENTRY_QUOTE_REFRESH_MULTIPLIER);
+        if proactive_refresh_quote_age_ms <= 0 {
+            return Vec::new();
+        }
+
+        let mut stale = Vec::new();
+        for (venue, side, stage) in [
+            (candidate.long_venue, Side::Buy, "entry_long"),
+            (candidate.short_venue, Side::Sell, "entry_short"),
+        ] {
+            let Some(observed_at_ms) = market.observed_at_ms(venue) else {
+                stale.push(EntryQuoteRefreshLeg {
+                    venue,
+                    side,
+                    stage,
+                    expired_reason: format!(
+                        "entry_quote_stale:{venue}:missing>{proactive_refresh_quote_age_ms}"
+                    ),
+                    age_ms: None,
+                });
+                continue;
+            };
+            let age_ms = wall_clock_now_ms().saturating_sub(observed_at_ms);
+            if age_ms > proactive_refresh_quote_age_ms {
+                stale.push(EntryQuoteRefreshLeg {
+                    venue,
+                    side,
+                    stage,
+                    expired_reason: format!(
+                        "entry_quote_stale:{venue}:{age_ms}>{proactive_refresh_quote_age_ms}"
+                    ),
+                    age_ms: Some(age_ms),
+                });
+            }
+        }
+        stale
     }
 
     fn runtime_entry_quote_freshness_reason(

@@ -63,4 +63,14 @@ impl MarketView {
             symbols: vec![self.symbol(venue, symbol)?.clone()],
         })
     }
+
+    pub fn merge_snapshot(&mut self, snapshot: VenueMarketSnapshot) {
+        self.now_ms = self.now_ms.max(snapshot.observed_at_ms);
+        self.observed_at_by_venue
+            .insert(snapshot.venue, snapshot.observed_at_ms);
+        for symbol in snapshot.symbols {
+            self.symbols
+                .insert((snapshot.venue, symbol.symbol.clone()), symbol);
+        }
+    }
 }
