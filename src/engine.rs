@@ -177,6 +177,7 @@ pub struct Engine {
     market_data_activated_at_ms: Option<i64>,
     last_no_entry_diagnostics: Option<NoEntryDiagnosticsLogState>,
     repeated_failure_logs: BTreeMap<String, RepeatedFailureLogState>,
+    cached_live_entry_venue_filter: Option<CachedLiveEntryVenueFilter>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -457,6 +458,22 @@ struct RepeatedFailureLogState {
     suppressed_count: usize,
 }
 
+#[derive(Clone, Debug)]
+struct LiveEntryVenueStatus {
+    eligible: bool,
+    reason: String,
+    effective_balance_quote: Option<f64>,
+    equity_quote: Option<f64>,
+    available_balance_quote: Option<f64>,
+    error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct CachedLiveEntryVenueFilter {
+    observed_at_ms: i64,
+    eligible_venues: BTreeSet<Venue>,
+}
+
 const FLAT_RECOVERY_PROBE_INTERVAL_MS: i64 = 30_000;
 const RUNNING_SLOT_RECONCILE_INTERVAL_MS: i64 = 10_000;
 const ORDER_HEALTH_WINDOW_SIZE: usize = 20;
@@ -466,6 +483,8 @@ const NO_ENTRY_DIAGNOSTIC_SAMPLE_INTERVAL_CYCLES: u64 = 10;
 const REPEATED_FAILURE_LOG_SAMPLE_INTERVAL_CYCLES: u64 = 20;
 const REPEATED_FAILURE_LOG_RETENTION_CYCLES: u64 = 200;
 const RECONCILIATION_SUMMARY_ONLY_DELTA_QUOTE: f64 = 0.05;
+const LIVE_ENTRY_VENUE_FILTER_TTL_MS: i64 = 60_000;
+const MIN_LIVE_ENTRY_VENUE_BALANCE_QUOTE: f64 = 50.0;
 
 fn default_exit_after_first_stage() -> bool {
     true
@@ -479,8 +498,10 @@ fn entry_selection_target(remaining_slots: usize) -> usize {
 
 fn perp_liquidity_thresholds(venue: Venue) -> (f64, f64) {
     let min_volume_24h_quote = match venue {
-        Venue::Hyperliquid => HYPERLIQUID_MIN_PERP_VOLUME_24H_QUOTE,
-        Venue::Binance | Venue::Okx | Venue::Bybit => CEX_MIN_PERP_VOLUME_24H_QUOTE,
+        Venue::Hyperliquid | Venue::Aster => HYPERLIQUID_MIN_PERP_VOLUME_24H_QUOTE,
+        Venue::Binance | Venue::Okx | Venue::Bybit | Venue::Bitget | Venue::Gate => {
+            CEX_MIN_PERP_VOLUME_24H_QUOTE
+        }
     };
     (min_volume_24h_quote, MIN_PERP_OPEN_INTEREST_QUOTE)
 }
@@ -550,6 +571,7 @@ impl Engine {
             market_data_activated_at_ms: None,
             last_no_entry_diagnostics: None,
             repeated_failure_logs: BTreeMap::new(),
+            cached_live_entry_venue_filter: None,
         };
         engine.finalize_startup_position_recovery().await?;
         engine.initialize_scan_symbols(cached_scan_symbol_state.as_ref());
@@ -813,7 +835,18 @@ impl Engine {
                 return Ok(());
             }
         }
-        let market = match self.fetch_market_view().await {
+        let live_entry_venue_filter =
+            if matches!(self.config.runtime.mode, crate::config::RuntimeMode::Live)
+                && self.active_positions().is_empty()
+            {
+                Some(self.live_entry_venue_filter(tick_started_at_ms).await)
+            } else {
+                None
+            };
+        let market = match self
+            .fetch_market_view(live_entry_venue_filter.as_ref().map(|item| &item.eligible_venues))
+            .await
+        {
             Ok(market) => market,
             Err(error) => {
                 if !self.active_positions().is_empty() {
@@ -892,6 +925,12 @@ impl Engine {
             let transfer_statuses = self.fetch_transfer_status_view().await;
             let mut scan_config = self.config.clone();
             scan_config.symbols = self.active_scan_symbols().to_vec();
+            if let Some(filter) = live_entry_venue_filter.as_ref() {
+                self.apply_live_entry_venue_filter_to_scan_config(
+                    &mut scan_config,
+                    &filter.eligible_venues,
+                );
+            }
             let mut candidates = discover_candidates(
                 &scan_config,
                 &market,
@@ -1002,13 +1041,24 @@ impl Engine {
             .append_critical(self.normalize_journal_ts_ms(ts_ms), kind, payload)
     }
 
-    async fn fetch_market_view(&mut self) -> Result<MarketView> {
+    async fn fetch_market_view(
+        &mut self,
+        allowed_venues: Option<&BTreeSet<Venue>>,
+    ) -> Result<MarketView> {
         let symbols = self.active_scan_symbols().to_vec();
-        let futures = self.adapters.iter().map(|(venue, adapter)| {
-            let adapter = Arc::clone(adapter);
-            let symbols = symbols.clone();
-            async move { (*venue, adapter.fetch_market_snapshot(&symbols).await) }
-        });
+        let futures = self
+            .adapters
+            .iter()
+            .filter(|(venue, _)| {
+                allowed_venues
+                    .map(|allowed| allowed.contains(venue))
+                    .unwrap_or(true)
+            })
+            .map(|(venue, adapter)| {
+                let adapter = Arc::clone(adapter);
+                let symbols = symbols.clone();
+                async move { (*venue, adapter.fetch_market_snapshot(&symbols).await) }
+            });
 
         let mut snapshots = Vec::new();
         let mut saw_hard_failure = false;
@@ -1041,6 +1091,121 @@ impl Engine {
             return Ok(MarketView::empty(now_ms()));
         }
         Ok(MarketView::from_snapshots(snapshots))
+    }
+
+    fn apply_live_entry_venue_filter_to_scan_config(
+        &self,
+        scan_config: &mut AppConfig,
+        eligible_venues: &BTreeSet<Venue>,
+    ) {
+        scan_config
+            .venues
+            .retain(|venue| eligible_venues.contains(&venue.venue));
+        scan_config
+            .directed_pairs
+            .retain(|pair| {
+                eligible_venues.contains(&pair.long) && eligible_venues.contains(&pair.short)
+            });
+    }
+
+    async fn live_entry_venue_filter(&mut self, now_ms: i64) -> CachedLiveEntryVenueFilter {
+        if let Some(cache) = self.cached_live_entry_venue_filter.as_ref() {
+            if now_ms.saturating_sub(cache.observed_at_ms) <= LIVE_ENTRY_VENUE_FILTER_TTL_MS {
+                return cache.clone();
+            }
+        }
+
+        let mut statuses = BTreeMap::new();
+        let mut eligible_venues = BTreeSet::new();
+        for (venue, adapter) in &self.adapters {
+            if !adapter.enforces_entry_balance_gate() {
+                eligible_venues.insert(*venue);
+                statuses.insert(
+                    *venue,
+                    LiveEntryVenueStatus {
+                        eligible: true,
+                        reason: "gate_not_enforced".to_string(),
+                        effective_balance_quote: None,
+                        equity_quote: None,
+                        available_balance_quote: None,
+                        error: None,
+                    },
+                );
+                continue;
+            }
+
+            let status = match adapter.fetch_account_balance_snapshot().await {
+                Ok(Some(snapshot)) => {
+                    let effective_balance_quote = snapshot
+                        .available_balance_quote
+                        .unwrap_or(snapshot.equity_quote);
+                    let eligible = effective_balance_quote >= MIN_LIVE_ENTRY_VENUE_BALANCE_QUOTE;
+                    if eligible {
+                        eligible_venues.insert(*venue);
+                    }
+                    LiveEntryVenueStatus {
+                        eligible,
+                        reason: if eligible {
+                            "eligible".to_string()
+                        } else {
+                            "balance_below_minimum".to_string()
+                        },
+                        effective_balance_quote: Some(effective_balance_quote),
+                        equity_quote: Some(snapshot.equity_quote),
+                        available_balance_quote: snapshot.available_balance_quote,
+                        error: None,
+                    }
+                }
+                Ok(None) => LiveEntryVenueStatus {
+                    eligible: false,
+                    reason: "account_balance_snapshot_unavailable".to_string(),
+                    effective_balance_quote: None,
+                    equity_quote: None,
+                    available_balance_quote: None,
+                    error: None,
+                },
+                Err(error) => LiveEntryVenueStatus {
+                    eligible: false,
+                    reason: "account_balance_fetch_failed".to_string(),
+                    effective_balance_quote: None,
+                    equity_quote: None,
+                    available_balance_quote: None,
+                    error: Some(error.to_string()),
+                },
+            };
+            statuses.insert(*venue, status);
+        }
+
+        let payload_statuses = statuses
+            .iter()
+            .map(|(venue, status)| {
+                json!({
+                    "venue": venue,
+                    "eligible": status.eligible,
+                    "reason": status.reason,
+                    "effective_balance_quote": status.effective_balance_quote,
+                    "equity_quote": status.equity_quote,
+                    "available_balance_quote": status.available_balance_quote,
+                    "error": status.error,
+                })
+            })
+            .collect::<Vec<_>>();
+        let _ = self.log_critical_event_at(
+            now_ms,
+            "runtime.entry_venue_filter.refreshed",
+            &json!({
+                "minimum_balance_quote": MIN_LIVE_ENTRY_VENUE_BALANCE_QUOTE,
+                "eligible_venues": eligible_venues.iter().copied().collect::<Vec<_>>(),
+                "statuses": payload_statuses,
+            }),
+        );
+
+        let cache = CachedLiveEntryVenueFilter {
+            observed_at_ms: now_ms,
+            eligible_venues,
+        };
+        self.cached_live_entry_venue_filter = Some(cache.clone());
+        cache
     }
 
     async fn fetch_hints(&mut self) -> Option<Vec<OpportunityHint>> {

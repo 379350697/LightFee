@@ -9,10 +9,11 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use futures::future::join_all;
 use lightfee::{
-    config::RuntimeMode, strategy::discover_candidates, AppConfig, BinanceLiveAdapter,
-    BybitLiveAdapter, CandidateOpportunity, ChillybotOpportunitySource, FeedgrabChillybotSource,
-    FundingOpportunityType, MarketView, OkxLiveAdapter, OpportunityHintSource, OrderFill,
-    OrderRequest, Side, TransferStatusSource, TransferStatusView, Venue, VenueAdapter,
+    config::RuntimeMode, strategy::discover_candidates, AppConfig, AsterLiveAdapter,
+    BinanceLiveAdapter, BitgetLiveAdapter, BybitLiveAdapter, CandidateOpportunity, ChillybotOpportunitySource,
+    FeedgrabChillybotSource, FundingOpportunityType, GateLiveAdapter, MarketView,
+    OkxLiveAdapter, OpportunityHintSource, OrderFill, OrderRequest, Side, TransferStatusSource,
+    TransferStatusView, Venue, VenueAdapter,
 };
 use tokio::time::{sleep, Duration};
 
@@ -298,6 +299,15 @@ async fn build_live_adapters(config: &AppConfig) -> Result<Vec<Arc<dyn VenueAdap
             Venue::Bybit => Arc::new(
                 BybitLiveAdapter::new(venue_config, &config.runtime, &config.symbols).await?,
             ),
+            Venue::Bitget => Arc::new(
+                BitgetLiveAdapter::new(venue_config, &config.runtime, &config.symbols).await?,
+            ),
+            Venue::Gate => Arc::new(
+                GateLiveAdapter::new(venue_config, &config.runtime, &config.symbols).await?,
+            ),
+            Venue::Aster => Arc::new(
+                AsterLiveAdapter::new(venue_config, &config.runtime, &config.symbols).await?,
+            ),
             Venue::Hyperliquid => Arc::new(
                 lightfee::HyperliquidLiveAdapter::new(
                     venue_config,
@@ -502,6 +512,9 @@ fn venue_code(venue: Venue) -> &'static str {
         Venue::Binance => "bn",
         Venue::Okx => "ok",
         Venue::Bybit => "by",
+        Venue::Bitget => "bg",
+        Venue::Gate => "gt",
+        Venue::Aster => "as",
         Venue::Hyperliquid => "hl",
     }
 }

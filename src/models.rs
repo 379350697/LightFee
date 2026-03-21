@@ -11,6 +11,9 @@ pub enum Venue {
     Binance,
     Okx,
     Bybit,
+    Bitget,
+    Gate,
+    Aster,
     Hyperliquid,
 }
 
@@ -20,6 +23,9 @@ impl Venue {
             Self::Binance => "binance",
             Self::Okx => "okx",
             Self::Bybit => "bybit",
+            Self::Bitget => "bitget",
+            Self::Gate => "gate",
+            Self::Aster => "aster",
             Self::Hyperliquid => "hyperliquid",
         }
     }
@@ -39,6 +45,9 @@ impl FromStr for Venue {
             "binance" => Ok(Self::Binance),
             "okx" => Ok(Self::Okx),
             "bybit" => Ok(Self::Bybit),
+            "bitget" => Ok(Self::Bitget),
+            "gate" | "gateio" | "gate_io" => Ok(Self::Gate),
+            "aster" => Ok(Self::Aster),
             "hyperliquid" => Ok(Self::Hyperliquid),
             other => Err(format!("unsupported venue: {other}")),
         }

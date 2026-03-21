@@ -8,9 +8,9 @@ use anyhow::{anyhow, Context, Result};
 use chrono::{Duration, Local, NaiveDate};
 use lightfee::{
     analyze_daily_journal_file, config::RuntimeMode, AccountBalanceSnapshot, AppConfig,
-    BalanceSnapshotFailure, BalanceSnapshotReport, BinanceLiveAdapter, BybitLiveAdapter,
-    DailyProfitSummary, HyperliquidLiveAdapter, JsonlJournal, OkxLiveAdapter, ScriptedVenueAdapter,
-    Venue, VenueAdapter,
+    AsterLiveAdapter, BalanceSnapshotFailure, BalanceSnapshotReport, BinanceLiveAdapter, BitgetLiveAdapter,
+    BybitLiveAdapter, DailyProfitSummary, GateLiveAdapter, HyperliquidLiveAdapter, JsonlJournal,
+    OkxLiveAdapter, ScriptedVenueAdapter, Venue, VenueAdapter,
 };
 use serde::Serialize;
 
@@ -201,6 +201,15 @@ async fn build_adapter_for_report(
             }
             Venue::Bybit => Arc::new(
                 BybitLiveAdapter::new(venue_config, &config.runtime, &config.symbols).await?,
+            ),
+            Venue::Bitget => Arc::new(
+                BitgetLiveAdapter::new(venue_config, &config.runtime, &config.symbols).await?,
+            ),
+            Venue::Gate => Arc::new(
+                GateLiveAdapter::new(venue_config, &config.runtime, &config.symbols).await?,
+            ),
+            Venue::Aster => Arc::new(
+                AsterLiveAdapter::new(venue_config, &config.runtime, &config.symbols).await?,
             ),
             Venue::Hyperliquid => Arc::new(
                 HyperliquidLiveAdapter::new(venue_config, &config.runtime, &config.symbols).await?,

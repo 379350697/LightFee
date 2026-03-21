@@ -32,6 +32,10 @@ pub trait VenueAdapter: Send + Sync {
         Ok(None)
     }
 
+    fn enforces_entry_balance_gate(&self) -> bool {
+        false
+    }
+
     async fn fetch_order_fill_reconciliation(
         &self,
         _symbol: &str,

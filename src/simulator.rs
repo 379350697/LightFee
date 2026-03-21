@@ -29,6 +29,8 @@ pub struct ScriptedVenueAdapter {
     taker_fee_bps: f64,
     min_notional_quote_hint: Option<f64>,
     balance_snapshot: Option<AccountBalanceSnapshot>,
+    balance_fetch_error: Option<String>,
+    enforce_entry_balance_gate: bool,
     inner: Mutex<Inner>,
 }
 
@@ -39,6 +41,8 @@ impl ScriptedVenueAdapter {
             taker_fee_bps,
             min_notional_quote_hint: None,
             balance_snapshot: None,
+            balance_fetch_error: None,
+            enforce_entry_balance_gate: false,
             inner: Mutex::new(Inner {
                 snapshots,
                 cursor: 0,
@@ -78,6 +82,16 @@ impl ScriptedVenueAdapter {
             available_balance_quote,
             observed_at_ms: 0,
         });
+        self
+    }
+
+    pub fn with_balance_fetch_error(mut self, error: &str) -> Self {
+        self.balance_fetch_error = Some(error.to_string());
+        self
+    }
+
+    pub fn with_entry_balance_gate(mut self) -> Self {
+        self.enforce_entry_balance_gate = true;
         self
     }
 
@@ -253,7 +267,14 @@ impl VenueAdapter for ScriptedVenueAdapter {
     }
 
     async fn fetch_account_balance_snapshot(&self) -> Result<Option<AccountBalanceSnapshot>> {
+        if let Some(error) = self.balance_fetch_error.as_ref() {
+            return Err(anyhow!(error.clone()));
+        }
         Ok(self.balance_snapshot.clone())
+    }
+
+    fn enforces_entry_balance_gate(&self) -> bool {
+        self.enforce_entry_balance_gate
     }
 
     async fn normalize_quantity(&self, _symbol: &str, quantity: f64) -> Result<f64> {

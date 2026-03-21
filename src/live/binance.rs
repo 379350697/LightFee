@@ -1009,6 +1009,10 @@ impl VenueAdapter for BinanceLiveAdapter {
         }))
     }
 
+    fn enforces_entry_balance_gate(&self) -> bool {
+        true
+    }
+
     async fn fetch_order_fill_reconciliation(
         &self,
         symbol: &str,

@@ -2768,6 +2768,200 @@ async fn repeated_soft_market_failures_are_aggregated_across_ticks() {
 }
 
 #[tokio::test]
+async fn live_scan_skips_venues_with_balance_below_minimum() {
+    let temp = TempDir::new().expect("tempdir");
+    let mut config = test_config(&temp, false);
+    config.runtime.mode = RuntimeMode::Live;
+    config.strategy.entry_window_secs = 3_600;
+    config.symbols = vec!["BTCUSDT".to_string()];
+    config.venues = vec![venue(Venue::Binance, 0.5), venue(Venue::Okx, 0.5)];
+    config.directed_pairs = vec![DirectedPairConfig {
+        long: Venue::Binance,
+        short: Venue::Okx,
+        symbols: config.symbols.clone(),
+    }];
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let funding_timestamp_ms = now_ms + 60_000;
+
+    let binance = Arc::new(
+        ScriptedVenueAdapter::new(
+            Venue::Binance,
+            0.5,
+            vec![venue_snapshot(
+                Venue::Binance,
+                now_ms,
+                vec![symbol_snapshot(
+                    "BTCUSDT",
+                    100.0,
+                    100.1,
+                    500.0,
+                    500.0,
+                    -0.0005,
+                    funding_timestamp_ms,
+                )],
+            )],
+        )
+        .with_balance_snapshot(120.0, Some(120.0), Some(120.0))
+        .with_entry_balance_gate(),
+    );
+    let okx = Arc::new(
+        ScriptedVenueAdapter::new(
+            Venue::Okx,
+            0.5,
+            vec![venue_snapshot(
+                Venue::Okx,
+                now_ms,
+                vec![symbol_snapshot(
+                    "BTCUSDT",
+                    100.2,
+                    100.3,
+                    500.0,
+                    500.0,
+                    0.0015,
+                    funding_timestamp_ms,
+                )],
+            )],
+        )
+        .with_balance_snapshot(40.0, Some(40.0), Some(40.0))
+        .with_entry_balance_gate(),
+    );
+
+    let mut engine = Engine::new(
+        config.clone(),
+        vec![
+            binance as Arc<dyn VenueAdapter>,
+            okx as Arc<dyn VenueAdapter>,
+        ],
+    )
+    .await
+    .expect("engine");
+
+    engine.tick().await.expect("tick");
+    sleep(Duration::from_millis(100)).await;
+
+    let scan = engine.state().last_scan.as_ref().expect("scan");
+    assert_eq!(scan.candidate_count, 0);
+    assert_eq!(scan.tradeable_count, 0);
+
+    let records = read_event_records(&config.persistence.event_log_path);
+    let filter_event = records
+        .iter()
+        .find(|record| record_kind(record) == Some("runtime.entry_venue_filter.refreshed"))
+        .expect("filter event");
+    let statuses = filter_event["payload"]["statuses"]
+        .as_array()
+        .expect("statuses");
+    let okx_status = statuses
+        .iter()
+        .find(|item| item["venue"] == "okx")
+        .expect("okx status");
+    assert_eq!(okx_status["eligible"], false);
+    assert_eq!(okx_status["reason"], "balance_below_minimum");
+    assert_eq!(
+        okx_status["effective_balance_quote"].as_f64(),
+        Some(40.0)
+    );
+}
+
+#[tokio::test]
+async fn live_scan_skips_venues_with_balance_fetch_failures() {
+    let temp = TempDir::new().expect("tempdir");
+    let mut config = test_config(&temp, false);
+    config.runtime.mode = RuntimeMode::Live;
+    config.strategy.entry_window_secs = 3_600;
+    config.symbols = vec!["BTCUSDT".to_string()];
+    config.venues = vec![venue(Venue::Binance, 0.5), venue(Venue::Okx, 0.5)];
+    config.directed_pairs = vec![DirectedPairConfig {
+        long: Venue::Binance,
+        short: Venue::Okx,
+        symbols: config.symbols.clone(),
+    }];
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let funding_timestamp_ms = now_ms + 60_000;
+
+    let binance = Arc::new(
+        ScriptedVenueAdapter::new(
+            Venue::Binance,
+            0.5,
+            vec![venue_snapshot(
+                Venue::Binance,
+                now_ms,
+                vec![symbol_snapshot(
+                    "BTCUSDT",
+                    100.0,
+                    100.1,
+                    500.0,
+                    500.0,
+                    -0.0005,
+                    funding_timestamp_ms,
+                )],
+            )],
+        )
+        .with_balance_snapshot(120.0, Some(120.0), Some(120.0))
+        .with_entry_balance_gate(),
+    );
+    let okx = Arc::new(
+        ScriptedVenueAdapter::new(
+            Venue::Okx,
+            0.5,
+            vec![venue_snapshot(
+                Venue::Okx,
+                now_ms,
+                vec![symbol_snapshot(
+                    "BTCUSDT",
+                    100.2,
+                    100.3,
+                    500.0,
+                    500.0,
+                    0.0015,
+                    funding_timestamp_ms,
+                )],
+            )],
+        )
+        .with_balance_fetch_error("okx login failed: code=50113 msg=invalid signature")
+        .with_entry_balance_gate(),
+    );
+
+    let mut engine = Engine::new(
+        config.clone(),
+        vec![
+            binance as Arc<dyn VenueAdapter>,
+            okx as Arc<dyn VenueAdapter>,
+        ],
+    )
+    .await
+    .expect("engine");
+
+    engine.tick().await.expect("tick");
+    sleep(Duration::from_millis(100)).await;
+
+    let scan = engine.state().last_scan.as_ref().expect("scan");
+    assert_eq!(scan.candidate_count, 0);
+    assert_eq!(scan.tradeable_count, 0);
+
+    let records = read_event_records(&config.persistence.event_log_path);
+    let filter_event = records
+        .iter()
+        .find(|record| record_kind(record) == Some("runtime.entry_venue_filter.refreshed"))
+        .expect("filter event");
+    let statuses = filter_event["payload"]["statuses"]
+        .as_array()
+        .expect("statuses");
+    let okx_status = statuses
+        .iter()
+        .find(|item| item["venue"] == "okx")
+        .expect("okx status");
+    assert_eq!(okx_status["eligible"], false);
+    assert_eq!(okx_status["reason"], "account_balance_fetch_failed");
+    assert!(
+        okx_status["error"]
+            .as_str()
+            .expect("error")
+            .contains("code=50113")
+    );
+}
+
+#[tokio::test]
 async fn hard_market_failures_on_all_venues_still_fail_tick() {
     let temp = TempDir::new().expect("tempdir");
     let config = test_config(&temp, false);

@@ -510,6 +510,9 @@ fn map_exchange(exchange: &str) -> Option<Venue> {
         "binance" => Some(Venue::Binance),
         "okx" => Some(Venue::Okx),
         "bybit" => Some(Venue::Bybit),
+        "bitget" => Some(Venue::Bitget),
+        "gate" | "gateio" | "gate_io" => Some(Venue::Gate),
+        "aster" => Some(Venue::Aster),
         "hyperliquid" => Some(Venue::Hyperliquid),
         _ => None,
     }

@@ -136,8 +136,10 @@ pub fn venue_symbol(config: &VenueConfig, symbol: &str) -> String {
 
     let (base, quote) = split_symbol(symbol);
     match config.venue {
-        Venue::Binance | Venue::Bybit => format!("{base}{quote}"),
+        Venue::Binance | Venue::Bybit | Venue::Aster => format!("{base}{quote}"),
         Venue::Okx => format!("{base}-{quote}-SWAP"),
+        Venue::Bitget => format!("{base}{quote}_UMCBL"),
+        Venue::Gate => format!("{base}_{quote}"),
         Venue::Hyperliquid => base,
     }
 }
@@ -169,9 +171,12 @@ fn decimals_from_step(step: f64) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use crate::models::{OrderRequest, Side};
+    use crate::{
+        config::{LiveVenueConfig, VenueConfig},
+        models::{OrderRequest, Side, Venue},
+    };
 
-    use super::{floor_to_step, hinted_fill};
+    use super::{floor_to_step, hinted_fill, venue_symbol};
 
     #[test]
     fn floor_to_step_keeps_boundary_values() {
@@ -193,5 +198,28 @@ mod tests {
         };
 
         assert_eq!(hinted_fill(&request), Some((123.45, 9_999)));
+    }
+
+    #[test]
+    fn venue_symbol_formats_bitget_and_gate_contracts() {
+        let bitget = VenueConfig {
+            venue: Venue::Bitget,
+            enabled: true,
+            taker_fee_bps: 1.0,
+            max_notional: 100.0,
+            market_data_file: None,
+            live: LiveVenueConfig::default(),
+        };
+        let gate = VenueConfig {
+            venue: Venue::Gate,
+            enabled: true,
+            taker_fee_bps: 1.0,
+            max_notional: 100.0,
+            market_data_file: None,
+            live: LiveVenueConfig::default(),
+        };
+
+        assert_eq!(venue_symbol(&bitget, "BTCUSDT"), "BTCUSDT_UMCBL");
+        assert_eq!(venue_symbol(&gate, "BTCUSDT"), "BTC_USDT");
     }
 }

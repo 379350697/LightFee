@@ -4,9 +4,10 @@ use anyhow::{Context, Result};
 use lightfee::{
     config::{OpportunitySourceMode, RuntimeMode},
     resilience::FailureBackoff,
-    AppConfig, BinanceLiveAdapter, BybitLiveAdapter, ChillybotOpportunitySource, Engine,
-    FeedgrabChillybotSource, HyperliquidLiveAdapter, OkxLiveAdapter, OpportunityHintSource,
-    ScriptedVenueAdapter, TransferStatusSource, Venue, VenueAdapter,
+    AppConfig, AsterLiveAdapter, BinanceLiveAdapter, BitgetLiveAdapter, BybitLiveAdapter,
+    ChillybotOpportunitySource, Engine, FeedgrabChillybotSource, GateLiveAdapter,
+    HyperliquidLiveAdapter, OkxLiveAdapter, OpportunityHintSource, ScriptedVenueAdapter,
+    TransferStatusSource, Venue, VenueAdapter,
 };
 use tokio::time;
 use tracing::{error, info};
@@ -232,6 +233,15 @@ async fn build_live_adapters(config: &AppConfig) -> Result<Vec<Arc<dyn VenueAdap
             }
             Venue::Bybit => Arc::new(
                 BybitLiveAdapter::new(venue_config, &config.runtime, &config.symbols).await?,
+            ),
+            Venue::Bitget => Arc::new(
+                BitgetLiveAdapter::new(venue_config, &config.runtime, &config.symbols).await?,
+            ),
+            Venue::Gate => Arc::new(
+                GateLiveAdapter::new(venue_config, &config.runtime, &config.symbols).await?,
+            ),
+            Venue::Aster => Arc::new(
+                AsterLiveAdapter::new(venue_config, &config.runtime, &config.symbols).await?,
             ),
             Venue::Hyperliquid => Arc::new(
                 HyperliquidLiveAdapter::new(venue_config, &config.runtime, &config.symbols).await?,

@@ -26,7 +26,10 @@ pub use config::{
 };
 pub use engine::{Engine, EngineMode, EngineState, OpenPosition, ScanSnapshot};
 pub use journal::{scan_path_records, JournalRecord, JournalRuntimeMetricsSnapshot, JsonlJournal};
-pub use live::{BinanceLiveAdapter, BybitLiveAdapter, HyperliquidLiveAdapter, OkxLiveAdapter};
+pub use live::{
+    AsterLiveAdapter, BinanceLiveAdapter, BitgetLiveAdapter, BybitLiveAdapter, GateLiveAdapter,
+    HyperliquidLiveAdapter, OkxLiveAdapter,
+};
 pub use market::MarketView;
 pub use models::{
     AccountBalanceSnapshot, AssetTransferStatus, CandidateOpportunity, FundingLeg,

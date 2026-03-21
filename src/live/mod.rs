@@ -1,14 +1,20 @@
+mod aster;
 mod binance;
+mod bitget;
 mod bybit;
 mod cache;
 mod common;
+mod gate;
 mod hyperliquid;
 mod okx;
 mod private_ws;
 mod ws;
 
+pub use aster::AsterLiveAdapter;
 pub use binance::BinanceLiveAdapter;
+pub use bitget::BitgetLiveAdapter;
 pub use bybit::BybitLiveAdapter;
+pub use gate::GateLiveAdapter;
 pub use hyperliquid::HyperliquidLiveAdapter;
 pub use okx::OkxLiveAdapter;
 
