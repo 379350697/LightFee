@@ -188,9 +188,11 @@ struct QuantityPlan {
 struct CloseExecution {
     short_fill: crate::models::OrderFill,
     short_client_order_id: String,
+    short_submit_started_at_ms: i64,
     short_latency_ms: u64,
     long_fill: crate::models::OrderFill,
     long_client_order_id: String,
+    long_submit_started_at_ms: i64,
     long_latency_ms: u64,
     realized_price_pnl_quote: f64,
     total_exit_fee_quote: f64,
@@ -2477,6 +2479,7 @@ impl Engine {
                     position_id,
                     &reason,
                     close_plan.quantity,
+                    evaluation_now_ms,
                     &position_market,
                 )
                 .await?;
@@ -3303,6 +3306,7 @@ impl Engine {
         };
         let long_client_order_id = long_close.client_order_id.clone();
 
+        let short_submit_started_at_ms = wall_clock_now_ms();
         let (short_fill, short_latency_ms) = self
             .execute_order_leg(
                 position.short_venue,
@@ -3314,6 +3318,7 @@ impl Engine {
                 },
             )
             .await?;
+        let long_submit_started_at_ms = wall_clock_now_ms();
         let (long_fill, long_latency_ms) = self
             .execute_order_leg(
                 position.long_venue,
@@ -3334,9 +3339,11 @@ impl Engine {
         Ok(CloseExecution {
             short_fill,
             short_client_order_id,
+            short_submit_started_at_ms,
             short_latency_ms,
             long_fill,
             long_client_order_id,
+            long_submit_started_at_ms,
             long_latency_ms,
             realized_price_pnl_quote,
             total_exit_fee_quote,
@@ -3348,6 +3355,7 @@ impl Engine {
         position_id: &str,
         reason: &str,
         quantity: f64,
+        triggered_at_ms: i64,
         market: &MarketView,
     ) -> Result<()> {
         let Some(position) = self
@@ -3368,6 +3376,21 @@ impl Engine {
                 "partial_exit_long",
             )
             .await?;
+        self.log_event(
+            "execution.partial_exit_prepare_timing",
+            &json!({
+                "position_id": &position.position_id,
+                "symbol": &position.symbol,
+                "reason": reason,
+                "funding_timestamp_ms": position.funding_timestamp_ms,
+                "partial_close_triggered_at_ms": triggered_at_ms,
+                "first_close_order_submitted_at_ms": execution.short_submit_started_at_ms,
+                "second_close_order_submitted_at_ms": execution.long_submit_started_at_ms,
+                "settlement_to_trigger_ms": triggered_at_ms.saturating_sub(position.funding_timestamp_ms),
+                "trigger_to_submit_ms": execution.short_submit_started_at_ms.saturating_sub(triggered_at_ms),
+                "settlement_to_first_submit_ms": execution.short_submit_started_at_ms.saturating_sub(position.funding_timestamp_ms),
+            }),
+        );
         let closed_quantity = execution
             .short_fill
             .quantity

@@ -46,7 +46,7 @@ pub struct BybitLiveAdapter {
     supported_symbols: Mutex<HashSet<String>>,
     transfer_status_cache: Mutex<Option<BybitTransferStatusCache>>,
     time_offset_ms: Mutex<Option<i64>>,
-    position_mode: Arc<Mutex<Option<BybitPositionMode>>>,
+    position_modes: Arc<Mutex<HashMap<String, BybitPositionMode>>>,
     market_ws: Arc<WsMarketState>,
     market_subscription_symbols: Mutex<Vec<String>>,
     private_ws: Arc<WsPrivateState>,
@@ -98,7 +98,7 @@ impl BybitLiveAdapter {
             supported_symbols: Mutex::new(supported_symbols),
             transfer_status_cache: Mutex::new(transfer_status_cache),
             time_offset_ms: Mutex::new(None),
-            position_mode: Arc::new(Mutex::new(None)),
+            position_modes: Arc::new(Mutex::new(HashMap::new())),
             market_ws,
             market_subscription_symbols: Mutex::new(Vec::new()),
             private_ws: WsPrivateState::new(),
@@ -297,7 +297,7 @@ impl BybitLiveAdapter {
         let reconnect_initial_ms = self.runtime.ws_reconnect_initial_ms;
         let reconnect_max_ms = self.runtime.ws_reconnect_max_ms;
         let unhealthy_after_failures = self.runtime.ws_unhealthy_after_failures;
-        let position_mode = self.position_mode.clone();
+        let position_modes = self.position_modes.clone();
         let symbol_map = symbols
             .iter()
             .map(|symbol| (venue_symbol(&self.config, symbol), symbol.clone()))
@@ -373,7 +373,7 @@ impl BybitLiveAdapter {
                                         Some(Ok(Message::Text(text))) => {
                                             match handle_bybit_private_message(
                                                 &private_state,
-                                                &position_mode,
+                                                &position_modes,
                                                 &symbol_map,
                                                 text.as_ref(),
                                                 &mut subscribed,
@@ -775,11 +775,8 @@ impl BybitLiveAdapter {
         Ok(now_ms() + offset_ms)
     }
 
-    fn position_mode(&self) -> BybitPositionMode {
-        self.position_mode
-            .lock()
-            .expect("lock")
-            .clone()
+    fn position_mode_for_symbol(&self, symbol: &str) -> BybitPositionMode {
+        bybit_position_mode_for_symbol(&self.position_modes, symbol)
             .unwrap_or(BybitPositionMode::OneWay)
     }
 }
@@ -872,7 +869,7 @@ impl VenueAdapter for BybitLiveAdapter {
         validate_bybit_order_request(&meta, &request.symbol, quantity, request.price_hint)?;
         let order_prepare_ms = elapsed_ms(order_prepare_started_at);
 
-        let initial_mode = self.position_mode();
+        let initial_mode = self.position_mode_for_symbol(&request.symbol);
         let submit_started_at = Instant::now();
         let mut response = self
             .submit_order_once(&request, &meta, quantity, initial_mode)
@@ -888,10 +885,11 @@ impl VenueAdapter for BybitLiveAdapter {
                 .submit_order_once(&request, &meta, quantity, fallback_mode)
                 .await?;
             if fallback_response.response.ret_code == 0 {
-                self.position_mode
-                    .lock()
-                    .expect("lock")
-                    .replace(fallback_mode);
+                update_bybit_position_mode_slot(
+                    &self.position_modes,
+                    &request.symbol,
+                    Some(fallback_mode),
+                );
                 response.request_sign_ms += fallback_response.request_sign_ms;
                 response.submit_http_ms += fallback_response.submit_http_ms;
                 response.response_decode_ms += fallback_response.response_decode_ms;
@@ -1029,7 +1027,8 @@ impl VenueAdapter for BybitLiveAdapter {
             .map(|result| {
                 result.list.into_iter().try_fold(0.0, |acc, row| {
                     update_bybit_position_mode_slot(
-                        &self.position_mode,
+                        &self.position_modes,
+                        symbol,
                         bybit_position_mode_from_position_idx(row.position_idx),
                     );
                     let quantity = parse_f64(&row.size)?;
@@ -1287,7 +1286,7 @@ fn build_bybit_subscribe_messages(topics: &[String]) -> Vec<String> {
 
 fn handle_bybit_private_message(
     private_state: &Arc<WsPrivateState>,
-    position_mode: &Arc<Mutex<Option<BybitPositionMode>>>,
+    position_modes: &Arc<Mutex<HashMap<String, BybitPositionMode>>>,
     symbol_map: &HashMap<String, String>,
     raw: &str,
     subscribed: &mut bool,
@@ -1340,6 +1339,13 @@ fn handle_bybit_private_message(
                 let Some(symbol) = symbol_map.get(venue_symbol) else {
                     continue;
                 };
+                update_bybit_position_mode_slot(
+                    position_modes,
+                    symbol,
+                    bybit_position_mode_from_position_idx(
+                        row.get("positionIdx").and_then(position_idx_from_value),
+                    ),
+                );
                 private_state.record_order(PrivateOrderUpdate {
                     symbol: symbol.clone(),
                     order_id: row
@@ -1431,18 +1437,19 @@ fn handle_bybit_private_message(
                 .and_then(|value| value.as_i64())
                 .unwrap_or_else(now_ms);
             for row in data {
-                update_bybit_position_mode_slot(
-                    position_mode,
-                    bybit_position_mode_from_position_idx(
-                        row.get("positionIdx").and_then(position_idx_from_value),
-                    ),
-                );
                 let Some(venue_symbol) = row.get("symbol").and_then(|value| value.as_str()) else {
                     continue;
                 };
                 let Some(symbol) = symbol_map.get(venue_symbol) else {
                     continue;
                 };
+                update_bybit_position_mode_slot(
+                    position_modes,
+                    symbol,
+                    bybit_position_mode_from_position_idx(
+                        row.get("positionIdx").and_then(position_idx_from_value),
+                    ),
+                );
                 let size = row
                     .get("size")
                     .and_then(|value| value.as_str())
@@ -1508,20 +1515,22 @@ fn bybit_position_mode_from_position_idx(position_idx: Option<i64>) -> Option<By
     }
 }
 
+fn bybit_position_mode_for_symbol(
+    slot: &Arc<Mutex<HashMap<String, BybitPositionMode>>>,
+    symbol: &str,
+) -> Option<BybitPositionMode> {
+    slot.lock().expect("lock").get(symbol).copied()
+}
+
 fn update_bybit_position_mode_slot(
-    slot: &Arc<Mutex<Option<BybitPositionMode>>>,
+    slot: &Arc<Mutex<HashMap<String, BybitPositionMode>>>,
+    symbol: &str,
     mode: Option<BybitPositionMode>,
 ) {
     let Some(mode) = mode else {
         return;
     };
-    let mut current = slot.lock().expect("lock");
-    match (*current, mode) {
-        (Some(BybitPositionMode::Hedge), BybitPositionMode::OneWay) => {}
-        _ => {
-            current.replace(mode);
-        }
-    }
+    slot.lock().expect("lock").insert(symbol.to_string(), mode);
 }
 
 fn position_idx_from_value(value: &serde_json::Value) -> Option<i64> {
@@ -1543,11 +1552,11 @@ fn bybit_position_idx(mode: BybitPositionMode, side: Side, reduce_only: bool) ->
 }
 
 fn bybit_position_mode_retry_allowed(ret_code: i64, ret_msg: &str) -> bool {
-    if ret_code != 10001 {
-        return false;
-    }
     let normalized = ret_msg.to_ascii_lowercase();
-    normalized.contains("position idx") || normalized.contains("position mode")
+    (ret_code == 10001
+        || normalized.contains("position idx")
+        || normalized.contains("position mode"))
+        && (normalized.contains("position idx") || normalized.contains("position mode"))
 }
 
 fn validate_bybit_order_request(
@@ -1871,16 +1880,18 @@ fn bybit_transfer_status_cache_is_fresh(
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeSet, HashMap, HashSet};
+    use std::sync::{Arc, Mutex};
 
     use crate::models::Venue;
 
     use super::{
-        build_bybit_transfer_status_cache, bybit_position_idx,
+        build_bybit_transfer_status_cache, bybit_position_idx, bybit_position_mode_for_symbol,
         bybit_position_mode_from_position_idx, bybit_position_mode_retry_allowed,
         bybit_transfer_status_cache_is_fresh, ensure_bybit_order_link_id,
         filter_bybit_transfer_statuses, format_bybit_api_error, format_bybit_http_error,
-        prune_bybit_symbol_catalog_entry, validate_bybit_order_request, BybitCoinChain,
-        BybitCoinInfo, BybitInstrumentMeta, BybitPositionMode,
+        prune_bybit_symbol_catalog_entry, update_bybit_position_mode_slot,
+        validate_bybit_order_request, BybitCoinChain, BybitCoinInfo, BybitInstrumentMeta,
+        BybitPositionMode,
     };
 
     #[test]
@@ -2029,10 +2040,32 @@ mod tests {
             10001,
             "position idx not match position mode"
         ));
+        assert!(bybit_position_mode_retry_allowed(
+            110043,
+            "position idx not match position mode"
+        ));
         assert!(!bybit_position_mode_retry_allowed(
             110001,
             "order not found"
         ));
+    }
+
+    #[test]
+    fn position_mode_is_tracked_per_symbol() {
+        let slot = Arc::new(Mutex::new(HashMap::new()));
+
+        update_bybit_position_mode_slot(&slot, "BTCUSDT", Some(BybitPositionMode::Hedge));
+        update_bybit_position_mode_slot(&slot, "ETHUSDT", Some(BybitPositionMode::OneWay));
+
+        assert_eq!(
+            bybit_position_mode_for_symbol(&slot, "BTCUSDT"),
+            Some(BybitPositionMode::Hedge)
+        );
+        assert_eq!(
+            bybit_position_mode_for_symbol(&slot, "ETHUSDT"),
+            Some(BybitPositionMode::OneWay)
+        );
+        assert_eq!(bybit_position_mode_for_symbol(&slot, "SOLUSDT"), None);
     }
 
     #[test]

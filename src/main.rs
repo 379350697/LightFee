@@ -12,6 +12,8 @@ use tokio::time;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
+const ACTIVE_POSITION_FAST_POLL_INTERVAL_MS: u64 = 250;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -61,6 +63,13 @@ async fn main() -> Result<()> {
 
     let mut interval = time::interval(Duration::from_millis(config.runtime.poll_interval_ms));
     interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let active_poll_ms = active_position_poll_interval_ms(
+        config.runtime.mode.clone(),
+        config.runtime.poll_interval_ms,
+        1,
+    );
+    let mut active_interval = time::interval(Duration::from_millis(active_poll_ms));
+    active_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut tick_backoff = FailureBackoff::new(
         config.runtime.tick_failure_backoff_initial_ms,
         config.runtime.tick_failure_backoff_max_ms,
@@ -68,8 +77,28 @@ async fn main() -> Result<()> {
     );
     let mut backoff_until = None;
     loop {
+        let fast_poll_active = active_position_poll_enabled(
+            config.runtime.mode.clone(),
+            config.runtime.poll_interval_ms,
+            engine.state().open_positions.len(),
+        );
         tokio::select! {
             _ = interval.tick() => {
+                let now = time::Instant::now();
+                if backoff_until.is_some_and(|until| now < until) {
+                    continue;
+                }
+                backoff_until = None;
+                match engine.tick().await {
+                    Ok(()) => tick_backoff.on_success(),
+                    Err(error) => {
+                        let delay_ms = tick_backoff.on_failure_with_jitter();
+                        backoff_until = Some(time::Instant::now() + Duration::from_millis(delay_ms));
+                        error!(?error, backoff_ms = delay_ms, "engine tick failed");
+                    }
+                }
+            }
+            _ = active_interval.tick(), if fast_poll_active => {
                 let now = time::Instant::now();
                 if backoff_until.is_some_and(|until| now < until) {
                     continue;
@@ -123,6 +152,28 @@ fn startup_market_warmup_ms(
         return None;
     }
     Some(poll_interval_ms.saturating_mul(3).clamp(3_000, 10_000))
+}
+
+fn active_position_poll_interval_ms(
+    mode: RuntimeMode,
+    poll_interval_ms: u64,
+    active_position_count: usize,
+) -> u64 {
+    if !matches!(mode, RuntimeMode::Live) || active_position_count == 0 {
+        return poll_interval_ms;
+    }
+    poll_interval_ms.min(ACTIVE_POSITION_FAST_POLL_INTERVAL_MS)
+}
+
+fn active_position_poll_enabled(
+    mode: RuntimeMode,
+    poll_interval_ms: u64,
+    active_position_count: usize,
+) -> bool {
+    matches!(mode, RuntimeMode::Live)
+        && active_position_count > 0
+        && active_position_poll_interval_ms(mode, poll_interval_ms, active_position_count)
+            < poll_interval_ms
 }
 
 async fn build_adapters(
@@ -228,7 +279,10 @@ mod tests {
         Arc,
     };
 
-    use super::{prewarm_live_adapters, startup_market_warmup_ms};
+    use super::{
+        active_position_poll_enabled, active_position_poll_interval_ms, prewarm_live_adapters,
+        startup_market_warmup_ms,
+    };
     use anyhow::Result;
     use async_trait::async_trait;
     use lightfee::{
@@ -267,6 +321,29 @@ mod tests {
             startup_market_warmup_ms(RuntimeMode::Live, false, 0, 1_500),
             None
         );
+    }
+
+    #[test]
+    fn live_mode_uses_fast_poll_when_positions_are_open() {
+        assert_eq!(
+            active_position_poll_interval_ms(RuntimeMode::Live, 3_000, 1),
+            250
+        );
+        assert!(active_position_poll_enabled(RuntimeMode::Live, 3_000, 1));
+    }
+
+    #[test]
+    fn paper_or_idle_mode_uses_base_poll_interval() {
+        assert_eq!(
+            active_position_poll_interval_ms(RuntimeMode::Paper, 3_000, 1),
+            3_000
+        );
+        assert_eq!(
+            active_position_poll_interval_ms(RuntimeMode::Live, 3_000, 0),
+            3_000
+        );
+        assert!(!active_position_poll_enabled(RuntimeMode::Paper, 3_000, 1));
+        assert!(!active_position_poll_enabled(RuntimeMode::Live, 3_000, 0));
     }
 
     struct PrewarmProbeAdapter {

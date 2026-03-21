@@ -70,6 +70,7 @@ async fn opens_then_exits_after_funding_capture() {
     assert!(has_event(&records, "execution.exit_latency_summary"));
     assert_eq!(event_count(&records, "execution.order_filled"), 6);
     assert!(has_event(&records, "exit.partial_closed"));
+    assert!(has_event(&records, "execution.partial_exit_prepare_timing"));
 
     let first = records.first().expect("first record");
     assert!(first.get("seq").and_then(Value::as_u64).unwrap_or_default() >= 1);

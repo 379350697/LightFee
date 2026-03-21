@@ -690,6 +690,10 @@ impl BinanceLiveAdapter {
     fn clear_server_time_offset(&self) {
         self.time_offset_ms.lock().expect("lock").take();
     }
+
+    fn clear_position_mode(&self) {
+        self.position_mode.lock().expect("lock").take();
+    }
 }
 
 fn format_binance_http_error(status: reqwest::StatusCode, body: &str) -> anyhow::Error {
@@ -722,6 +726,8 @@ fn should_retry_binance_order_error(error: &anyhow::Error) -> bool {
     message.contains("code=-1021")
         || message.contains("recvwindow")
         || message.contains("timestamp")
+        || (message.contains("position side") && message.contains("setting"))
+        || message.contains("positionside")
         || message.contains("status=500")
         || message.contains("status=502")
         || message.contains("status=503")
@@ -818,9 +824,16 @@ impl VenueAdapter for BinanceLiveAdapter {
             Ok(response) => response,
             Err(error) if should_retry_binance_order_error(&error) => {
                 self.clear_server_time_offset();
+                self.clear_position_mode();
                 sleep(Duration::from_millis(100)).await;
-                self.submit_market_order_once(&request, quantity, meta.step_size, position_mode)
-                    .await?
+                let retry_position_mode = self.position_mode().await?;
+                self.submit_market_order_once(
+                    &request,
+                    quantity,
+                    meta.step_size,
+                    retry_position_mode,
+                )
+                .await?
             }
             Err(error) => return Err(error),
         };
@@ -1801,6 +1814,9 @@ mod tests {
         )));
         assert!(!should_retry_binance_order_error(&anyhow!(
             "binance private endpoint returned non-success status: status=400 Bad Request code=-4164 msg=Order's notional must be no smaller than 5"
+        )));
+        assert!(should_retry_binance_order_error(&anyhow!(
+            "binance private endpoint returned non-success status: status=400 Bad Request code=-4061 msg=Order's position side does not match user's setting."
         )));
     }
 

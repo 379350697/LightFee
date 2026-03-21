@@ -719,6 +719,10 @@ impl OkxLiveAdapter {
         Ok(iso8601_from_ms(self.server_timestamp_ms().await?))
     }
 
+    fn clear_position_mode(&self) {
+        self.position_mode.lock().expect("lock").take();
+    }
+
     async fn signed_request(
         &self,
         method: reqwest::Method,
@@ -930,6 +934,16 @@ fn format_okx_order_response_error(
     anyhow!("{context}: code={} msg={}", top_code, top_msg)
 }
 
+fn should_retry_okx_order_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("posside")
+        || message.contains("posside error")
+        || message.contains("posmode")
+        || message.contains("posmode error")
+        || message.contains("position side")
+        || message.contains("position mode")
+}
+
 fn ensure_okx_api_success<T>(
     context: &str,
     response: OkxApiResponse<T>,
@@ -1008,35 +1022,63 @@ impl VenueAdapter for OkxLiveAdapter {
         ensure_okx_client_order_id(&request.client_order_id)?;
         let order_prepare_started_at = Instant::now();
         let meta = self.symbol_meta(&request.symbol).await?;
-        let position_mode = self.position_mode().await?;
         let contracts = floor_to_step(request.quantity / meta.ct_val, meta.lot_sz);
         validate_okx_order_request(&meta, &request.symbol, contracts)?;
         let order_prepare_ms = elapsed_ms(order_prepare_started_at);
         let submit_started_at = Instant::now();
-        let response = self
-            .submit_order_once(&request, &meta, position_mode, contracts)
-            .await?;
+        let mut attempted_mode_reset = false;
+        let response = loop {
+            let position_mode = self.position_mode().await?;
+            let response = self
+                .submit_order_once(&request, &meta, position_mode, contracts)
+                .await;
+            match response {
+                Ok(response) => {
+                    let top_level_error = response
+                        .response
+                        .code
+                        .as_deref()
+                        .filter(|code| *code != "0")
+                        .map(|_| {
+                            format_okx_order_response_error(
+                                "okx order ack failed",
+                                &response.response,
+                            )
+                        });
+                    let row_error = response
+                        .response
+                        .data
+                        .first()
+                        .filter(|ack| ack.s_code.as_deref().unwrap_or("0") != "0")
+                        .map(format_okx_order_ack_error);
+                    if let Some(error) = top_level_error.or(row_error) {
+                        if !attempted_mode_reset && should_retry_okx_order_error(&error) {
+                            attempted_mode_reset = true;
+                            self.clear_position_mode();
+                            sleep(Duration::from_millis(100)).await;
+                            let _ = self.position_mode().await?;
+                            continue;
+                        }
+                        return Err(error);
+                    }
+                    break response;
+                }
+                Err(error) if !attempted_mode_reset && should_retry_okx_order_error(&error) => {
+                    attempted_mode_reset = true;
+                    self.clear_position_mode();
+                    sleep(Duration::from_millis(100)).await;
+                    let _ = self.position_mode().await?;
+                }
+                Err(error) => return Err(error),
+            }
+        };
         let submit_ack_ms = elapsed_ms(submit_started_at);
-        if response
-            .response
-            .code
-            .as_deref()
-            .is_some_and(|code| code != "0")
-        {
-            return Err(format_okx_order_response_error(
-                "okx order ack failed",
-                &response.response,
-            ));
-        }
         let ack = response
             .response
             .data
             .into_iter()
             .next()
             .ok_or_else(|| anyhow!("okx order ack missing row"))?;
-        if ack.s_code.as_deref().unwrap_or("0") != "0" {
-            return Err(format_okx_order_ack_error(&ack));
-        }
 
         let (average_price, filled_at_ms) = if let Some(fill) = hinted_fill(&request) {
             fill
@@ -1870,8 +1912,9 @@ mod tests {
         build_okx_private_subscribe_messages, build_okx_subscribe_messages,
         ensure_okx_client_order_id, format_okx_http_error, format_okx_order_ack_error,
         format_okx_order_response_error, okx_instrument_meta_map_from_rows, okx_pos_side,
-        prune_okx_symbol_catalog_entry, validate_okx_order_request, OkxApiResponse, OkxInstrument,
-        OkxInstrumentMeta, OkxOrderAck, OkxPositionMode, OKX_MAX_SUBSCRIBE_ARGS_PER_MESSAGE,
+        prune_okx_symbol_catalog_entry, should_retry_okx_order_error, validate_okx_order_request,
+        OkxApiResponse, OkxInstrument, OkxInstrumentMeta, OkxOrderAck, OkxPositionMode,
+        OKX_MAX_SUBSCRIBE_ARGS_PER_MESSAGE,
     };
     use crate::models::Side;
 
@@ -2046,5 +2089,18 @@ mod tests {
         assert!(rendered.contains("s_code=51008"));
         assert!(rendered.contains("Insufficient margin"));
         assert!(rendered.contains("cl_ord_id=cid-abc"));
+    }
+
+    #[test]
+    fn retryable_order_errors_include_position_mode_mismatch() {
+        assert!(should_retry_okx_order_error(&anyhow::anyhow!(
+            "okx order rejected: s_code=51000 s_msg=Parameter posSide error ord_id=unknown cl_ord_id=unknown tag=unknown"
+        )));
+        assert!(should_retry_okx_order_error(&anyhow::anyhow!(
+            "okx order ack failed: code=1 msg=All operations failed s_code=51000 s_msg=Parameter posMode error ord_id=unknown cl_ord_id=unknown tag=unknown"
+        )));
+        assert!(!should_retry_okx_order_error(&anyhow::anyhow!(
+            "okx order rejected: s_code=51008 s_msg=Insufficient margin ord_id=unknown cl_ord_id=unknown tag=unknown"
+        )));
     }
 }
