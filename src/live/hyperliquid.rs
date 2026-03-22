@@ -63,7 +63,8 @@ use super::{
 const HYPERLIQUID_MIN_NOTIONAL_QUOTE: f64 = 10.0;
 const HYPERLIQUID_PERP_LIQUIDITY_CACHE_TTL_MS: i64 = 60 * 1_000;
 const HYPERLIQUID_MARKET_WS_IDLE_TIMEOUT_MS: i64 = 45 * 1_000;
-const HYPERLIQUID_PRIVATE_WS_IDLE_TIMEOUT_MS: i64 = 3 * 60 * 1_000;
+#[cfg(test)]
+const HYPERLIQUID_PRIVATE_WS_IDLE_TIMEOUT_MS: i64 = 0;
 const HYPERLIQUID_WS_WATCHDOG_TICK_MS: u64 = 5 * 1_000;
 
 pub struct HyperliquidLiveAdapter {
@@ -609,118 +610,92 @@ impl HyperliquidLiveAdapter {
                 reconnect_backoff.on_success();
                 private_state.record_connection_success(now_ms());
                 let _info_client = info_client;
-                let mut last_message_ms = now_ms();
-                let mut watchdog = interval(Duration::from_millis(HYPERLIQUID_WS_WATCHDOG_TICK_MS));
-                watchdog.set_missed_tick_behavior(MissedTickBehavior::Skip);
                 let mut should_rebuild = false;
                 while !should_rebuild {
-                    tokio::select! {
-                        _ = watchdog.tick() => {
-                            let current_now_ms = now_ms();
-                            if hyperliquid_ws_watchdog_timed_out(
-                                last_message_ms,
-                                current_now_ms,
-                                HYPERLIQUID_PRIVATE_WS_IDLE_TIMEOUT_MS,
-                            ) {
-                                private_state.record_connection_failure(
-                                    current_now_ms,
-                                    unhealthy_after_failures,
-                                    "hyperliquid private websocket idle timeout".to_string(),
-                                );
-                                warn!(
-                                    idle_ms = current_now_ms.saturating_sub(last_message_ms),
-                                    "hyperliquid private websocket idle watchdog timed out"
-                                );
-                                should_rebuild = true;
+                    match receiver.recv().await {
+                        Some(HyperliquidMessage::User(user_event)) => {
+                            private_state.record_connection_success(now_ms());
+                            if let UserData::Fills(fills) = user_event.data {
+                                for fill in fills {
+                                    let Some(symbol) = symbol_map.get(&fill.coin) else {
+                                        continue;
+                                    };
+                                    let quantity = match parse_f64(&fill.sz) {
+                                        Ok(quantity) => quantity,
+                                        Err(_) => continue,
+                                    };
+                                    let average_price = parse_f64(&fill.px).ok();
+                                    let fee_quote =
+                                        match fill.fee_token.to_ascii_uppercase().as_str() {
+                                            "USDC" | "USDT" => parse_f64(&fill.fee).ok(),
+                                            _ => None,
+                                        };
+                                    private_state.record_order(PrivateOrderUpdate {
+                                        symbol: symbol.clone(),
+                                        order_id: fill.oid.to_string(),
+                                        client_order_id: fill.cloid.clone(),
+                                        filled_quantity: Some(quantity),
+                                        average_price,
+                                        fee_quote,
+                                        updated_at_ms: fill.time as i64,
+                                    });
+                                    let signed_quantity =
+                                        hyperliquid_side_sign(&fill.side) * quantity;
+                                    let current_size = private_state
+                                        .position(symbol)
+                                        .map(|position| position.size)
+                                        .unwrap_or_default();
+                                    private_state.update_position(
+                                        symbol,
+                                        current_size + signed_quantity,
+                                        fill.time as i64,
+                                    );
+                                }
                             }
                         }
-                        message = receiver.recv() => {
-                            match message {
-                                Some(HyperliquidMessage::User(user_event)) => {
-                                    last_message_ms = now_ms();
-                                    private_state.record_connection_success(last_message_ms);
-                                    if let UserData::Fills(fills) = user_event.data {
-                                        for fill in fills {
-                                            let Some(symbol) = symbol_map.get(&fill.coin) else {
-                                                continue;
-                                            };
-                                            let quantity = match parse_f64(&fill.sz) {
-                                                Ok(quantity) => quantity,
-                                                Err(_) => continue,
-                                            };
-                                            let average_price = parse_f64(&fill.px).ok();
-                                            let fee_quote = match fill.fee_token.to_ascii_uppercase().as_str() {
-                                                "USDC" | "USDT" => parse_f64(&fill.fee).ok(),
-                                                _ => None,
-                                            };
-                                            private_state.record_order(PrivateOrderUpdate {
-                                                symbol: symbol.clone(),
-                                                order_id: fill.oid.to_string(),
-                                                client_order_id: fill.cloid.clone(),
-                                                filled_quantity: Some(quantity),
-                                                average_price,
-                                                fee_quote,
-                                                updated_at_ms: fill.time as i64,
-                                            });
-                                            let signed_quantity = hyperliquid_side_sign(&fill.side) * quantity;
-                                            let current_size = private_state
-                                                .position(symbol)
-                                                .map(|position| position.size)
-                                                .unwrap_or_default();
-                                            private_state.update_position(
-                                                symbol,
-                                                current_size + signed_quantity,
-                                                fill.time as i64,
-                                            );
-                                        }
-                                    }
-                                }
-                                Some(HyperliquidMessage::OrderUpdates(order_updates)) => {
-                                    last_message_ms = now_ms();
-                                    private_state.record_connection_success(last_message_ms);
-                                    for update in order_updates.data {
-                                        let Some(symbol) = symbol_map.get(&update.order.coin) else {
-                                            continue;
-                                        };
-                                        private_state.record_order(PrivateOrderUpdate {
-                                            symbol: symbol.clone(),
-                                            order_id: update.order.oid.to_string(),
-                                            client_order_id: update.order.cloid.clone(),
-                                            filled_quantity: None,
-                                            average_price: None,
-                                            fee_quote: None,
-                                            updated_at_ms: update.status_timestamp as i64,
-                                        });
-                                    }
-                                }
-                                Some(HyperliquidMessage::HyperliquidError(error)) => {
-                                    private_state.record_connection_failure(
-                                        now_ms(),
-                                        unhealthy_after_failures,
-                                        error.clone(),
-                                    );
-                                    warn!(?error, "hyperliquid private websocket reported error");
-                                }
-                                Some(HyperliquidMessage::NoData) => {
-                                    private_state.record_connection_failure(
-                                        now_ms(),
-                                        unhealthy_after_failures,
-                                        "hyperliquid private websocket disconnected".to_string(),
-                                    );
-                                    debug!("hyperliquid private websocket disconnected");
-                                    should_rebuild = true;
-                                }
-                                Some(_) => {}
-                                None => {
-                                    private_state.record_connection_failure(
-                                        now_ms(),
-                                        unhealthy_after_failures,
-                                        "hyperliquid private websocket receiver closed".to_string(),
-                                    );
-                                    debug!("hyperliquid private websocket receiver closed");
-                                    should_rebuild = true;
-                                }
+                        Some(HyperliquidMessage::OrderUpdates(order_updates)) => {
+                            private_state.record_connection_success(now_ms());
+                            for update in order_updates.data {
+                                let Some(symbol) = symbol_map.get(&update.order.coin) else {
+                                    continue;
+                                };
+                                private_state.record_order(PrivateOrderUpdate {
+                                    symbol: symbol.clone(),
+                                    order_id: update.order.oid.to_string(),
+                                    client_order_id: update.order.cloid.clone(),
+                                    filled_quantity: None,
+                                    average_price: None,
+                                    fee_quote: None,
+                                    updated_at_ms: update.status_timestamp as i64,
+                                });
                             }
+                        }
+                        Some(HyperliquidMessage::HyperliquidError(error)) => {
+                            private_state.record_connection_failure(
+                                now_ms(),
+                                unhealthy_after_failures,
+                                error.clone(),
+                            );
+                            warn!(?error, "hyperliquid private websocket reported error");
+                        }
+                        Some(HyperliquidMessage::NoData) => {
+                            private_state.record_connection_failure(
+                                now_ms(),
+                                unhealthy_after_failures,
+                                "hyperliquid private websocket disconnected".to_string(),
+                            );
+                            debug!("hyperliquid private websocket disconnected");
+                            should_rebuild = true;
+                        }
+                        Some(_) => {}
+                        None => {
+                            private_state.record_connection_failure(
+                                now_ms(),
+                                unhealthy_after_failures,
+                                "hyperliquid private websocket receiver closed".to_string(),
+                            );
+                            debug!("hyperliquid private websocket receiver closed");
+                            should_rebuild = true;
                         }
                     }
                 }
@@ -1965,6 +1940,7 @@ mod tests {
         hyperliquid_ws_watchdog_timed_out, ioc_order_params_from_reference_price,
         prune_hyperliquid_symbol_catalog_entry, should_retry_hyperliquid_duplicate_nonce,
         sign_hyperliquid_l1_action, HyperliquidAssetMeta, HyperliquidOrderOutcome,
+        HYPERLIQUID_PRIVATE_WS_IDLE_TIMEOUT_MS,
     };
 
     #[test]
@@ -2169,6 +2145,11 @@ mod tests {
         assert!(!hyperliquid_ws_watchdog_timed_out(1_000, 1_000, 45_000));
         assert!(!hyperliquid_ws_watchdog_timed_out(1_000, 46_000, 45_000));
         assert!(hyperliquid_ws_watchdog_timed_out(1_000, 46_001, 45_000));
+    }
+
+    #[test]
+    fn private_idle_watchdog_is_disabled_for_sparse_event_streams() {
+        assert_eq!(HYPERLIQUID_PRIVATE_WS_IDLE_TIMEOUT_MS, 0);
     }
 
     #[test]

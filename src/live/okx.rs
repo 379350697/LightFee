@@ -42,6 +42,8 @@ use super::{
 
 const OKX_MAX_SUBSCRIBE_ARGS_PER_MESSAGE: usize = 100;
 const OKX_PERP_LIQUIDITY_CACHE_TTL_MS: i64 = 60 * 1_000;
+const OKX_PRIVATE_WS_IDLE_TIMEOUT_MS: i64 = 90 * 1_000;
+const OKX_PRIVATE_WS_WATCHDOG_TICK_MS: u64 = 5 * 1_000;
 
 pub struct OkxLiveAdapter {
     config: VenueConfig,
@@ -521,10 +523,33 @@ impl OkxLiveAdapter {
                         }
 
                         let mut subscribed = false;
+                        let mut last_message_ms = now_ms();
                         let mut ping_interval = interval(Duration::from_secs(20));
                         ping_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+                        let mut watchdog =
+                            interval(Duration::from_millis(OKX_PRIVATE_WS_WATCHDOG_TICK_MS));
+                        watchdog.set_missed_tick_behavior(MissedTickBehavior::Skip);
                         loop {
                             tokio::select! {
+                                _ = watchdog.tick() => {
+                                    let current_now_ms = now_ms();
+                                    if okx_private_ws_watchdog_timed_out(
+                                        last_message_ms,
+                                        current_now_ms,
+                                        OKX_PRIVATE_WS_IDLE_TIMEOUT_MS,
+                                    ) {
+                                        private_state.record_connection_failure(
+                                            current_now_ms,
+                                            unhealthy_after_failures,
+                                            "okx private websocket idle timeout".to_string(),
+                                        );
+                                        warn!(
+                                            idle_ms = current_now_ms.saturating_sub(last_message_ms),
+                                            "okx private websocket idle watchdog timed out"
+                                        );
+                                        break;
+                                    }
+                                }
                                 _ = ping_interval.tick() => {
                                     if let Err(error) = socket.send(Message::Text("ping".to_string().into())).await {
                                         private_state.record_connection_failure(
@@ -538,6 +563,8 @@ impl OkxLiveAdapter {
                                 message = socket.next() => {
                                     match message {
                                         Some(Ok(Message::Text(text))) => {
+                                            last_message_ms = now_ms();
+                                            private_state.record_connection_success(last_message_ms);
                                             match handle_okx_private_message(
                                                 &private_state,
                                                 &symbol_map,
@@ -566,6 +593,8 @@ impl OkxLiveAdapter {
                                             }
                                         }
                                         Some(Ok(Message::Ping(payload))) => {
+                                            last_message_ms = now_ms();
+                                            private_state.record_connection_success(last_message_ms);
                                             if let Err(error) = socket.send(Message::Pong(payload)).await {
                                                 private_state.record_connection_failure(
                                                     now_ms(),
@@ -574,6 +603,10 @@ impl OkxLiveAdapter {
                                                 );
                                                 break;
                                             }
+                                        }
+                                        Some(Ok(Message::Pong(_))) => {
+                                            last_message_ms = now_ms();
+                                            private_state.record_connection_success(last_message_ms);
                                         }
                                         Some(Ok(Message::Close(frame))) => {
                                             private_state.record_connection_failure(
@@ -1185,6 +1218,10 @@ fn is_benign_okx_private_ws_error(error: &WsError) -> bool {
             | WsError::AlreadyClosed
             | WsError::Protocol(ProtocolError::ResetWithoutClosingHandshake)
     )
+}
+
+fn okx_private_ws_watchdog_timed_out(last_message_ms: i64, now_ms: i64, timeout_ms: i64) -> bool {
+    timeout_ms > 0 && now_ms.saturating_sub(last_message_ms) > timeout_ms
 }
 
 fn ensure_okx_api_success<T>(
@@ -2447,10 +2484,11 @@ mod tests {
         build_okx_subscribe_messages, ensure_okx_client_order_id, format_okx_http_error,
         format_okx_order_ack_error, format_okx_order_response_error,
         is_benign_okx_private_ws_error, okx_account_balance_snapshot_from_row,
-        okx_instrument_meta_map_from_rows, okx_pos_side, okx_trade_fee_snapshot_from_row,
-        prune_okx_symbol_catalog_entry, should_retry_okx_order_error, validate_okx_order_request,
-        OkxAccountBalance, OkxApiResponse, OkxInstrument, OkxInstrumentMeta, OkxOrderAck,
-        OkxPositionMode, OkxTicker, OkxTradeFeeRow, OKX_MAX_SUBSCRIBE_ARGS_PER_MESSAGE,
+        okx_instrument_meta_map_from_rows, okx_pos_side, okx_private_ws_watchdog_timed_out,
+        okx_trade_fee_snapshot_from_row, prune_okx_symbol_catalog_entry,
+        should_retry_okx_order_error, validate_okx_order_request, OkxAccountBalance,
+        OkxApiResponse, OkxInstrument, OkxInstrumentMeta, OkxOrderAck, OkxPositionMode, OkxTicker,
+        OkxTradeFeeRow, OKX_MAX_SUBSCRIBE_ARGS_PER_MESSAGE,
     };
     use crate::models::{Side, Venue};
     use tokio_tungstenite::tungstenite::{error::ProtocolError, Error as WsError};
@@ -2797,5 +2835,12 @@ mod tests {
         assert!(!is_benign_okx_private_ws_error(&WsError::Io(
             std::io::Error::other("boom")
         )));
+    }
+
+    #[test]
+    fn okx_private_watchdog_times_out_only_after_threshold() {
+        assert!(!okx_private_ws_watchdog_timed_out(1_000, 1_000, 90_000));
+        assert!(!okx_private_ws_watchdog_timed_out(1_000, 91_000, 90_000));
+        assert!(okx_private_ws_watchdog_timed_out(1_000, 91_001, 90_000));
     }
 }
