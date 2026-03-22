@@ -30,9 +30,10 @@ use crate::{
 use super::{
     base_asset, build_http_client, build_query, cache_is_fresh, enrich_fill_from_private,
     estimate_fee_quote, floor_to_step, format_decimal, hinted_fill, hmac_sha256_hex,
-    load_json_cache, lookup_or_wait_private_order, now_ms, parse_bool_flag, parse_f64, parse_i64,
-    parse_text_message, quote_fill, spawn_ws_loop, store_json_cache, venue_symbol,
-    PrivateOrderUpdate, WsMarketState, WsPrivateState, SYMBOL_CACHE_TTL_MS, TRANSFER_CACHE_TTL_MS,
+    is_benign_ws_disconnect_error, load_json_cache, lookup_or_wait_private_order, now_ms,
+    parse_bool_flag, parse_f64, parse_i64, parse_text_message, quote_fill, spawn_ws_loop,
+    store_json_cache, venue_symbol, PrivateOrderUpdate, WsMarketState, WsPrivateState,
+    SYMBOL_CACHE_TTL_MS, TRANSFER_CACHE_TTL_MS,
 };
 
 const BYBIT_MAX_SUBSCRIBE_TOPICS_PER_MESSAGE: usize = 100;
@@ -515,7 +516,11 @@ impl BybitLiveAdapter {
                                                 unhealthy_after_failures,
                                                 error.to_string(),
                                             );
-                                            warn!(?error, "bybit private websocket receive failed");
+                                            if is_benign_ws_disconnect_error(&error) {
+                                                debug!(?error, "bybit private websocket receive disconnected");
+                                            } else {
+                                                warn!(?error, "bybit private websocket receive failed");
+                                            }
                                             break;
                                         }
                                         None => break,

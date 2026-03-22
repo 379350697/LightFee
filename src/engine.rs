@@ -118,6 +118,8 @@ const SETTLEMENT_HALF_CLOSE_RATIO: f64 = 0.5;
 const SETTLEMENT_REMAINDER_CLOSE_DELAY_MS: i64 = 5 * 60 * 1_000;
 const SETTLEMENT_FORCE_CLOSE_DELAY_MS: i64 = 20 * 60 * 1_000;
 const CLOSE_RECONCILIATION_RETRY_BASE_MS: i64 = 30 * 1_000;
+const MARKET_DATA_WINDOW_PREWARM_MS: i64 = 2 * 60 * 1_000;
+const MARKET_DATA_WINDOW_LINGER_MS: i64 = 3 * 60 * 1_000;
 const CLOSE_RECONCILIATION_RETRY_MAX_MS: i64 = 5 * 60 * 1_000;
 const CEX_MIN_PERP_VOLUME_24H_QUOTE: f64 = 5_000_000.0;
 const HYPERLIQUID_MIN_PERP_VOLUME_24H_QUOTE: f64 = 1_000_000.0;
@@ -181,6 +183,14 @@ pub fn apply_cached_fee_snapshots_to_candidates(
     fallback_venues
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct FeeResolutionLogEntry {
+    venue: Venue,
+    taker_fee_bps: f64,
+    source: &'static str,
+    used_fallback: bool,
+}
+
 fn resolved_taker_fee_bps(
     config: &AppConfig,
     fee_snapshots: &BTreeMap<Venue, AccountFeeSnapshot>,
@@ -197,6 +207,31 @@ fn resolved_taker_fee_bps(
             .unwrap_or_default(),
         true,
     )
+}
+
+fn resolved_fee_log_entry(
+    config: &AppConfig,
+    fee_snapshots: &BTreeMap<Venue, AccountFeeSnapshot>,
+    venue: Venue,
+) -> FeeResolutionLogEntry {
+    if let Some(snapshot) = fee_snapshots.get(&venue) {
+        return FeeResolutionLogEntry {
+            venue,
+            taker_fee_bps: snapshot.taker_fee_bps,
+            source: "account_fee_snapshot",
+            used_fallback: false,
+        };
+    }
+
+    FeeResolutionLogEntry {
+        venue,
+        taker_fee_bps: config
+            .venue(venue)
+            .map(|venue_config| venue_config.taker_fee_bps)
+            .unwrap_or_default(),
+        source: "configured_taker_fee_bps",
+        used_fallback: true,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -747,7 +782,11 @@ impl Engine {
         let hour_ms = 60 * 60 * 1_000_i64;
         let elapsed_in_hour_ms = now_ms.rem_euclid(hour_ms);
         let remaining_ms = hour_ms.saturating_sub(elapsed_in_hour_ms);
-        is_within_funding_scan_window_ms(&self.config, remaining_ms)
+        should_activate_windowed_market_data_with_hysteresis(
+            &self.config,
+            remaining_ms,
+            self.market_data_active,
+        )
     }
 
     fn market_data_warmup_pending(&self, now_ms: i64) -> bool {
@@ -3306,12 +3345,19 @@ impl Engine {
         let mut entry_market = market.clone();
         let entry_started_at = Instant::now();
         let position_id = format!("pos-{}-{}", self.state.cycle, candidate.pair_id);
+        let fee_snapshots = self.cached_live_fee_snapshots();
+        let long_fee = resolved_fee_log_entry(&self.config, &fee_snapshots, candidate.long_venue);
+        let short_fee = resolved_fee_log_entry(&self.config, &fee_snapshots, candidate.short_venue);
         self.log_event(
             "execution.entry_selected",
             &json!({
                 "position_id": &position_id,
                 "pair_id": &candidate.pair_id,
                 "candidate": &candidate,
+                "fee_resolution": {
+                    "long": &long_fee,
+                    "short": &short_fee,
+                },
             }),
         );
         let quote_refresh_started_at = Instant::now();
@@ -5886,6 +5932,49 @@ impl Engine {
     }
 }
 
+fn should_activate_windowed_market_data_with_hysteresis(
+    config: &AppConfig,
+    remaining_ms: i64,
+    currently_active: bool,
+) -> bool {
+    if is_within_funding_scan_window_ms(config, remaining_ms) {
+        return true;
+    }
+    if remaining_ms <= 0 {
+        return false;
+    }
+
+    let max_before_ms = config
+        .strategy
+        .max_scan_minutes_before_funding
+        .max(0)
+        .saturating_mul(60_000);
+    let min_before_ms = config
+        .strategy
+        .min_scan_minutes_before_funding
+        .max(0)
+        .saturating_mul(60_000);
+
+    if max_before_ms > 0 {
+        if remaining_ms > max_before_ms
+            && remaining_ms <= max_before_ms.saturating_add(MARKET_DATA_WINDOW_PREWARM_MS)
+        {
+            return true;
+        }
+        if currently_active
+            && remaining_ms < min_before_ms
+            && remaining_ms >= min_before_ms.saturating_sub(MARKET_DATA_WINDOW_LINGER_MS)
+        {
+            return true;
+        }
+        return false;
+    }
+
+    let entry_window_ms = config.strategy.entry_window_secs.saturating_mul(1_000);
+    remaining_ms > entry_window_ms
+        && remaining_ms <= entry_window_ms.saturating_add(MARKET_DATA_WINDOW_PREWARM_MS)
+}
+
 fn is_soft_market_fetch_failure(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         let message = cause.to_string();
@@ -6509,7 +6598,8 @@ mod tests {
         apply_cached_fee_snapshots_to_candidates, cached_flat_guard_reason,
         compact_client_order_id, effective_entry_leg_notional_floor, hyperliquid_entry_gate_reason,
         order_error_may_have_created_exposure, order_quote_expired_reason, persistent_state_view,
-        remap_no_entry_diagnostic_reason, should_probe_live_recovery,
+        remap_no_entry_diagnostic_reason, resolved_fee_log_entry,
+        should_activate_windowed_market_data_with_hysteresis, should_probe_live_recovery,
         venue_order_health_risk_score, EngineMode, EngineState, VenueOrderHealthSample,
     };
     use crate::models::{PositionSnapshot, Venue};
@@ -6624,6 +6714,46 @@ mod tests {
     }
 
     #[test]
+    fn market_data_activity_uses_window_prewarm_and_linger() {
+        let config = AppConfig {
+            runtime: RuntimeConfig::default(),
+            strategy: StrategyConfig {
+                max_scan_minutes_before_funding: 25,
+                min_scan_minutes_before_funding: 5,
+                ..StrategyConfig::default()
+            },
+            persistence: PersistenceConfig {
+                event_log_path: "runtime/test-events.jsonl".to_string(),
+                snapshot_path: "runtime/test-state.json".to_string(),
+            },
+            venues: vec![],
+            symbols: vec![],
+            directed_pairs: vec![],
+        };
+
+        assert!(should_activate_windowed_market_data_with_hysteresis(
+            &config,
+            26 * 60 * 1_000,
+            false,
+        ));
+        assert!(!should_activate_windowed_market_data_with_hysteresis(
+            &config,
+            28 * 60 * 1_000,
+            false,
+        ));
+        assert!(should_activate_windowed_market_data_with_hysteresis(
+            &config,
+            4 * 60 * 1_000,
+            true,
+        ));
+        assert!(!should_activate_windowed_market_data_with_hysteresis(
+            &config,
+            60 * 1_000,
+            true,
+        ));
+    }
+
+    #[test]
     fn cached_fee_snapshots_fall_back_to_config_when_missing() {
         let config = AppConfig {
             runtime: RuntimeConfig::default(),
@@ -6711,6 +6841,75 @@ mod tests {
         assert!((candidate.expected_edge_bps - 5.45).abs() < 1e-9);
         assert!((candidate.worst_case_edge_bps - 4.95).abs() < 1e-9);
         assert!((candidate.first_stage_expected_edge_bps - 5.45).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fee_resolution_log_entry_marks_cached_snapshot_source() {
+        let config = AppConfig {
+            runtime: RuntimeConfig::default(),
+            strategy: StrategyConfig::default(),
+            persistence: PersistenceConfig {
+                event_log_path: "runtime/test-events.jsonl".to_string(),
+                snapshot_path: "runtime/test-state.json".to_string(),
+            },
+            venues: vec![VenueConfig {
+                venue: Venue::Binance,
+                enabled: true,
+                taker_fee_bps: 4.0,
+                max_notional: 1_000.0,
+                market_data_file: None,
+                live: Default::default(),
+            }],
+            symbols: vec![],
+            directed_pairs: vec![],
+        };
+        let fee_snapshots = BTreeMap::from([(
+            Venue::Binance,
+            AccountFeeSnapshot {
+                venue: Venue::Binance,
+                taker_fee_bps: 0.8,
+                maker_fee_bps: 0.4,
+                observed_at_ms: 123,
+                source: "account".to_string(),
+            },
+        )]);
+
+        let fee_entry = resolved_fee_log_entry(&config, &fee_snapshots, Venue::Binance);
+
+        assert_eq!(fee_entry.venue, Venue::Binance);
+        assert!((fee_entry.taker_fee_bps - 0.8).abs() < 1e-9);
+        assert_eq!(fee_entry.source, "account_fee_snapshot");
+        assert!(!fee_entry.used_fallback);
+    }
+
+    #[test]
+    fn fee_resolution_log_entry_marks_config_fallback_source() {
+        let config = AppConfig {
+            runtime: RuntimeConfig::default(),
+            strategy: StrategyConfig::default(),
+            persistence: PersistenceConfig {
+                event_log_path: "runtime/test-events.jsonl".to_string(),
+                snapshot_path: "runtime/test-state.json".to_string(),
+            },
+            venues: vec![VenueConfig {
+                venue: Venue::Okx,
+                enabled: true,
+                taker_fee_bps: 2.5,
+                max_notional: 1_000.0,
+                market_data_file: None,
+                live: Default::default(),
+            }],
+            symbols: vec![],
+            directed_pairs: vec![],
+        };
+        let fee_snapshots = BTreeMap::new();
+
+        let fee_entry = resolved_fee_log_entry(&config, &fee_snapshots, Venue::Okx);
+
+        assert_eq!(fee_entry.venue, Venue::Okx);
+        assert!((fee_entry.taker_fee_bps - 2.5).abs() < 1e-9);
+        assert_eq!(fee_entry.source, "configured_taker_fee_bps");
+        assert!(fee_entry.used_fallback);
     }
 
     #[test]

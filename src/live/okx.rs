@@ -13,7 +13,10 @@ use reqwest::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::time::{interval, sleep, Duration, MissedTickBehavior};
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{error::ProtocolError, protocol::Message, Error as WsError},
+};
 use tracing::{debug, warn};
 
 use crate::{
@@ -188,12 +191,14 @@ impl OkxLiveAdapter {
             .into_iter()
             .next()
             .ok_or_else(|| anyhow!("okx trade fee missing row"))?;
-        let snapshot = AccountFeeSnapshot {
-            venue: Venue::Okx,
-            taker_fee_bps: parse_f64(&row.taker)? * 10_000.0,
-            maker_fee_bps: parse_f64(&row.maker)? * 10_000.0,
-            observed_at_ms: now_ms(),
-            source: format!("okx_trade_fee:{}", inst_family),
+        let Some(snapshot) = okx_trade_fee_snapshot_from_row(&row, &inst_family, now_ms())? else {
+            debug!(
+                inst_family,
+                maker = row.maker,
+                taker = row.taker,
+                "okx trade fee response omitted maker/taker; keeping cached fee snapshot"
+            );
+            return Ok(self.cached_account_fee_snapshot());
         };
         self.store_account_fee_snapshot(&snapshot);
         Ok(Some(snapshot))
@@ -585,7 +590,11 @@ impl OkxLiveAdapter {
                                                 unhealthy_after_failures,
                                                 error.to_string(),
                                             );
-                                            warn!(?error, "okx private websocket receive failed");
+                                            if is_benign_okx_private_ws_error(&error) {
+                                                debug!(?error, "okx private websocket receive disconnected");
+                                            } else {
+                                                warn!(?error, "okx private websocket receive failed");
+                                            }
                                             break;
                                         }
                                         None => break,
@@ -1019,6 +1028,34 @@ fn format_okx_http_error(status: reqwest::StatusCode, body: &str) -> anyhow::Err
     }
 }
 
+fn parse_optional_okx_trade_fee_bps(raw: &str) -> Result<Option<f64>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(parse_f64(trimmed)? * 10_000.0))
+}
+
+fn okx_trade_fee_snapshot_from_row(
+    row: &OkxTradeFeeRow,
+    inst_family: &str,
+    observed_at_ms: i64,
+) -> Result<Option<AccountFeeSnapshot>> {
+    let Some(taker_fee_bps) = parse_optional_okx_trade_fee_bps(&row.taker)? else {
+        return Ok(None);
+    };
+    let Some(maker_fee_bps) = parse_optional_okx_trade_fee_bps(&row.maker)? else {
+        return Ok(None);
+    };
+    Ok(Some(AccountFeeSnapshot {
+        venue: Venue::Okx,
+        taker_fee_bps,
+        maker_fee_bps,
+        observed_at_ms,
+        source: format!("okx_trade_fee:{inst_family}"),
+    }))
+}
+
 fn format_okx_order_ack_error(ack: &OkxOrderAck) -> anyhow::Error {
     anyhow!(
         "okx order rejected: s_code={} s_msg={} ord_id={} cl_ord_id={} tag={}",
@@ -1060,6 +1097,15 @@ fn should_retry_okx_order_error(error: &anyhow::Error) -> bool {
         || message.contains("posmode error")
         || message.contains("position side")
         || message.contains("position mode")
+}
+
+fn is_benign_okx_private_ws_error(error: &WsError) -> bool {
+    matches!(
+        error,
+        WsError::ConnectionClosed
+            | WsError::AlreadyClosed
+            | WsError::Protocol(ProtocolError::ResetWithoutClosingHandshake)
+    )
 }
 
 fn ensure_okx_api_success<T>(
@@ -2187,12 +2233,14 @@ mod tests {
     use super::{
         build_okx_private_subscribe_messages, build_okx_subscribe_messages,
         ensure_okx_client_order_id, format_okx_http_error, format_okx_order_ack_error,
-        format_okx_order_response_error, okx_instrument_meta_map_from_rows, okx_pos_side,
+        format_okx_order_response_error, is_benign_okx_private_ws_error,
+        okx_instrument_meta_map_from_rows, okx_pos_side, okx_trade_fee_snapshot_from_row,
         prune_okx_symbol_catalog_entry, should_retry_okx_order_error, validate_okx_order_request,
         OkxApiResponse, OkxInstrument, OkxInstrumentMeta, OkxOrderAck, OkxPositionMode,
-        OKX_MAX_SUBSCRIBE_ARGS_PER_MESSAGE,
+        OkxTradeFeeRow, OKX_MAX_SUBSCRIBE_ARGS_PER_MESSAGE,
     };
-    use crate::models::Side;
+    use crate::models::{Side, Venue};
+    use tokio_tungstenite::tungstenite::{error::ProtocolError, Error as WsError};
 
     #[test]
     fn pos_side_maps_long_short_mode_correctly() {
@@ -2377,6 +2425,48 @@ mod tests {
         )));
         assert!(!should_retry_okx_order_error(&anyhow::anyhow!(
             "okx order rejected: s_code=51008 s_msg=Insufficient margin ord_id=unknown cl_ord_id=unknown tag=unknown"
+        )));
+    }
+
+    #[test]
+    fn trade_fee_snapshot_tolerates_empty_fee_fields() {
+        let snapshot = okx_trade_fee_snapshot_from_row(
+            &OkxTradeFeeRow {
+                maker: "".to_string(),
+                taker: "".to_string(),
+            },
+            "ETH-USDT",
+            123,
+        )
+        .expect("parse fee row");
+        assert!(snapshot.is_none());
+
+        let snapshot = okx_trade_fee_snapshot_from_row(
+            &OkxTradeFeeRow {
+                maker: "-0.0002".to_string(),
+                taker: "-0.0005".to_string(),
+            },
+            "ETH-USDT",
+            123,
+        )
+        .expect("parse populated fee row")
+        .expect("snapshot");
+        assert_eq!(snapshot.venue, Venue::Okx);
+        assert_eq!(snapshot.observed_at_ms, 123);
+        assert_eq!(snapshot.maker_fee_bps, -2.0);
+        assert_eq!(snapshot.taker_fee_bps, -5.0);
+        assert_eq!(snapshot.source, "okx_trade_fee:ETH-USDT");
+    }
+
+    #[test]
+    fn benign_private_ws_errors_are_downgraded() {
+        assert!(is_benign_okx_private_ws_error(&WsError::ConnectionClosed));
+        assert!(is_benign_okx_private_ws_error(&WsError::AlreadyClosed));
+        assert!(is_benign_okx_private_ws_error(&WsError::Protocol(
+            ProtocolError::ResetWithoutClosingHandshake
+        )));
+        assert!(!is_benign_okx_private_ws_error(&WsError::Io(
+            std::io::Error::other("boom")
         )));
     }
 }

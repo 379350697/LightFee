@@ -30,10 +30,10 @@ use crate::{
 use super::{
     base_asset, build_http_client, build_query, cache_is_fresh, enrich_fill_from_private,
     estimate_fee_quote, filter_transfer_statuses, floor_to_step, format_decimal, hinted_fill,
-    hmac_sha256_base64, load_json_cache, lookup_or_wait_private_order, now_ms, parse_f64,
-    parse_i64, parse_text_message, quote_fill, spawn_ws_loop, store_json_cache,
-    transfer_cache_ttl_ms, venue_symbol, PrivateOrderUpdate, VenueTransferStatusCache,
-    WsMarketState, WsPrivateState, SYMBOL_CACHE_TTL_MS,
+    hmac_sha256_base64, is_benign_ws_disconnect_error, load_json_cache,
+    lookup_or_wait_private_order, now_ms, parse_f64, parse_i64, parse_text_message, quote_fill,
+    spawn_ws_loop, store_json_cache, transfer_cache_ttl_ms, venue_symbol, PrivateOrderUpdate,
+    VenueTransferStatusCache, WsMarketState, WsPrivateState, SYMBOL_CACHE_TTL_MS,
 };
 use crate::resilience::FailureBackoff;
 
@@ -429,7 +429,11 @@ impl BitgetLiveAdapter {
                                                 unhealthy_after_failures,
                                                 error.to_string(),
                                             );
-                                            warn!(?error, "bitget private websocket receive failed");
+                                            if is_benign_ws_disconnect_error(&error) {
+                                                debug!(?error, "bitget private websocket receive disconnected");
+                                            } else {
+                                                warn!(?error, "bitget private websocket receive failed");
+                                            }
                                             break;
                                         }
                                         None => break,

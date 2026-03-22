@@ -7,7 +7,10 @@ use std::{
 use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
 use tokio::{task::JoinHandle, time::sleep};
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{error::ProtocolError, protocol::Message, Error as WsError},
+};
 use tracing::{debug, warn};
 
 use crate::{
@@ -219,11 +222,19 @@ pub(crate) fn spawn_ws_loop<F>(
                                         unhealthy_after_failures,
                                         error.to_string(),
                                     );
-                                    warn!(
-                                        venue = venue_name,
-                                        ?error,
-                                        "market websocket pong failed"
-                                    );
+                                    if is_benign_ws_disconnect_error(&error) {
+                                        debug!(
+                                            venue = venue_name,
+                                            ?error,
+                                            "market websocket pong disconnected"
+                                        );
+                                    } else {
+                                        warn!(
+                                            venue = venue_name,
+                                            ?error,
+                                            "market websocket pong failed"
+                                        );
+                                    }
                                     break;
                                 }
                             }
@@ -243,11 +254,19 @@ pub(crate) fn spawn_ws_loop<F>(
                                     unhealthy_after_failures,
                                     error.to_string(),
                                 );
-                                warn!(
-                                    venue = venue_name,
-                                    ?error,
-                                    "market websocket receive failed"
-                                );
+                                if is_benign_ws_disconnect_error(&error) {
+                                    debug!(
+                                        venue = venue_name,
+                                        ?error,
+                                        "market websocket receive disconnected"
+                                    );
+                                } else {
+                                    warn!(
+                                        venue = venue_name,
+                                        ?error,
+                                        "market websocket receive failed"
+                                    );
+                                }
                                 break;
                             }
                         }
@@ -276,6 +295,15 @@ pub(crate) fn spawn_ws_loop<F>(
     state.set_worker(task);
 }
 
+pub(crate) fn is_benign_ws_disconnect_error(error: &WsError) -> bool {
+    matches!(
+        error,
+        WsError::ConnectionClosed
+            | WsError::AlreadyClosed
+            | WsError::Protocol(ProtocolError::ResetWithoutClosingHandshake)
+    )
+}
+
 pub(crate) fn merged_quote_snapshot(
     symbol: &str,
     quote: WsBookQuote,
@@ -300,7 +328,8 @@ pub(crate) fn parse_text_message(raw: &str) -> Result<serde_json::Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::{merged_quote_snapshot, WsBookQuote, WsMarketState};
+    use super::{is_benign_ws_disconnect_error, merged_quote_snapshot, WsBookQuote, WsMarketState};
+    use tokio_tungstenite::tungstenite::{error::ProtocolError, Error as WsError};
 
     #[test]
     fn market_state_merges_quote_and_funding_updates() {
@@ -331,5 +360,17 @@ mod tests {
         );
         assert_eq!(snapshot.bid_size, 9.0);
         assert_eq!(snapshot.funding_timestamp_ms, 100);
+    }
+
+    #[test]
+    fn benign_disconnect_errors_are_classified() {
+        assert!(is_benign_ws_disconnect_error(&WsError::ConnectionClosed));
+        assert!(is_benign_ws_disconnect_error(&WsError::AlreadyClosed));
+        assert!(is_benign_ws_disconnect_error(&WsError::Protocol(
+            ProtocolError::ResetWithoutClosingHandshake
+        )));
+        assert!(!is_benign_ws_disconnect_error(&WsError::Io(
+            std::io::Error::other("boom")
+        )));
     }
 }

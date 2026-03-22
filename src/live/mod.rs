@@ -31,5 +31,6 @@ pub(crate) use private_ws::{
     enrich_fill_from_private, lookup_or_wait_private_order, PrivateOrderUpdate, WsPrivateState,
 };
 pub(crate) use ws::{
-    merged_quote_snapshot, parse_text_message, spawn_ws_loop, WsBookQuote, WsMarketState,
+    is_benign_ws_disconnect_error, merged_quote_snapshot, parse_text_message, spawn_ws_loop,
+    WsBookQuote, WsMarketState,
 };
