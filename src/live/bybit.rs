@@ -703,6 +703,46 @@ impl BybitLiveAdapter {
         })
     }
 
+    async fn fetch_bulk_symbol_snapshots(
+        &self,
+        symbols: &[String],
+    ) -> Result<Vec<SymbolMarketSnapshot>> {
+        let requested_symbols = symbols
+            .iter()
+            .filter(|symbol| self.supports_symbol(symbol))
+            .map(|symbol| (venue_symbol(&self.config, symbol), symbol.clone()))
+            .collect::<HashMap<_, _>>();
+        if requested_symbols.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let response = self
+            .client
+            .get(format!("{}/v5/market/tickers", self.base_url))
+            .query(&[("category", "linear")])
+            .send()
+            .await
+            .context("failed to request bybit bulk tickers")?
+            .error_for_status()
+            .context("bybit bulk tickers returned non-success status")?
+            .json::<BybitApiResponse<BybitTickerList>>()
+            .await
+            .context("failed to decode bybit bulk tickers")?;
+        if response.ret_code != 0 {
+            return Err(format_bybit_api_error(
+                "bybit bulk tickers failed",
+                response.ret_code,
+                &response.ret_msg,
+            ));
+        }
+
+        let rows = response
+            .result
+            .ok_or_else(|| anyhow!("bybit bulk tickers missing result payload"))?
+            .list;
+        build_bybit_snapshots_from_bulk_rows(&requested_symbols, rows)
+    }
+
     async fn submit_order_once(
         &self,
         request: &OrderRequest,
@@ -944,12 +984,22 @@ impl VenueAdapter for BybitLiveAdapter {
         let mut quotes = Vec::new();
         let mut observed_at_ms = 0_i64;
         let allow_direct_fallback = symbols.len() == 1;
+        let mut missing = Vec::new();
         for symbol in symbols.iter().filter(|symbol| self.supports_symbol(symbol)) {
             if let Some((snapshot, snapshot_observed_at_ms)) = self.cached_snapshot(symbol) {
                 observed_at_ms = observed_at_ms.max(snapshot_observed_at_ms);
                 quotes.push(snapshot);
             } else if allow_direct_fallback {
                 let snapshot = self.fetch_symbol_snapshot(symbol).await?;
+                observed_at_ms = observed_at_ms.max(snapshot.funding_timestamp_ms.min(now_ms()));
+                quotes.push(snapshot);
+            } else {
+                missing.push(symbol.clone());
+            }
+        }
+        if !missing.is_empty() && !allow_direct_fallback {
+            let bulk_snapshots = self.fetch_bulk_symbol_snapshots(&missing).await?;
+            for snapshot in bulk_snapshots {
                 observed_at_ms = observed_at_ms.max(snapshot.funding_timestamp_ms.min(now_ms()));
                 quotes.push(snapshot);
             }
@@ -1194,17 +1244,7 @@ impl VenueAdapter for BybitLiveAdapter {
             .and_then(|result| result.list.into_iter().next())
             .ok_or_else(|| anyhow!("bybit wallet balance missing row"))?;
 
-        Ok(Some(AccountBalanceSnapshot {
-            venue: Venue::Bybit,
-            equity_quote: parse_f64(&row.total_equity)?,
-            wallet_balance_quote: Some(parse_f64(&row.total_wallet_balance)?),
-            available_balance_quote: row
-                .total_available_balance
-                .as_deref()
-                .map(parse_f64)
-                .transpose()?,
-            observed_at_ms: now_ms(),
-        }))
+        bybit_account_balance_snapshot_from_row(&row, now_ms())
     }
 
     fn cached_account_fee_snapshot(&self) -> Option<AccountFeeSnapshot> {
@@ -1708,9 +1748,28 @@ fn extract_bybit_quote_fee(value: Option<&serde_json::Value>) -> Option<f64> {
 }
 
 fn parse_optional_f64_field(raw: Option<&str>) -> Result<Option<f64>> {
-    raw.filter(|value| !value.is_empty())
+    raw.map(str::trim)
+        .filter(|value| !value.is_empty())
         .map(parse_f64)
         .transpose()
+}
+
+fn bybit_account_balance_snapshot_from_row(
+    row: &BybitWalletBalance,
+    observed_at_ms: i64,
+) -> Result<Option<AccountBalanceSnapshot>> {
+    let total_equity = parse_optional_f64_field(Some(&row.total_equity))?;
+    let wallet_balance = parse_optional_f64_field(Some(&row.total_wallet_balance))?;
+    let available_balance = parse_optional_f64_field(row.total_available_balance.as_deref())?;
+    let equity_quote = total_equity.or(wallet_balance).or(available_balance);
+
+    Ok(equity_quote.map(|equity_quote| AccountBalanceSnapshot {
+        venue: Venue::Bybit,
+        equity_quote,
+        wallet_balance_quote: wallet_balance,
+        available_balance_quote: available_balance,
+        observed_at_ms,
+    }))
 }
 
 fn ensure_bybit_order_link_id(client_order_id: &str) -> Result<()> {
@@ -1926,6 +1985,8 @@ struct BybitTickerList {
 
 #[derive(Debug, Deserialize)]
 struct BybitTicker {
+    #[serde(default)]
+    symbol: Option<String>,
     #[serde(rename = "bid1Price")]
     bid1_price: String,
     #[serde(rename = "bid1Size")]
@@ -1942,6 +2003,32 @@ struct BybitTicker {
     turnover_24h: String,
     #[serde(rename = "openInterestValue", default)]
     open_interest_value: String,
+}
+
+fn build_bybit_snapshots_from_bulk_rows(
+    requested_symbols: &HashMap<String, String>,
+    tickers: Vec<BybitTicker>,
+) -> Result<Vec<SymbolMarketSnapshot>> {
+    let mut snapshots = Vec::new();
+    for ticker in tickers {
+        let Some(venue_symbol) = ticker.symbol.as_ref() else {
+            continue;
+        };
+        let Some(symbol) = requested_symbols.get(venue_symbol) else {
+            continue;
+        };
+        snapshots.push(SymbolMarketSnapshot {
+            symbol: symbol.clone(),
+            best_bid: parse_f64(&ticker.bid1_price)?,
+            best_ask: parse_f64(&ticker.ask1_price)?,
+            bid_size: parse_f64(&ticker.bid1_size)?,
+            ask_size: parse_f64(&ticker.ask1_size)?,
+            mark_price: None,
+            funding_rate: parse_f64(&ticker.funding_rate)?,
+            funding_timestamp_ms: parse_i64(&ticker.next_funding_time)?,
+        });
+    }
+    Ok(snapshots)
 }
 
 #[derive(Debug, Deserialize)]
@@ -2133,13 +2220,14 @@ mod tests {
     use crate::models::Venue;
 
     use super::{
-        build_bybit_transfer_status_cache, bybit_position_idx, bybit_position_mode_for_symbol,
-        bybit_position_mode_from_position_idx, bybit_position_mode_retry_allowed,
-        bybit_transfer_status_cache_is_fresh, ensure_bybit_order_link_id,
-        filter_bybit_transfer_statuses, format_bybit_api_error, format_bybit_http_error,
-        prune_bybit_symbol_catalog_entry, should_retry_bybit_order_error,
+        build_bybit_snapshots_from_bulk_rows, build_bybit_transfer_status_cache,
+        bybit_account_balance_snapshot_from_row, bybit_position_idx,
+        bybit_position_mode_for_symbol, bybit_position_mode_from_position_idx,
+        bybit_position_mode_retry_allowed, bybit_transfer_status_cache_is_fresh,
+        ensure_bybit_order_link_id, filter_bybit_transfer_statuses, format_bybit_api_error,
+        format_bybit_http_error, prune_bybit_symbol_catalog_entry, should_retry_bybit_order_error,
         update_bybit_position_mode_slot, validate_bybit_order_request, BybitCoinChain,
-        BybitCoinInfo, BybitInstrumentMeta, BybitPositionMode,
+        BybitCoinInfo, BybitInstrumentMeta, BybitPositionMode, BybitTicker, BybitWalletBalance,
     };
 
     #[test]
@@ -2353,5 +2441,78 @@ mod tests {
                 .to_string()
                 .contains("below min notional")
         );
+    }
+
+    #[test]
+    fn wallet_balance_snapshot_tolerates_empty_total_fields() {
+        let snapshot = bybit_account_balance_snapshot_from_row(
+            &BybitWalletBalance {
+                total_equity: "".to_string(),
+                total_wallet_balance: "96.4".to_string(),
+                total_available_balance: Some("55.0".to_string()),
+            },
+            999,
+        )
+        .expect("parse balance row")
+        .expect("snapshot");
+        assert_eq!(snapshot.venue, Venue::Bybit);
+        assert_eq!(snapshot.equity_quote, 96.4);
+        assert_eq!(snapshot.wallet_balance_quote, Some(96.4));
+        assert_eq!(snapshot.available_balance_quote, Some(55.0));
+        assert_eq!(snapshot.observed_at_ms, 999);
+
+        let empty_snapshot = bybit_account_balance_snapshot_from_row(
+            &BybitWalletBalance {
+                total_equity: "".to_string(),
+                total_wallet_balance: "".to_string(),
+                total_available_balance: Some("".to_string()),
+            },
+            999,
+        )
+        .expect("parse empty row");
+        assert!(empty_snapshot.is_none());
+    }
+
+    #[test]
+    fn bulk_tickers_build_requested_snapshots() {
+        let requested_symbols = HashMap::from([
+            ("ETHUSDT".to_string(), "ETHUSDT".to_string()),
+            ("BTCUSDT".to_string(), "BTCUSDT".to_string()),
+        ]);
+        let tickers = vec![
+            BybitTicker {
+                symbol: Some("ETHUSDT".to_string()),
+                bid1_price: "2100.1".to_string(),
+                bid1_size: "12".to_string(),
+                ask1_price: "2100.2".to_string(),
+                ask1_size: "10".to_string(),
+                funding_rate: "0.0001".to_string(),
+                next_funding_time: "1773964800000".to_string(),
+                turnover_24h: "0".to_string(),
+                open_interest_value: "0".to_string(),
+            },
+            BybitTicker {
+                symbol: Some("XRPUSDT".to_string()),
+                bid1_price: "0.5".to_string(),
+                bid1_size: "1000".to_string(),
+                ask1_price: "0.5001".to_string(),
+                ask1_size: "900".to_string(),
+                funding_rate: "0.0002".to_string(),
+                next_funding_time: "1773964800000".to_string(),
+                turnover_24h: "0".to_string(),
+                open_interest_value: "0".to_string(),
+            },
+        ];
+
+        let snapshots =
+            build_bybit_snapshots_from_bulk_rows(&requested_symbols, tickers).expect("snapshots");
+
+        assert_eq!(snapshots.len(), 1);
+        let snapshot = &snapshots[0];
+        assert_eq!(snapshot.symbol, "ETHUSDT");
+        assert!((snapshot.best_bid - 2100.1).abs() < 1e-9);
+        assert!((snapshot.best_ask - 2100.2).abs() < 1e-9);
+        assert!((snapshot.funding_rate - 0.0001).abs() < 1e-12);
+        assert_eq!(snapshot.funding_timestamp_ms, 1_773_964_800_000);
     }
 }

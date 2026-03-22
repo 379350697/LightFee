@@ -544,6 +544,44 @@ impl BinanceLiveAdapter {
         })
     }
 
+    async fn fetch_bulk_symbol_snapshots(
+        &self,
+        symbols: &[String],
+    ) -> Result<Vec<SymbolMarketSnapshot>> {
+        let requested_symbols = symbols
+            .iter()
+            .filter(|symbol| self.supports_symbol(symbol))
+            .map(|symbol| (venue_symbol(&self.config, symbol), symbol.clone()))
+            .collect::<HashMap<_, _>>();
+        if requested_symbols.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let books = self
+            .client
+            .get(format!("{}/fapi/v1/ticker/bookTicker", self.base_url))
+            .send()
+            .await
+            .context("failed to request binance book ticker bootstrap")?
+            .error_for_status()
+            .context("binance book ticker bootstrap returned non-success status")?
+            .json::<Vec<BinanceBookTickerWithSymbol>>()
+            .await
+            .context("failed to decode binance book ticker bootstrap")?;
+        let premiums = self
+            .client
+            .get(format!("{}/fapi/v1/premiumIndex", self.base_url))
+            .send()
+            .await
+            .context("failed to request binance premium index bootstrap")?
+            .error_for_status()
+            .context("binance premium index bootstrap returned non-success status")?
+            .json::<Vec<BinancePremiumIndexWithSymbol>>()
+            .await
+            .context("failed to decode binance premium index bootstrap")?;
+        build_binance_snapshots_from_bulk_rows(&requested_symbols, books, premiums)
+    }
+
     async fn symbol_meta(&self, symbol: &str) -> Result<BinanceSymbolMeta> {
         if let Some(meta) = self.metadata.lock().expect("lock").get(symbol).cloned() {
             return Ok(meta);
@@ -857,6 +895,7 @@ impl VenueAdapter for BinanceLiveAdapter {
         let mut quotes = Vec::new();
         let mut observed_at_ms = 0_i64;
         let allow_direct_fallback = symbols.len() == 1;
+        let mut missing = Vec::new();
         for symbol in symbols.iter().filter(|symbol| self.supports_symbol(symbol)) {
             if let Some(snapshot) = self.cached_snapshot(symbol) {
                 observed_at_ms = observed_at_ms.max(
@@ -868,6 +907,15 @@ impl VenueAdapter for BinanceLiveAdapter {
                 quotes.push(snapshot);
             } else if allow_direct_fallback {
                 let snapshot = self.fetch_symbol_snapshot(symbol).await?;
+                observed_at_ms = observed_at_ms.max(snapshot.funding_timestamp_ms.min(now_ms()));
+                quotes.push(snapshot);
+            } else {
+                missing.push(symbol.clone());
+            }
+        }
+        if !missing.is_empty() && !allow_direct_fallback {
+            let bulk_snapshots = self.fetch_bulk_symbol_snapshots(&missing).await?;
+            for snapshot in bulk_snapshots {
                 observed_at_ms = observed_at_ms.max(snapshot.funding_timestamp_ms.min(now_ms()));
                 quotes.push(snapshot);
             }
@@ -1456,6 +1504,8 @@ enum BinancePositionMode {
 
 #[derive(Debug, Deserialize)]
 struct BinanceBookTicker {
+    #[serde(default)]
+    symbol: Option<String>,
     #[serde(rename = "bidPrice")]
     bid_price: String,
     #[serde(rename = "bidQty")]
@@ -1466,8 +1516,12 @@ struct BinanceBookTicker {
     ask_qty: String,
 }
 
+type BinanceBookTickerWithSymbol = BinanceBookTicker;
+
 #[derive(Debug, Deserialize)]
 struct BinancePremiumIndex {
+    #[serde(default)]
+    symbol: Option<String>,
     #[serde(
         rename = "markPrice",
         deserialize_with = "deserialize_string_or_number"
@@ -1483,6 +1537,44 @@ struct BinancePremiumIndex {
         deserialize_with = "deserialize_string_or_number"
     )]
     next_funding_time: String,
+}
+
+type BinancePremiumIndexWithSymbol = BinancePremiumIndex;
+
+fn build_binance_snapshots_from_bulk_rows(
+    requested_symbols: &HashMap<String, String>,
+    books: Vec<BinanceBookTickerWithSymbol>,
+    premiums: Vec<BinancePremiumIndexWithSymbol>,
+) -> Result<Vec<SymbolMarketSnapshot>> {
+    let premium_by_symbol = premiums
+        .into_iter()
+        .filter_map(|premium| premium.symbol.clone().map(|symbol| (symbol, premium)))
+        .collect::<HashMap<_, _>>();
+
+    let mut snapshots = Vec::new();
+    for book in books {
+        let Some(venue_symbol) = book.symbol.as_ref() else {
+            continue;
+        };
+        let Some(symbol) = requested_symbols.get(venue_symbol) else {
+            continue;
+        };
+        let Some(premium) = premium_by_symbol.get(venue_symbol) else {
+            continue;
+        };
+        snapshots.push(SymbolMarketSnapshot {
+            symbol: symbol.clone(),
+            best_bid: parse_f64(&book.bid_price)?,
+            best_ask: parse_f64(&book.ask_price)?,
+            bid_size: parse_f64(&book.bid_qty)?,
+            ask_size: parse_f64(&book.ask_qty)?,
+            mark_price: Some(parse_f64(&premium.mark_price)?),
+            funding_rate: parse_f64(&premium.last_funding_rate)?,
+            funding_timestamp_ms: parse_i64(&premium.next_funding_time)?,
+        });
+    }
+
+    Ok(snapshots)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1978,13 +2070,16 @@ fn validate_binance_order_request(
 #[cfg(test)]
 mod tests {
     use super::{
-        binance_position_side, binance_private_fill_wait_ms, build_binance_subscribe_messages,
+        binance_position_side, binance_private_fill_wait_ms,
+        build_binance_snapshots_from_bulk_rows, build_binance_subscribe_messages,
         ensure_binance_client_order_id, format_binance_http_error,
-        should_retry_binance_order_error, validate_binance_order_request, BinancePositionMode,
-        BinancePremiumIndex, BinanceSymbolMeta, BINANCE_MAX_SUBSCRIBE_STREAMS_PER_MESSAGE,
+        should_retry_binance_order_error, validate_binance_order_request, BinanceBookTicker,
+        BinancePositionMode, BinancePremiumIndex, BinanceSymbolMeta,
+        BINANCE_MAX_SUBSCRIBE_STREAMS_PER_MESSAGE,
     };
     use crate::models::Side;
     use anyhow::anyhow;
+    use std::collections::HashMap;
 
     #[test]
     fn premium_index_accepts_integer_next_funding_time() {
@@ -2032,6 +2127,56 @@ mod tests {
             let params = payload["params"].as_array().expect("params");
             assert!(params.len() <= BINANCE_MAX_SUBSCRIBE_STREAMS_PER_MESSAGE);
         }
+    }
+
+    #[test]
+    fn bulk_rows_build_requested_snapshots() {
+        let requested_symbols = HashMap::from([
+            ("ETHUSDT".to_string(), "ETHUSDT".to_string()),
+            ("BTCUSDT".to_string(), "BTCUSDT".to_string()),
+        ]);
+        let books = vec![
+            BinanceBookTicker {
+                symbol: Some("ETHUSDT".to_string()),
+                bid_price: "2100.1".to_string(),
+                bid_qty: "12.0".to_string(),
+                ask_price: "2100.2".to_string(),
+                ask_qty: "10.0".to_string(),
+            },
+            BinanceBookTicker {
+                symbol: Some("XRPUSDT".to_string()),
+                bid_price: "0.5".to_string(),
+                bid_qty: "1000".to_string(),
+                ask_price: "0.5001".to_string(),
+                ask_qty: "900".to_string(),
+            },
+        ];
+        let premiums = vec![
+            BinancePremiumIndex {
+                symbol: Some("ETHUSDT".to_string()),
+                mark_price: "2100.15".to_string(),
+                last_funding_rate: "0.0001".to_string(),
+                next_funding_time: "1773964800000".to_string(),
+            },
+            BinancePremiumIndex {
+                symbol: Some("BTCUSDT".to_string()),
+                mark_price: "65000".to_string(),
+                last_funding_rate: "0.0002".to_string(),
+                next_funding_time: "1773964800000".to_string(),
+            },
+        ];
+
+        let snapshots = build_binance_snapshots_from_bulk_rows(&requested_symbols, books, premiums)
+            .expect("build snapshots");
+
+        assert_eq!(snapshots.len(), 1);
+        let snapshot = &snapshots[0];
+        assert_eq!(snapshot.symbol, "ETHUSDT");
+        assert!((snapshot.best_bid - 2100.1).abs() < 1e-9);
+        assert!((snapshot.best_ask - 2100.2).abs() < 1e-9);
+        assert_eq!(snapshot.mark_price, Some(2100.15));
+        assert!((snapshot.funding_rate - 0.0001).abs() < 1e-12);
+        assert_eq!(snapshot.funding_timestamp_ms, 1_773_964_800_000);
     }
 
     #[test]

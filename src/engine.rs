@@ -120,6 +120,7 @@ const SETTLEMENT_FORCE_CLOSE_DELAY_MS: i64 = 20 * 60 * 1_000;
 const CLOSE_RECONCILIATION_RETRY_BASE_MS: i64 = 30 * 1_000;
 const MARKET_DATA_WINDOW_PREWARM_MS: i64 = 2 * 60 * 1_000;
 const MARKET_DATA_WINDOW_LINGER_MS: i64 = 3 * 60 * 1_000;
+const MARKET_DATA_WARMUP_MIN_MS: i64 = 5 * 1_000;
 const CLOSE_RECONCILIATION_RETRY_MAX_MS: i64 = 5 * 60 * 1_000;
 const CEX_MIN_PERP_VOLUME_24H_QUOTE: f64 = 5_000_000.0;
 const HYPERLIQUID_MIN_PERP_VOLUME_24H_QUOTE: f64 = 1_000_000.0;
@@ -232,6 +233,10 @@ fn resolved_fee_log_entry(
         source: "configured_taker_fee_bps",
         used_fallback: true,
     }
+}
+
+fn market_data_warmup_duration_ms(poll_interval_ms: u64) -> i64 {
+    (poll_interval_ms.min(i64::MAX as u64) as i64).max(MARKET_DATA_WARMUP_MIN_MS)
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -797,7 +802,7 @@ impl Engine {
                 .market_data_activated_at_ms
                 .is_some_and(|activated_at_ms| {
                     now_ms.saturating_sub(activated_at_ms)
-                        < self.config.runtime.poll_interval_ms.min(i64::MAX as u64) as i64
+                        < market_data_warmup_duration_ms(self.config.runtime.poll_interval_ms)
                 })
     }
 
@@ -944,7 +949,9 @@ impl Engine {
                     "market_data.warmup_pending",
                     &json!({
                         "activated_at_ms": self.market_data_activated_at_ms,
-                        "warmup_ms": self.config.runtime.poll_interval_ms,
+                        "warmup_ms": market_data_warmup_duration_ms(
+                            self.config.runtime.poll_interval_ms
+                        ),
                     }),
                 );
                 return Ok(());
@@ -6597,10 +6604,11 @@ mod tests {
     use super::{
         apply_cached_fee_snapshots_to_candidates, cached_flat_guard_reason,
         compact_client_order_id, effective_entry_leg_notional_floor, hyperliquid_entry_gate_reason,
-        order_error_may_have_created_exposure, order_quote_expired_reason, persistent_state_view,
-        remap_no_entry_diagnostic_reason, resolved_fee_log_entry,
-        should_activate_windowed_market_data_with_hysteresis, should_probe_live_recovery,
-        venue_order_health_risk_score, EngineMode, EngineState, VenueOrderHealthSample,
+        market_data_warmup_duration_ms, order_error_may_have_created_exposure,
+        order_quote_expired_reason, persistent_state_view, remap_no_entry_diagnostic_reason,
+        resolved_fee_log_entry, should_activate_windowed_market_data_with_hysteresis,
+        should_probe_live_recovery, venue_order_health_risk_score, EngineMode, EngineState,
+        VenueOrderHealthSample,
     };
     use crate::models::{PositionSnapshot, Venue};
 
@@ -6751,6 +6759,13 @@ mod tests {
             60 * 1_000,
             true,
         ));
+    }
+
+    #[test]
+    fn market_data_warmup_duration_has_minimum_floor() {
+        assert_eq!(market_data_warmup_duration_ms(1_500), 5_000);
+        assert_eq!(market_data_warmup_duration_ms(5_000), 5_000);
+        assert_eq!(market_data_warmup_duration_ms(8_000), 8_000);
     }
 
     #[test]

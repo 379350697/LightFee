@@ -783,24 +783,83 @@ impl OkxLiveAdapter {
             .into_iter()
             .next()
             .ok_or_else(|| anyhow!("okx funding response missing rows for {inst_id}"))?;
-        let best_bid = book
-            .bids
-            .first()
-            .ok_or_else(|| anyhow!("okx bids missing for {inst_id}"))?;
-        let best_ask = book
-            .asks
-            .first()
-            .ok_or_else(|| anyhow!("okx asks missing for {inst_id}"))?;
-        Ok(SymbolMarketSnapshot {
-            symbol: symbol.to_string(),
-            best_bid: parse_f64(&best_bid[0])?,
-            best_ask: parse_f64(&best_ask[0])?,
-            bid_size: parse_f64(&best_bid[1])? * meta.ct_val,
-            ask_size: parse_f64(&best_ask[1])? * meta.ct_val,
-            mark_price: None,
-            funding_rate: parse_f64(&funding.funding_rate)?,
-            funding_timestamp_ms: parse_i64(&funding.next_funding_time)?,
-        })
+        build_okx_snapshot_from_components(symbol, &meta, &book, &funding)
+    }
+
+    async fn fetch_symbol_funding_snapshot(&self, symbol: &str) -> Result<(f64, i64)> {
+        let inst_id = venue_symbol(&self.config, symbol);
+        let funding = self
+            .client
+            .get(format!("{}/api/v5/public/funding-rate", self.base_url))
+            .query(&[("instId", inst_id.as_str())])
+            .send()
+            .await
+            .context("failed to request okx funding rate")?
+            .error_for_status()
+            .context("okx funding rate returned non-success status")?
+            .json::<OkxApiResponse<OkxFundingRate>>()
+            .await
+            .context("failed to decode okx funding rate")?;
+        let funding = ensure_okx_api_success("okx funding rate failed", funding)?;
+        let funding = funding
+            .data
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("okx funding response missing rows for {inst_id}"))?;
+        Ok(parse_okx_funding_snapshot(&funding)?)
+    }
+
+    async fn fetch_tickers_map(&self) -> Result<HashMap<String, OkxTicker>> {
+        let response = self
+            .client
+            .get(format!("{}/api/v5/market/tickers", self.base_url))
+            .query(&[("instType", "SWAP")])
+            .send()
+            .await
+            .context("failed to request okx tickers")?
+            .error_for_status()
+            .context("okx tickers returned non-success status")?
+            .json::<OkxApiResponse<OkxTicker>>()
+            .await
+            .context("failed to decode okx tickers")?;
+        let response = ensure_okx_api_success("okx tickers failed", response)?;
+        Ok(response
+            .data
+            .into_iter()
+            .map(|ticker| (okx_symbol_key(&ticker.inst_id), ticker))
+            .collect())
+    }
+
+    async fn fetch_bulk_symbol_snapshots(
+        &self,
+        requested_symbols: &[String],
+    ) -> Result<Vec<SymbolMarketSnapshot>> {
+        let tickers = self.fetch_tickers_map().await?;
+        let metadata = self.metadata.lock().expect("lock").clone();
+        let mut funding_by_symbol = HashMap::new();
+        for symbol in requested_symbols {
+            if let Some(funding) = self.market_ws.funding(symbol) {
+                funding_by_symbol.insert(symbol.clone(), funding);
+            } else if let Ok(funding) = self.fetch_symbol_funding_snapshot(symbol).await {
+                funding_by_symbol.insert(symbol.clone(), funding);
+            }
+        }
+        build_okx_snapshots_from_bulk_rows(
+            requested_symbols,
+            tickers,
+            &funding_by_symbol,
+            &metadata,
+        )
+    }
+
+    async fn refresh_market_snapshot_from_bulk(
+        &self,
+        symbol: &str,
+    ) -> Result<Option<SymbolMarketSnapshot>> {
+        let snapshots = self
+            .fetch_bulk_symbol_snapshots(&[symbol.to_string()])
+            .await?;
+        Ok(snapshots.into_iter().next())
     }
 
     async fn server_timestamp_ms(&self) -> Result<i64> {
@@ -1150,6 +1209,7 @@ impl VenueAdapter for OkxLiveAdapter {
         let mut quotes = Vec::new();
         let mut observed_at_ms = 0_i64;
         let allow_direct_fallback = symbols.len() == 1;
+        let mut missing = Vec::new();
         for symbol in symbols.iter().filter(|symbol| self.supports_symbol(symbol)) {
             if let Some((snapshot, snapshot_observed_at_ms)) = self.cached_snapshot(symbol).await? {
                 observed_at_ms = observed_at_ms.max(snapshot_observed_at_ms);
@@ -1158,6 +1218,20 @@ impl VenueAdapter for OkxLiveAdapter {
                 let snapshot = self.fetch_symbol_snapshot(symbol).await?;
                 observed_at_ms = observed_at_ms.max(snapshot.funding_timestamp_ms.min(now_ms()));
                 quotes.push(snapshot);
+            } else {
+                missing.push(symbol.clone());
+            }
+        }
+        if !missing.is_empty() && !allow_direct_fallback {
+            match self.fetch_bulk_symbol_snapshots(&missing).await {
+                Ok(mut snapshots) => {
+                    observed_at_ms = observed_at_ms.max(now_ms());
+                    quotes.append(&mut snapshots);
+                }
+                Err(error) if !quotes.is_empty() => {
+                    debug!(?error, missing = ?missing, "okx bulk ticker fallback failed; using cached quotes");
+                }
+                Err(error) => return Err(error),
             }
         }
         if quotes.is_empty() {
@@ -1174,7 +1248,10 @@ impl VenueAdapter for OkxLiveAdapter {
     }
 
     async fn refresh_market_snapshot(&self, symbol: &str) -> Result<VenueMarketSnapshot> {
-        let snapshot = self.fetch_symbol_snapshot(symbol).await?;
+        let snapshot = match self.refresh_market_snapshot_from_bulk(symbol).await? {
+            Some(snapshot) => snapshot,
+            None => self.fetch_symbol_snapshot(symbol).await?,
+        };
         Ok(VenueMarketSnapshot {
             venue: Venue::Okx,
             observed_at_ms: now_ms(),
@@ -1404,13 +1481,7 @@ impl VenueAdapter for OkxLiveAdapter {
             .next()
             .ok_or_else(|| anyhow!("okx account balance missing row"))?;
 
-        Ok(Some(AccountBalanceSnapshot {
-            venue: Venue::Okx,
-            equity_quote: parse_f64(&row.total_eq)?,
-            wallet_balance_quote: row.adj_eq.as_deref().map(parse_f64).transpose()?,
-            available_balance_quote: row.avail_eq.as_deref().map(parse_f64).transpose()?,
-            observed_at_ms: now_ms(),
-        }))
+        okx_account_balance_snapshot_from_row(&row, now_ms())
     }
 
     fn cached_account_fee_snapshot(&self) -> Option<AccountFeeSnapshot> {
@@ -1791,6 +1862,16 @@ struct OkxFundingRate {
 
 #[derive(Debug, Deserialize)]
 struct OkxTicker {
+    #[serde(rename = "instId")]
+    inst_id: String,
+    #[serde(rename = "bidPx")]
+    bid_px: String,
+    #[serde(rename = "askPx")]
+    ask_px: String,
+    #[serde(rename = "bidSz")]
+    bid_sz: String,
+    #[serde(rename = "askSz")]
+    ask_sz: String,
     #[serde(rename = "last")]
     last: String,
     #[serde(rename = "volCcy24h")]
@@ -1949,6 +2030,72 @@ fn okx_instrument_meta_map_from_rows(
         );
     }
     Ok(map)
+}
+
+fn parse_okx_funding_snapshot(funding: &OkxFundingRate) -> Result<(f64, i64)> {
+    Ok((
+        parse_f64(&funding.funding_rate)?,
+        parse_i64(&funding.next_funding_time)?,
+    ))
+}
+
+fn build_okx_snapshot_from_components(
+    symbol: &str,
+    meta: &OkxInstrumentMeta,
+    book: &OkxBook,
+    funding: &OkxFundingRate,
+) -> Result<SymbolMarketSnapshot> {
+    let best_bid = book
+        .bids
+        .first()
+        .ok_or_else(|| anyhow!("okx bids missing for {}", symbol))?;
+    let best_ask = book
+        .asks
+        .first()
+        .ok_or_else(|| anyhow!("okx asks missing for {}", symbol))?;
+    let (funding_rate, funding_timestamp_ms) = parse_okx_funding_snapshot(funding)?;
+    Ok(SymbolMarketSnapshot {
+        symbol: symbol.to_string(),
+        best_bid: parse_f64(&best_bid[0])?,
+        best_ask: parse_f64(&best_ask[0])?,
+        bid_size: parse_f64(&best_bid[1])? * meta.ct_val,
+        ask_size: parse_f64(&best_ask[1])? * meta.ct_val,
+        mark_price: None,
+        funding_rate,
+        funding_timestamp_ms,
+    })
+}
+
+fn build_okx_snapshots_from_bulk_rows(
+    requested_symbols: &[String],
+    tickers: HashMap<String, OkxTicker>,
+    funding_by_symbol: &HashMap<String, (f64, i64)>,
+    metadata: &HashMap<String, OkxInstrumentMeta>,
+) -> Result<Vec<SymbolMarketSnapshot>> {
+    let mut snapshots = Vec::new();
+    for symbol in requested_symbols {
+        let Some(ticker) = tickers.get(symbol) else {
+            continue;
+        };
+        let Some(meta) = metadata.get(symbol) else {
+            continue;
+        };
+        let Some((funding_rate, funding_timestamp_ms)) = funding_by_symbol.get(symbol).copied()
+        else {
+            continue;
+        };
+        snapshots.push(SymbolMarketSnapshot {
+            symbol: symbol.clone(),
+            best_bid: parse_f64(&ticker.bid_px)?,
+            best_ask: parse_f64(&ticker.ask_px)?,
+            bid_size: parse_f64(&ticker.bid_sz)? * meta.ct_val,
+            ask_size: parse_f64(&ticker.ask_sz)? * meta.ct_val,
+            mark_price: None,
+            funding_rate,
+            funding_timestamp_ms,
+        });
+    }
+    Ok(snapshots)
 }
 
 async fn fetch_okx_public_instrument_meta_map(
@@ -2174,6 +2321,31 @@ struct OkxTradeFeeRow {
     taker: String,
 }
 
+fn parse_optional_okx_balance_quote(raw: Option<&str>) -> Result<Option<f64>> {
+    raw.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(parse_f64)
+        .transpose()
+}
+
+fn okx_account_balance_snapshot_from_row(
+    row: &OkxAccountBalance,
+    observed_at_ms: i64,
+) -> Result<Option<AccountBalanceSnapshot>> {
+    let total_equity = parse_optional_okx_balance_quote(Some(&row.total_eq))?;
+    let wallet_balance = parse_optional_okx_balance_quote(row.adj_eq.as_deref())?;
+    let available_balance = parse_optional_okx_balance_quote(row.avail_eq.as_deref())?;
+    let equity_quote = total_equity.or(wallet_balance).or(available_balance);
+
+    Ok(equity_quote.map(|equity_quote| AccountBalanceSnapshot {
+        venue: Venue::Okx,
+        equity_quote,
+        wallet_balance_quote: wallet_balance,
+        available_balance_quote: available_balance,
+        observed_at_ms,
+    }))
+}
+
 fn ensure_okx_client_order_id(client_order_id: &str) -> Result<()> {
     if client_order_id.is_empty() {
         return Err(anyhow!("okx client order id must not be empty"));
@@ -2231,13 +2403,14 @@ mod tests {
     use std::collections::{HashMap, HashSet};
 
     use super::{
-        build_okx_private_subscribe_messages, build_okx_subscribe_messages,
-        ensure_okx_client_order_id, format_okx_http_error, format_okx_order_ack_error,
-        format_okx_order_response_error, is_benign_okx_private_ws_error,
+        build_okx_private_subscribe_messages, build_okx_snapshots_from_bulk_rows,
+        build_okx_subscribe_messages, ensure_okx_client_order_id, format_okx_http_error,
+        format_okx_order_ack_error, format_okx_order_response_error,
+        is_benign_okx_private_ws_error, okx_account_balance_snapshot_from_row,
         okx_instrument_meta_map_from_rows, okx_pos_side, okx_trade_fee_snapshot_from_row,
         prune_okx_symbol_catalog_entry, should_retry_okx_order_error, validate_okx_order_request,
-        OkxApiResponse, OkxInstrument, OkxInstrumentMeta, OkxOrderAck, OkxPositionMode,
-        OkxTradeFeeRow, OKX_MAX_SUBSCRIBE_ARGS_PER_MESSAGE,
+        OkxAccountBalance, OkxApiResponse, OkxInstrument, OkxInstrumentMeta, OkxOrderAck,
+        OkxPositionMode, OkxTicker, OkxTradeFeeRow, OKX_MAX_SUBSCRIBE_ARGS_PER_MESSAGE,
     };
     use crate::models::{Side, Venue};
     use tokio_tungstenite::tungstenite::{error::ProtocolError, Error as WsError};
@@ -2456,6 +2629,82 @@ mod tests {
         assert_eq!(snapshot.maker_fee_bps, -2.0);
         assert_eq!(snapshot.taker_fee_bps, -5.0);
         assert_eq!(snapshot.source, "okx_trade_fee:ETH-USDT");
+    }
+
+    #[test]
+    fn account_balance_snapshot_tolerates_empty_total_eq() {
+        let snapshot = okx_account_balance_snapshot_from_row(
+            &OkxAccountBalance {
+                total_eq: "".to_string(),
+                adj_eq: Some("88.5".to_string()),
+                avail_eq: Some("70.25".to_string()),
+            },
+            321,
+        )
+        .expect("parse balance row")
+        .expect("snapshot");
+        assert_eq!(snapshot.venue, Venue::Okx);
+        assert_eq!(snapshot.equity_quote, 88.5);
+        assert_eq!(snapshot.wallet_balance_quote, Some(88.5));
+        assert_eq!(snapshot.available_balance_quote, Some(70.25));
+        assert_eq!(snapshot.observed_at_ms, 321);
+
+        let empty_snapshot = okx_account_balance_snapshot_from_row(
+            &OkxAccountBalance {
+                total_eq: "".to_string(),
+                adj_eq: Some("".to_string()),
+                avail_eq: Some("".to_string()),
+            },
+            321,
+        )
+        .expect("parse empty row");
+        assert!(empty_snapshot.is_none());
+    }
+
+    #[test]
+    fn bulk_tickers_build_requested_snapshots() {
+        let requested_symbols = vec!["ETHUSDT".to_string()];
+        let tickers = HashMap::from([(
+            "ETHUSDT".to_string(),
+            OkxTicker {
+                inst_id: "ETH-USDT-SWAP".to_string(),
+                bid_px: "3010".to_string(),
+                ask_px: "3011".to_string(),
+                bid_sz: "25".to_string(),
+                ask_sz: "30".to_string(),
+                last: "3010.5".to_string(),
+                vol_ccy_24h: "1234567".to_string(),
+            },
+        )]);
+        let funding_by_symbol =
+            HashMap::from([("ETHUSDT".to_string(), (0.0003, 1_710_000_000_000))]);
+        let metadata = HashMap::from([(
+            "ETHUSDT".to_string(),
+            OkxInstrumentMeta {
+                ct_val: 0.01,
+                lot_sz: 1.0,
+                min_sz: None,
+                max_mkt_sz: None,
+            },
+        )]);
+
+        let snapshots = build_okx_snapshots_from_bulk_rows(
+            &requested_symbols,
+            tickers,
+            &funding_by_symbol,
+            &metadata,
+        )
+        .expect("build snapshots");
+
+        assert_eq!(snapshots.len(), 1);
+        let snapshot = &snapshots[0];
+        assert_eq!(snapshot.symbol, "ETHUSDT");
+        assert_eq!(snapshot.best_bid, 3010.0);
+        assert_eq!(snapshot.best_ask, 3011.0);
+        assert_eq!(snapshot.bid_size, 0.25);
+        assert_eq!(snapshot.ask_size, 0.30);
+        assert_eq!(snapshot.funding_rate, 0.0003);
+        assert_eq!(snapshot.funding_timestamp_ms, 1_710_000_000_000);
     }
 
     #[test]
