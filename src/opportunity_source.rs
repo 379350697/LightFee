@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -9,6 +10,9 @@ use chrono::DateTime;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::models::{AssetTransferStatus, Venue};
+
+const HUMANIZED_HINT_FETCH_BASE_INTERVAL_MS: i64 = 25_000;
+const HUMANIZED_HINT_FETCH_JITTER_MS: i64 = 10_000;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct OpportunityHint {
@@ -46,6 +50,7 @@ pub trait TransferStatusSource: Send + Sync {
 pub struct ChillybotOpportunitySource {
     base_url: String,
     client: reqwest::Client,
+    hint_fetch_state: Arc<Mutex<HintFetchState>>,
 }
 
 impl ChillybotOpportunitySource {
@@ -57,6 +62,7 @@ impl ChillybotOpportunitySource {
         Ok(Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             client,
+            hint_fetch_state: Arc::new(Mutex::new(HintFetchState::default())),
         })
     }
 }
@@ -65,6 +71,7 @@ impl ChillybotOpportunitySource {
 pub struct FeedgrabChillybotSource {
     base_url: String,
     client: reqwest::Client,
+    hint_fetch_state: Arc<Mutex<HintFetchState>>,
 }
 
 impl FeedgrabChillybotSource {
@@ -76,6 +83,7 @@ impl FeedgrabChillybotSource {
         Ok(Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             client,
+            hint_fetch_state: Arc::new(Mutex::new(HintFetchState::default())),
         })
     }
 
@@ -112,14 +120,39 @@ impl FeedgrabChillybotSource {
 #[async_trait]
 impl OpportunityHintSource for ChillybotOpportunitySource {
     async fn fetch_hints(&self, symbols: &[String]) -> Result<Vec<OpportunityHint>> {
+        let now_ms = wall_clock_now_ms();
+        let requested_symbols = normalized_symbol_set(symbols);
+        if let Some(hints) = self
+            .hint_fetch_state
+            .lock()
+            .expect("lock")
+            .cached_hints_if_fresh(now_ms, &requested_symbols)
+        {
+            return Ok(hints);
+        }
         let response = self
             .client
             .get(format!("{}/api/data", self.base_url))
             .send()
             .await
-            .context("failed to request chillybot funding data")?
-            .error_for_status()
-            .context("chillybot returned non-success status")?;
+            .context("failed to request chillybot funding data");
+        let response = match response {
+            Ok(response) => response
+                .error_for_status()
+                .context("chillybot returned non-success status"),
+            Err(error) => Err(error),
+        };
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                let mut state = self.hint_fetch_state.lock().expect("lock");
+                if let Some(hints) = state.cached_hints_on_fetch_error(now_ms, &requested_symbols) {
+                    return Ok(hints);
+                }
+                state.record_fetch_attempt(now_ms, &requested_symbols, 0xC11B0A);
+                return Err(error);
+            }
+        };
         let payload = response
             .json::<ChillybotResponse>()
             .await
@@ -215,6 +248,10 @@ impl OpportunityHintSource for ChillybotOpportunitySource {
                 .total_cmp(&opportunity_score(left))
                 .then_with(|| left.symbol.cmp(&right.symbol))
         });
+        self.hint_fetch_state
+            .lock()
+            .expect("lock")
+            .store_fetched_hints(now_ms, requested_symbols, hints.clone(), 0xC11B0A);
         Ok(hints)
     }
 }
@@ -294,10 +331,31 @@ impl TransferStatusSource for ChillybotOpportunitySource {
 #[async_trait]
 impl OpportunityHintSource for FeedgrabChillybotSource {
     async fn fetch_hints(&self, symbols: &[String]) -> Result<Vec<OpportunityHint>> {
+        let now_ms = wall_clock_now_ms();
+        let requested_symbols = normalized_symbol_set(symbols);
+        if let Some(hints) = self
+            .hint_fetch_state
+            .lock()
+            .expect("lock")
+            .cached_hints_if_fresh(now_ms, &requested_symbols)
+        {
+            return Ok(hints);
+        }
         let payload = self
             .fetch_jina_json::<ChillybotResponse>("api/data")
             .await
-            .context("failed to fetch chillybot funding via feedgrab-jina")?;
+            .context("failed to fetch chillybot funding via feedgrab-jina");
+        let payload = match payload {
+            Ok(payload) => payload,
+            Err(error) => {
+                let mut state = self.hint_fetch_state.lock().expect("lock");
+                if let Some(hints) = state.cached_hints_on_fetch_error(now_ms, &requested_symbols) {
+                    return Ok(hints);
+                }
+                state.record_fetch_attempt(now_ms, &requested_symbols, 0xF33D6A8);
+                return Err(error);
+            }
+        };
 
         let wanted = symbols
             .iter()
@@ -389,7 +447,73 @@ impl OpportunityHintSource for FeedgrabChillybotSource {
                 .total_cmp(&opportunity_score(left))
                 .then_with(|| left.symbol.cmp(&right.symbol))
         });
+        self.hint_fetch_state
+            .lock()
+            .expect("lock")
+            .store_fetched_hints(now_ms, requested_symbols, hints.clone(), 0xF33D6A8);
         Ok(hints)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct HintFetchState {
+    cached_hints: Option<Vec<OpportunityHint>>,
+    cached_symbols: BTreeSet<String>,
+    next_allowed_fetch_ms: i64,
+}
+
+impl HintFetchState {
+    fn cached_hints_if_fresh(
+        &self,
+        now_ms: i64,
+        requested_symbols: &BTreeSet<String>,
+    ) -> Option<Vec<OpportunityHint>> {
+        if self.cached_hints.is_none() || &self.cached_symbols != requested_symbols {
+            return None;
+        }
+        if now_ms < self.next_allowed_fetch_ms {
+            return self.cached_hints.clone();
+        }
+        None
+    }
+
+    fn cached_hints_on_fetch_error(
+        &mut self,
+        now_ms: i64,
+        requested_symbols: &BTreeSet<String>,
+    ) -> Option<Vec<OpportunityHint>> {
+        if &self.cached_symbols != requested_symbols {
+            return None;
+        }
+        self.cached_hints_if_present(now_ms)
+    }
+
+    fn cached_hints_if_present(&mut self, _now_ms: i64) -> Option<Vec<OpportunityHint>> {
+        self.cached_hints.clone()
+    }
+
+    fn store_fetched_hints(
+        &mut self,
+        now_ms: i64,
+        requested_symbols: BTreeSet<String>,
+        hints: Vec<OpportunityHint>,
+        salt: u64,
+    ) {
+        self.cached_symbols = requested_symbols;
+        self.cached_hints = Some(hints);
+        self.next_allowed_fetch_ms =
+            now_ms.saturating_add(humanized_hint_fetch_interval_ms(now_ms, salt));
+    }
+
+    fn record_fetch_attempt(
+        &mut self,
+        now_ms: i64,
+        requested_symbols: &BTreeSet<String>,
+        salt: u64,
+    ) {
+        self.cached_symbols = requested_symbols.clone();
+        self.next_allowed_fetch_ms =
+            now_ms.saturating_add(humanized_hint_fetch_interval_ms(now_ms, salt));
     }
 }
 
@@ -548,4 +672,96 @@ pub fn normalize_symbol_key(symbol: &str) -> String {
         }
     }
     sanitized
+}
+
+fn normalized_symbol_set(symbols: &[String]) -> BTreeSet<String> {
+    symbols
+        .iter()
+        .map(|symbol| normalize_symbol_key(symbol))
+        .filter(|symbol| !symbol.is_empty())
+        .collect()
+}
+
+fn humanized_hint_fetch_interval_ms(now_ms: i64, salt: u64) -> i64 {
+    let base = HUMANIZED_HINT_FETCH_BASE_INTERVAL_MS;
+    let spread = HUMANIZED_HINT_FETCH_JITTER_MS.max(0);
+    if spread == 0 {
+        return base.max(1);
+    }
+    let now_u64 = now_ms.max(0) as u64;
+    let offset = now_u64
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(salt)
+        % (spread as u64 + 1);
+    base.saturating_add(offset as i64).max(1)
+}
+
+fn wall_clock_now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        humanized_hint_fetch_interval_ms, normalize_symbol_key, normalized_symbol_set,
+        HintFetchState, OpportunityHint,
+    };
+    use crate::models::Venue;
+
+    fn hint(symbol: &str) -> OpportunityHint {
+        OpportunityHint {
+            symbol: symbol.to_string(),
+            long_venue: Venue::Binance,
+            short_venue: Venue::Okx,
+            price_diff_pct: 0.1,
+            funding_diff_pct_per_hour: 0.01,
+            direction_consistent: true,
+            interval_aligned: true,
+            source: "test".to_string(),
+        }
+    }
+
+    #[test]
+    fn humanized_hint_interval_stays_within_expected_bounds() {
+        let interval = humanized_hint_fetch_interval_ms(1_700_000_000_000, 0x1234);
+        assert!((25_000..=35_000).contains(&interval));
+    }
+
+    #[test]
+    fn hint_fetch_state_reuses_cached_hints_until_due_for_same_symbols() {
+        let now_ms = 1_000_000;
+        let requested = normalized_symbol_set(&["BTCUSDT".to_string(), "ETHUSDT".to_string()]);
+        let mut state = HintFetchState::default();
+        state.store_fetched_hints(now_ms, requested.clone(), vec![hint("BTC")], 0x55AA);
+
+        let cached = state
+            .cached_hints_if_fresh(now_ms + 5_000, &requested)
+            .expect("cached hints");
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].symbol, "BTC");
+    }
+
+    #[test]
+    fn hint_fetch_state_does_not_reuse_cache_for_different_symbol_sets() {
+        let now_ms = 1_000_000;
+        let mut state = HintFetchState::default();
+        state.store_fetched_hints(
+            now_ms,
+            normalized_symbol_set(&["BTCUSDT".to_string()]),
+            vec![hint("BTC")],
+            0x55AA,
+        );
+
+        let different_symbols = normalized_symbol_set(&["ETHUSDT".to_string()]);
+        assert!(state
+            .cached_hints_if_fresh(now_ms + 5_000, &different_symbols)
+            .is_none());
+    }
+
+    #[test]
+    fn normalize_symbol_set_uses_normalized_keys() {
+        let symbols = normalized_symbol_set(&["btcusdt".to_string(), " ETH-USDT ".to_string()]);
+        assert!(symbols.contains(&normalize_symbol_key("BTCUSDT")));
+        assert!(symbols.contains(&normalize_symbol_key("ETH-USDT")));
+    }
 }

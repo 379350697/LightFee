@@ -834,6 +834,51 @@ impl Engine {
         );
     }
 
+    fn log_market_data_warmup_status(&mut self, now_ms: i64) {
+        let warmup_ms = market_data_warmup_duration_ms(self.config.runtime.poll_interval_ms);
+        let activated_at_ms = self.market_data_activated_at_ms;
+        let elapsed_ms =
+            activated_at_ms.map(|activated_at| now_ms.saturating_sub(activated_at).max(0));
+        let remaining_ms = elapsed_ms
+            .map(|elapsed| warmup_ms.saturating_sub(elapsed).max(0))
+            .unwrap_or(warmup_ms.max(0));
+        let venues = self
+            .adapters
+            .iter()
+            .map(|(venue, adapter)| {
+                let degradation_reason = self.market_data_degradation_reason(*venue, now_ms);
+                json!({
+                    "venue": venue,
+                    "supports_activity_control": adapter.supports_market_data_activity_control(),
+                    "market_worker_count": adapter.market_worker_count(),
+                    "private_worker_count": adapter.private_worker_count(),
+                    "degradation_reason": degradation_reason,
+                })
+            })
+            .collect::<Vec<_>>();
+        self.log_repeated_failure_event(
+            "runtime.market_data_warmup_status",
+            format!(
+                "runtime.market_data_warmup_status:{}",
+                activated_at_ms.unwrap_or_default()
+            ),
+            &json!({
+                "mode": self.state.mode,
+                "warmup_kind": "fixed_activation_delay",
+                "market_data_active": self.market_data_active,
+                "supports_windowed_market_data_control": self.supports_windowed_market_data_control(),
+                "should_activate_market_data": self.should_activate_market_data(now_ms),
+                "activated_at_ms": activated_at_ms,
+                "elapsed_ms": elapsed_ms,
+                "warmup_ms": warmup_ms,
+                "remaining_ms": remaining_ms,
+                "open_position_count": self.active_position_count(),
+                "scan_symbol_count": self.active_scan_symbols().len(),
+                "venues": venues,
+            }),
+        );
+    }
+
     fn candidate_in_entry_batch_finalization_window(
         &self,
         now_ms: i64,
@@ -1064,6 +1109,7 @@ impl Engine {
                 self.state.last_market_ts_ms = Some(tick_started_at_ms);
                 let warmup_ms =
                     market_data_warmup_duration_ms(self.config.runtime.poll_interval_ms);
+                self.log_market_data_warmup_status(tick_started_at_ms);
                 self.log_event(
                     "market_data.warmup_pending",
                     &json!({
@@ -1291,7 +1337,15 @@ impl Engine {
             selected_candidates
         } else {
             self.state.last_scan = None;
-            Vec::new()
+            if self.state.mode == EngineMode::Running
+                && self.config.runtime.auto_trade_enabled
+                && self.config.strategy.entry_batch_quiet_window_secs > 0
+                && !self.buffered_entry_candidates.is_empty()
+            {
+                self.select_entry_candidates_from_buffer_if_quiet(tick_started_at_ms, &market)
+            } else {
+                Vec::new()
+            }
         };
 
         if self.state.mode == EngineMode::Running && self.config.runtime.auto_trade_enabled {
@@ -1993,19 +2047,8 @@ impl Engine {
             return Vec::new();
         }
         let force_finalize_selection = self.buffered_entry_batch_finalization_window(now_ms);
-        let quiet_window_ms = self
-            .config
-            .strategy
-            .entry_batch_quiet_window_secs
-            .max(0)
-            .saturating_mul(1000);
         if !force_finalize_selection {
-            let Some(last_new_ms) = self.last_new_entry_candidate_ms else {
-                return Vec::new();
-            };
-            if now_ms.saturating_sub(last_new_ms) < quiet_window_ms {
-                return Vec::new();
-            }
+            return Vec::new();
         }
 
         let buffered = self
@@ -2028,7 +2071,7 @@ impl Engine {
                 &json!({
                     "buffered_candidate_count": buffered.len(),
                     "selected_count": selected.len(),
-                    "quiet_window_ms": quiet_window_ms,
+                    "selection_trigger": "scan_window_end",
                     "forced_by_window_end": force_finalize_selection,
                     "selection_symbols": selected.iter().map(|c| c.symbol.clone()).collect::<Vec<_>>()
                 }),
@@ -6908,10 +6951,6 @@ fn append_object_field(
 }
 
 fn is_entry_batch_finalization_window_ms(config: &AppConfig, remaining_ms: i64) -> bool {
-    if remaining_ms <= 0 {
-        return false;
-    }
-
     let max_before_ms = config
         .strategy
         .max_scan_minutes_before_funding
@@ -6924,8 +6963,7 @@ fn is_entry_batch_finalization_window_ms(config: &AppConfig, remaining_ms: i64) 
         .saturating_mul(60_000);
 
     if max_before_ms > 0 {
-        return remaining_ms >= min_before_ms
-            && remaining_ms <= min_before_ms.saturating_add(ENTRY_BATCH_FINALIZATION_LEAD_MS);
+        return remaining_ms <= min_before_ms;
     }
 
     let entry_window_ms = config
@@ -7193,7 +7231,7 @@ mod tests {
     }
 
     #[test]
-    fn entry_batch_finalization_window_starts_three_minutes_before_scan_end() {
+    fn entry_batch_finalization_window_starts_at_scan_end_boundary() {
         let config = AppConfig {
             runtime: RuntimeConfig::default(),
             strategy: StrategyConfig {
@@ -7216,15 +7254,15 @@ mod tests {
         ));
         assert!(is_entry_batch_finalization_window_ms(
             &config,
-            8 * 60 * 1_000
+            5 * 60 * 1_000
         ));
         assert!(is_entry_batch_finalization_window_ms(
             &config,
-            5 * 60 * 1_000
+            4 * 60 * 1_000
         ));
         assert!(!is_entry_batch_finalization_window_ms(
             &config,
-            4 * 60 * 1_000
+            6 * 60 * 1_000
         ));
     }
 
@@ -7286,7 +7324,7 @@ mod tests {
         let new_candidate =
             test_candidate("ethusdt:binance->okx", "ETHUSDT", 30.0, 12 * 60 * 1_000);
         engine.update_entry_candidate_buffer(
-            4 * 60 * 1_000,
+            7 * 60 * 1_000,
             &[refreshed_candidate.clone(), new_candidate],
         );
 
@@ -7302,7 +7340,7 @@ mod tests {
     }
 
     #[test]
-    fn entry_batch_finalization_forces_selection_without_waiting_for_quiet_window() {
+    fn entry_batch_finalization_waits_until_window_end_before_selecting() {
         let temp = TempDir::new().expect("tempdir");
         let event_log_path = temp.path().join("events.jsonl");
         let snapshot_path = temp.path().join("state.json");
@@ -7366,7 +7404,7 @@ mod tests {
         let market = MarketView::from_snapshots(vec![
             VenueMarketSnapshot {
                 venue: Venue::Binance,
-                observed_at_ms: 4 * 60 * 1_000,
+                observed_at_ms: 7 * 60 * 1_000,
                 symbols: vec![
                     test_symbol_snapshot("BTCUSDT", 100.0, 101.0, 12 * 60 * 1_000),
                     test_symbol_snapshot("ETHUSDT", 200.0, 201.0, 12 * 60 * 1_000),
@@ -7374,7 +7412,7 @@ mod tests {
             },
             VenueMarketSnapshot {
                 venue: Venue::Okx,
-                observed_at_ms: 4 * 60 * 1_000,
+                observed_at_ms: 7 * 60 * 1_000,
                 symbols: vec![
                     test_symbol_snapshot("BTCUSDT", 100.1, 101.1, 12 * 60 * 1_000),
                     test_symbol_snapshot("ETHUSDT", 200.1, 201.1, 12 * 60 * 1_000),
@@ -7382,8 +7420,13 @@ mod tests {
             },
         ]);
 
-        let selected = engine.select_entry_candidates_from_buffer_if_quiet(4 * 60 * 1_000, &market);
+        let selected_before_boundary =
+            engine.select_entry_candidates_from_buffer_if_quiet(4 * 60 * 1_000, &market);
+        assert!(selected_before_boundary.is_empty());
+        assert_eq!(engine.buffered_entry_candidates.len(), 2);
+        assert_eq!(engine.last_new_entry_candidate_ms, Some(4 * 60 * 1_000));
 
+        let selected = engine.select_entry_candidates_from_buffer_if_quiet(7 * 60 * 1_000, &market);
         assert_eq!(selected.len(), 2);
         assert!(engine.buffered_entry_candidates.is_empty());
         assert_eq!(engine.last_new_entry_candidate_ms, None);
@@ -7527,6 +7570,32 @@ mod tests {
             record.kind == "runtime.no_scan_reason"
                 && record.payload["reason"].as_str() == Some("market_data_warmup_pending")
         }));
+        let warmup_status = records
+            .iter()
+            .find(|record| record.kind == "runtime.market_data_warmup_status")
+            .expect("warmup status log");
+        assert_eq!(
+            warmup_status.payload["warmup_kind"].as_str(),
+            Some("fixed_activation_delay")
+        );
+        assert_eq!(warmup_status.payload["mode"].as_str(), Some("running"));
+        assert_eq!(
+            warmup_status.payload["supports_windowed_market_data_control"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(warmup_status.payload["scan_symbol_count"].as_u64(), Some(1));
+        assert!(
+            warmup_status.payload["remaining_ms"]
+                .as_i64()
+                .unwrap_or_default()
+                >= 0
+        );
+        let venues = warmup_status.payload["venues"]
+            .as_array()
+            .expect("venues array");
+        assert_eq!(venues.len(), 1);
+        assert_eq!(venues[0]["venue"].as_str(), Some("aster"));
+        assert_eq!(venues[0]["supports_activity_control"].as_bool(), Some(true));
     }
 
     #[tokio::test]
