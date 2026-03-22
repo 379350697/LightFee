@@ -8,8 +8,9 @@ use anyhow::{anyhow, Context, Result};
 use chrono::{Duration, FixedOffset, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use lightfee::{
     config::RuntimeMode, AppConfig, AsterLiveAdapter, BalanceSnapshotFailure,
-    BalanceSnapshotReport, BinanceLiveAdapter, BitgetLiveAdapter, BybitLiveAdapter, GateLiveAdapter,
-    HyperliquidLiveAdapter, OkxLiveAdapter, ScriptedVenueAdapter, Venue, VenueAdapter,
+    BalanceSnapshotReport, BinanceLiveAdapter, BitgetLiveAdapter, BybitLiveAdapter,
+    GateLiveAdapter, HyperliquidLiveAdapter, OkxLiveAdapter, ScriptedVenueAdapter, Venue,
+    VenueAdapter,
 };
 use rusqlite::{params, Connection};
 
@@ -100,11 +101,7 @@ async fn main() -> Result<()> {
 
     println!(
         "daily_930_saved date={} total_equity_quote={:?} window_net_quote={} window=[{}, {})",
-        report_date,
-        snapshot.total_equity_quote,
-        window_net_quote,
-        window_start_ms,
-        window_end_ms
+        report_date, snapshot.total_equity_quote, window_net_quote, window_start_ms, window_end_ms
     );
 
     Ok(())
