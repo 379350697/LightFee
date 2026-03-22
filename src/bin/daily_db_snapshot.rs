@@ -5,50 +5,28 @@ use std::{
 };
 
 use anyhow::{anyhow, Context, Result};
-use chrono::{Duration, Local, NaiveDate};
+use chrono::{Duration, FixedOffset, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use lightfee::{
-    analyze_daily_journal_file, config::RuntimeMode, AccountBalanceSnapshot, AppConfig,
-    AsterLiveAdapter, BalanceSnapshotFailure, BalanceSnapshotReport, BinanceLiveAdapter,
-    BitgetLiveAdapter, BybitLiveAdapter, DailyProfitSummary, GateLiveAdapter,
-    HyperliquidLiveAdapter, JsonlJournal, OkxLiveAdapter, ScriptedVenueAdapter, Venue,
-    VenueAdapter,
+    config::RuntimeMode, AppConfig, AsterLiveAdapter, BalanceSnapshotFailure,
+    BalanceSnapshotReport, BinanceLiveAdapter, BitgetLiveAdapter, BybitLiveAdapter, GateLiveAdapter,
+    HyperliquidLiveAdapter, OkxLiveAdapter, ScriptedVenueAdapter, Venue, VenueAdapter,
 };
-use serde::Serialize;
-
-#[derive(Debug, Serialize)]
-struct DailyReportOutput {
-    report_date: String,
-    generated_at_ms: i64,
-    current_balance_snapshot: BalanceSnapshotReport,
-    daily_profit_summary: Option<DailyProfitSummary>,
-}
-
-#[derive(Debug, Serialize)]
-struct BalanceSnapshotEvent {
-    total_equity_quote: Option<f64>,
-    venues: Vec<AccountBalanceSnapshot>,
-    failed_venues: Vec<BalanceSnapshotFailure>,
-}
+use rusqlite::{params, Connection};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = env::args().skip(1).collect::<Vec<_>>();
     if args.is_empty() {
         return Err(anyhow!(
-            "usage: cargo run --bin daily_report -- [--json] [--date YYYY-MM-DD] <config-path>"
+            "usage: cargo run --bin daily_db_snapshot -- [--date YYYY-MM-DD] <config-path>"
         ));
     }
 
-    let mut json_output = false;
     let mut date = None;
     let mut config_path = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
-            "--json" => {
-                json_output = true;
-                index += 1;
-            }
             "--date" => {
                 let value = args
                     .get(index + 1)
@@ -67,43 +45,102 @@ async fn main() -> Result<()> {
             }
         }
     }
-    let date = date.unwrap_or_else(|| Local::now().date_naive() - Duration::days(1));
+
+    let report_date = date.unwrap_or_else(|| Local::now().date_naive());
     let config_path = config_path.ok_or_else(|| anyhow!("missing config path"))?;
-
     let config = AppConfig::load(&config_path)?;
-    let journal = JsonlJournal::with_capacity(
-        &config.persistence.event_log_path,
-        config.runtime.journal_async_queue_capacity,
-    );
-    let generated_at_ms = chrono::Utc::now().timestamp_millis();
-    let snapshot = fetch_balance_snapshot(&config, &config_path, generated_at_ms).await?;
-    let snapshot_event = BalanceSnapshotEvent {
-        total_equity_quote: snapshot.total_equity_quote,
-        venues: snapshot.venues.clone(),
-        failed_venues: snapshot.failed_venues.clone(),
-    };
-    journal.append_critical(generated_at_ms, "balance.snapshot", &snapshot_event)?;
 
-    let analysis = analyze_daily_journal_file(Path::new(&config.persistence.event_log_path))?;
-    let daily_profit_summary = analysis
-        .daily_profit_summaries
-        .into_iter()
-        .find(|item| item.date == date.to_string());
-    let output = DailyReportOutput {
-        report_date: date.to_string(),
-        generated_at_ms,
-        current_balance_snapshot: analysis.current_balance_snapshot.unwrap_or(snapshot),
-        daily_profit_summary,
-    };
+    let observed_at_ms = Utc::now().timestamp_millis();
+    let snapshot = fetch_balance_snapshot(&config, &config_path, observed_at_ms).await?;
 
-    if json_output {
-        println!("{}", serde_json::to_string_pretty(&output)?);
-    } else {
-        print_human_report(&output);
+    let (window_start_ms, window_end_ms) = shanghai_930_window(report_date)?;
+
+    let db_path = Path::new("runtime").join("cache").join("live.sqlite3");
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent)?;
     }
+    let conn = Connection::open(db_path)?;
+    ensure_schema(&conn)?;
 
-    journal.shutdown()?;
+    let window_net_quote: f64 = conn.query_row(
+        "SELECT COALESCE(SUM(COALESCE(net_quote,0)),0) FROM hourly_closed_reconcile WHERE close_event_ts_ms>=?1 AND close_event_ts_ms<?2",
+        params![window_start_ms, window_end_ms],
+        |row| row.get(0),
+    )?;
+
+    let venues_json = serde_json::to_string(&snapshot.venues)?;
+    let failed_venues_json = serde_json::to_string(&snapshot.failed_venues)?;
+
+    conn.execute(
+        r#"
+        INSERT INTO daily_930_reports(
+          report_date, observed_at_ms, window_start_ms, window_end_ms,
+          total_equity_quote, window_net_quote, venues_json, failed_venues_json
+        ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        ON CONFLICT(report_date) DO UPDATE SET
+          observed_at_ms=excluded.observed_at_ms,
+          window_start_ms=excluded.window_start_ms,
+          window_end_ms=excluded.window_end_ms,
+          total_equity_quote=excluded.total_equity_quote,
+          window_net_quote=excluded.window_net_quote,
+          venues_json=excluded.venues_json,
+          failed_venues_json=excluded.failed_venues_json
+        "#,
+        params![
+            report_date.to_string(),
+            observed_at_ms,
+            window_start_ms,
+            window_end_ms,
+            snapshot.total_equity_quote,
+            window_net_quote,
+            venues_json,
+            failed_venues_json,
+        ],
+    )?;
+
+    println!(
+        "daily_930_saved date={} total_equity_quote={:?} window_net_quote={} window=[{}, {})",
+        report_date,
+        snapshot.total_equity_quote,
+        window_net_quote,
+        window_start_ms,
+        window_end_ms
+    );
+
     Ok(())
+}
+
+fn ensure_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS daily_930_reports (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          report_date TEXT NOT NULL UNIQUE,
+          observed_at_ms INTEGER NOT NULL,
+          window_start_ms INTEGER NOT NULL,
+          window_end_ms INTEGER NOT NULL,
+          total_equity_quote REAL,
+          window_net_quote REAL NOT NULL,
+          venues_json TEXT NOT NULL,
+          failed_venues_json TEXT NOT NULL
+        );
+        "#,
+    )?;
+    Ok(())
+}
+
+fn shanghai_930_window(report_date: NaiveDate) -> Result<(i64, i64)> {
+    let sh = FixedOffset::east_opt(8 * 3600).ok_or_else(|| anyhow!("invalid +08 offset"))?;
+    let end_naive = NaiveDateTime::new(
+        report_date,
+        NaiveTime::from_hms_opt(9, 30, 0).ok_or_else(|| anyhow!("invalid 09:30:00"))?,
+    );
+    let end = sh
+        .from_local_datetime(&end_naive)
+        .single()
+        .ok_or_else(|| anyhow!("failed to resolve local 09:30 timestamp"))?;
+    let start = end - Duration::days(1);
+    Ok((start.timestamp_millis(), end.timestamp_millis()))
 }
 
 async fn fetch_balance_snapshot(
@@ -217,66 +254,4 @@ async fn build_adapter_for_report(
             ),
         },
     })
-}
-
-fn print_human_report(report: &DailyReportOutput) {
-    println!(
-        "daily_report date={} generated_at_ms={} current_total_equity_quote={:?}",
-        report.report_date,
-        report.generated_at_ms,
-        report.current_balance_snapshot.total_equity_quote
-    );
-
-    for venue in &report.current_balance_snapshot.venues {
-        println!(
-            "balance venue={} equity_quote={:.8} wallet_balance_quote={:?} available_balance_quote={:?} observed_at_ms={}",
-            venue.venue,
-            venue.equity_quote,
-            venue.wallet_balance_quote,
-            venue.available_balance_quote,
-            venue.observed_at_ms,
-        );
-    }
-
-    for failure in &report.current_balance_snapshot.failed_venues {
-        println!(
-            "balance_failed venue={} error={}",
-            failure.venue, failure.error
-        );
-    }
-
-    if let Some(summary) = &report.daily_profit_summary {
-        println!(
-            "daily_profit date={} realized_revenue_quote={:.8} partial_realized_revenue_quote={:.8} remaining_close_realized_revenue_quote={:.8} opened_position_count={} partial_close_count={} closed_position_count={} latest_total_equity_quote={:?}",
-            summary.date,
-            summary.realized_revenue_quote,
-            summary.partial_realized_revenue_quote,
-            summary.remaining_close_realized_revenue_quote,
-            summary.opened_position_count,
-            summary.partial_close_count,
-            summary.closed_position_count,
-            summary.latest_total_equity_quote,
-        );
-        for (venue, equity) in &summary.venue_equity_quote {
-            println!(
-                "daily_profit_balance venue={} equity_quote={:.8}",
-                venue, equity
-            );
-        }
-        for symbol in &summary.opened_symbol_revenues {
-            println!(
-                "daily_symbol symbol={} position_count={} partial_close_count={} closed_position_count={} realized_net_quote={:.8}",
-                symbol.symbol,
-                symbol.position_count,
-                symbol.partial_close_count,
-                symbol.closed_position_count,
-                symbol.realized_net_quote,
-            );
-        }
-    } else {
-        println!(
-            "daily_profit date={} realized_revenue_quote=0",
-            report.report_date
-        );
-    }
 }

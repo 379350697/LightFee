@@ -26,7 +26,7 @@ This repository intentionally avoids the heavyweight control-plane shape from la
 cargo test
 cargo run -- config/example.toml
 cargo run --bin journal_report -- runtime/events.jsonl
-cargo run --bin daily_report -- config/example.toml
+cargo run --bin daily_db_snapshot -- config/example.toml
 ```
 
 The bundled config runs in `paper` mode using scripted venue feeds from `config/demo/`.
@@ -73,12 +73,11 @@ It summarizes:
 - recent per-position trade replays including candidate selection, entry plan, per-leg fills/failures, and warnings/errors
 - heuristic optimization recommendations with evidence, so recurring latency/timeout/depth issues surface directly in the report
 
-For a low-impact daily report, use `daily_report` as a separate once-per-day task instead of adding balance snapshots to the trading loop:
+For a low-impact daily database snapshot, use `daily_db_snapshot` as a separate once-per-day task (default designed for 09:30 Asia/Shanghai):
 
 ```bash
-cargo run --bin daily_report -- config/live.example.toml
-cargo run --bin daily_report -- --date 2026-03-20 config/live.example.toml
-cargo run --bin daily_report -- --json config/live.example.toml
+cargo run --bin daily_db_snapshot -- config/live.example.toml
+cargo run --bin daily_db_snapshot -- --date 2026-03-20 config/live.example.toml
 ```
 
 The daily report:
