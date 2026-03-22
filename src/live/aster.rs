@@ -46,7 +46,6 @@ pub struct AsterLiveAdapter {
     runtime: RuntimeConfig,
     client: Client,
     base_url: String,
-    wallet_base_url: String,
     metadata: Mutex<HashMap<String, BinanceSymbolMeta>>,
     supported_symbols: Mutex<HashSet<String>>,
     position_mode: Mutex<Option<BinancePositionMode>>,
@@ -73,11 +72,6 @@ impl AsterLiveAdapter {
         let base_url = config
             .live
             .base_url
-            .clone()
-            .unwrap_or_else(|| "https://fapi.asterdex.com".to_string());
-        let wallet_base_url = config
-            .live
-            .wallet_base_url
             .clone()
             .unwrap_or_else(|| "https://fapi.asterdex.com".to_string());
 
@@ -108,7 +102,6 @@ impl AsterLiveAdapter {
             runtime: runtime.clone(),
             client: build_http_client(runtime.exchange_http_timeout_ms)?,
             base_url,
-            wallet_base_url,
             metadata: Mutex::new(metadata),
             supported_symbols: Mutex::new(supported_symbols),
             position_mode: Mutex::new(None),
@@ -1150,7 +1143,7 @@ impl VenueAdapter for AsterLiveAdapter {
         let account = self
             .signed_request(
                 reqwest::Method::GET,
-                "/fapi/v2/account",
+                "/fapi/v4/account",
                 params,
                 None,
                 &self.base_url,
@@ -1330,10 +1323,6 @@ impl VenueAdapter for AsterLiveAdapter {
     }
 
     async fn fetch_transfer_statuses(&self, assets: &[String]) -> Result<Vec<AssetTransferStatus>> {
-        if self.wallet_base_url.contains("testnet") {
-            return Ok(Vec::new());
-        }
-
         let wanted = assets
             .iter()
             .map(|asset| base_asset(asset))
@@ -1346,47 +1335,10 @@ impl VenueAdapter for AsterLiveAdapter {
             return Ok(statuses);
         }
 
-        let params = vec![
-            ("recvWindow", BINANCE_RECV_WINDOW_MS.to_string()),
-            ("timestamp", self.server_timestamp_ms().await?.to_string()),
-        ];
-        let coins = self
-            .signed_request(
-                reqwest::Method::GET,
-                "/sapi/v1/capital/config/getall",
-                params,
-                None,
-                &self.wallet_base_url,
-            )
-            .await?
-            .json::<Vec<BinanceCapitalCoin>>()
-            .await
-            .context("failed to decode aster capital config")?;
-        let statuses = coins
-            .into_iter()
-            .filter_map(|coin| {
-                let asset = base_asset(&coin.coin);
-                if !wanted.is_empty() && !wanted.contains(&asset) {
-                    return None;
-                }
-                let deposit_enabled = coin
-                    .network_list
-                    .iter()
-                    .any(|network| network.deposit_enable);
-                let withdraw_enabled = coin
-                    .network_list
-                    .iter()
-                    .any(|network| network.withdraw_enable);
-                Some(AssetTransferStatus {
-                    venue: Venue::Aster,
-                    asset,
-                    deposit_enabled,
-                    withdraw_enabled,
-                    observed_at_ms,
-                    source: "aster".to_string(),
-                })
-            })
-            .collect::<Vec<_>>();
+        // Aster's official perpetual API docs expose trading/account endpoints on `/fapi/...`,
+        // but do not document a capital-config transfer status endpoint like Binance `/sapi/...`.
+        // Treat transfer status as unsupported instead of probing a non-existent Binance wallet API.
+        let statuses = Vec::new();
         let cache = VenueTransferStatusCache {
             observed_at_ms,
             statuses: statuses.clone(),
@@ -2134,7 +2086,7 @@ mod tests {
         net::TcpListener,
         sync::{
             atomic::{AtomicBool, Ordering},
-            Arc,
+            Arc, Mutex,
         },
         thread,
         time::Duration,
@@ -2340,6 +2292,8 @@ mod tests {
             live: LiveVenueConfig {
                 base_url: Some(server.base_url()),
                 wallet_base_url: Some(server.base_url()),
+                api_key: Some("test-key".to_string()),
+                api_secret: Some("test-secret".to_string()),
                 ..LiveVenueConfig::default()
             },
         };
@@ -2366,12 +2320,91 @@ mod tests {
         assert!(server.direct_premium_requests() >= 2);
     }
 
+    #[tokio::test]
+    async fn transfer_statuses_do_not_call_binance_capital_endpoint() {
+        let server = TestAsterHttpServer::spawn();
+        let config = VenueConfig {
+            venue: Venue::Aster,
+            enabled: true,
+            taker_fee_bps: 1.0,
+            max_notional: 100.0,
+            market_data_file: None,
+            live: LiveVenueConfig {
+                base_url: Some(server.base_url()),
+                wallet_base_url: Some(server.base_url()),
+                api_key: Some("test-key".to_string()),
+                api_secret: Some("test-secret".to_string()),
+                ..LiveVenueConfig::default()
+            },
+        };
+        let runtime = RuntimeConfig {
+            exchange_http_timeout_ms: 500,
+            ..RuntimeConfig::default()
+        };
+        let adapter = AsterLiveAdapter::new(&config, &runtime, &["ETHUSDT".to_string()])
+            .await
+            .expect("adapter");
+
+        let statuses =
+            crate::venue::VenueAdapter::fetch_transfer_statuses(&adapter, &["ETH".to_string()])
+                .await
+                .expect("transfer statuses");
+
+        assert!(statuses.is_empty());
+        assert!(!server
+            .request_paths()
+            .iter()
+            .any(|path| path.contains("/sapi/v1/capital/config/getall")));
+    }
+
+    #[tokio::test]
+    async fn account_balance_snapshot_uses_official_aster_account_endpoint() {
+        let server = TestAsterHttpServer::spawn();
+        let config = VenueConfig {
+            venue: Venue::Aster,
+            enabled: true,
+            taker_fee_bps: 1.0,
+            max_notional: 100.0,
+            market_data_file: None,
+            live: LiveVenueConfig {
+                base_url: Some(server.base_url()),
+                wallet_base_url: Some(server.base_url()),
+                api_key: Some("test-key".to_string()),
+                api_secret: Some("test-secret".to_string()),
+                ..LiveVenueConfig::default()
+            },
+        };
+        let runtime = RuntimeConfig {
+            exchange_http_timeout_ms: 500,
+            ..RuntimeConfig::default()
+        };
+        let adapter = AsterLiveAdapter::new(&config, &runtime, &["ETHUSDT".to_string()])
+            .await
+            .expect("adapter");
+
+        let snapshot = crate::venue::VenueAdapter::fetch_account_balance_snapshot(&adapter)
+            .await
+            .expect("balance snapshot")
+            .expect("some snapshot");
+
+        assert_eq!(snapshot.venue, Venue::Aster);
+        assert!(server
+            .request_paths()
+            .iter()
+            .any(|path| path.contains("/fapi/v4/account")));
+        assert!(!server
+            .request_paths()
+            .iter()
+            .any(|path| path.contains("/fapi/v2/account")));
+    }
+
     struct TestAsterHttpServer {
         base_url: String,
         shutdown: Arc<AtomicBool>,
         bulk_bootstrap_failed_once: Arc<AtomicBool>,
         direct_book_ticker_requests: Arc<std::sync::atomic::AtomicUsize>,
         direct_premium_requests: Arc<std::sync::atomic::AtomicUsize>,
+        request_paths: Arc<Mutex<Vec<String>>>,
         handle: Option<thread::JoinHandle<()>>,
     }
 
@@ -2391,11 +2424,17 @@ mod tests {
             let bulk_failed_flag = bulk_bootstrap_failed_once.clone();
             let direct_book_counter = direct_book_ticker_requests.clone();
             let direct_premium_counter = direct_premium_requests.clone();
+            let request_paths = Arc::new(Mutex::new(Vec::new()));
+            let request_paths_recorder = request_paths.clone();
             let handle = thread::spawn(move || {
                 while !shutdown_flag.load(Ordering::Relaxed) {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
                             let request_path = read_request_path(&mut stream);
+                            request_paths_recorder
+                                .lock()
+                                .expect("lock")
+                                .push(request_path.clone());
                             let (status, body) = respond_to_aster_request(
                                 &request_path,
                                 &bulk_failed_flag,
@@ -2418,6 +2457,7 @@ mod tests {
                 bulk_bootstrap_failed_once,
                 direct_book_ticker_requests,
                 direct_premium_requests,
+                request_paths,
                 handle: Some(handle),
             }
         }
@@ -2436,6 +2476,10 @@ mod tests {
 
         fn direct_premium_requests(&self) -> usize {
             self.direct_premium_requests.load(Ordering::Relaxed)
+        }
+
+        fn request_paths(&self) -> Vec<String> {
+            self.request_paths.lock().expect("lock").clone()
         }
     }
 
@@ -2495,6 +2539,14 @@ mod tests {
             .unwrap_or((request_path, None));
         match (path, query.and_then(parse_symbol_query)) {
             ("/fapi/v1/exchangeInfo", _) => (200, exchange_info_payload()),
+            ("/fapi/v1/time", _) => (200, r#"{"serverTime":1773961200000}"#.to_string()),
+            (
+                "/fapi/v4/account",
+                _,
+            ) => (
+                200,
+                r#"{"totalMarginBalance":"120.5","totalWalletBalance":"121.0","availableBalance":"88.8"}"#.to_string(),
+            ),
             ("/fapi/v1/ticker/bookTicker", None) => {
                 bulk_failed_flag.store(true, Ordering::Relaxed);
                 (
@@ -2597,21 +2649,6 @@ struct AsterCommissionRateResponse {
     maker_commission_rate: String,
     #[serde(rename = "takerCommissionRate")]
     taker_commission_rate: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct BinanceCapitalCoin {
-    coin: String,
-    #[serde(rename = "networkList", default)]
-    network_list: Vec<BinanceCapitalNetwork>,
-}
-
-#[derive(Debug, Deserialize)]
-struct BinanceCapitalNetwork {
-    #[serde(rename = "depositEnable")]
-    deposit_enable: bool,
-    #[serde(rename = "withdrawEnable")]
-    withdraw_enable: bool,
 }
 
 #[derive(Debug, Deserialize)]
