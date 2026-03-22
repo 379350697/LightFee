@@ -1296,7 +1296,7 @@ impl VenueAdapter for GateLiveAdapter {
     }
 
     fn supports_market_data_activity_control(&self) -> bool {
-        true
+        false
     }
 
     async fn set_market_data_active(&self, active: bool, symbols: &[String]) -> Result<()> {

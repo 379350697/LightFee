@@ -827,11 +827,52 @@ impl Engine {
     async fn sync_market_data_activity(&mut self, now_ms: i64) -> Result<bool> {
         let should_be_active = self.should_activate_market_data(now_ms);
         let symbols = self.active_scan_symbols().to_vec();
+        let adapters = self
+            .adapters
+            .iter()
+            .map(|(venue, adapter)| (*venue, Arc::clone(adapter)))
+            .collect::<Vec<_>>();
         if should_be_active {
-            for adapter in self.adapters.values() {
-                adapter.set_market_data_active(true, &symbols).await?;
+            let mut saw_controlled_venue = false;
+            let mut saw_uncontrolled_venue = false;
+            let mut successful_controlled_venues = 0usize;
+            for (venue, adapter) in &adapters {
+                let supports_activity_control = adapter.supports_market_data_activity_control();
+                if supports_activity_control {
+                    saw_controlled_venue = true;
+                } else {
+                    saw_uncontrolled_venue = true;
+                    continue;
+                }
+                match adapter.set_market_data_active(true, &symbols).await {
+                    Ok(()) => {
+                        successful_controlled_venues =
+                            successful_controlled_venues.saturating_add(1);
+                    }
+                    Err(error) => {
+                        self.state.last_error =
+                            Some(format!("market data activity failed on {venue}: {error:#}"));
+                        self.log_repeated_failure_event(
+                            "runtime.market_data_activity_failed",
+                            format!("market_data_activity_failed:{venue}:activate:{error}"),
+                            &json!({
+                                "venue": venue,
+                                "action": "activate",
+                                "symbol_count": symbols.len(),
+                                "error": error.to_string(),
+                            }),
+                        );
+                        if matches!(self.config.runtime.mode, RuntimeMode::Live)
+                            && self.active_positions().is_empty()
+                        {
+                            self.arm_market_data_degradation(*venue, "market_data_activity_failed");
+                        }
+                    }
+                }
             }
-            if !self.market_data_active {
+            let market_data_activated_successfully =
+                saw_uncontrolled_venue || !saw_controlled_venue || successful_controlled_venues > 0;
+            if market_data_activated_successfully && !self.market_data_active {
                 self.market_data_active = true;
                 self.market_data_activated_at_ms = Some(now_ms);
                 self.log_event(
@@ -840,10 +881,29 @@ impl Engine {
                         "symbol_count": symbols.len(),
                     }),
                 );
+            } else if !market_data_activated_successfully {
+                self.market_data_active = false;
+                self.market_data_activated_at_ms = None;
             }
         } else if self.market_data_active {
-            for adapter in self.adapters.values() {
-                adapter.set_market_data_active(false, &[]).await?;
+            for (venue, adapter) in &adapters {
+                if !adapter.supports_market_data_activity_control() {
+                    continue;
+                }
+                if let Err(error) = adapter.set_market_data_active(false, &[]).await {
+                    self.state.last_error =
+                        Some(format!("market data activity failed on {venue}: {error:#}"));
+                    self.log_repeated_failure_event(
+                        "runtime.market_data_activity_failed",
+                        format!("market_data_activity_failed:{venue}:deactivate:{error}"),
+                        &json!({
+                            "venue": venue,
+                            "action": "deactivate",
+                            "symbol_count": 0,
+                            "error": error.to_string(),
+                        }),
+                    );
+                }
             }
             self.market_data_active = false;
             self.market_data_activated_at_ms = None;
@@ -6815,7 +6875,10 @@ fn checklist_item(key: &'static str, ok: bool, detail: String) -> OpportunityChe
 mod tests {
     use std::{
         collections::{BTreeMap, HashMap, VecDeque},
-        sync::Arc,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
     };
 
     use crate::config::{
@@ -7371,6 +7434,52 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct MarketDataActivityAdapter {
+        venue: Venue,
+        activation_calls: Arc<AtomicUsize>,
+        supports_activity_control: bool,
+        fail_on_activate: bool,
+        fail_on_deactivate: bool,
+    }
+
+    #[async_trait]
+    impl crate::venue::VenueAdapter for MarketDataActivityAdapter {
+        fn venue(&self) -> Venue {
+            self.venue
+        }
+
+        async fn fetch_market_snapshot(&self, _symbols: &[String]) -> Result<VenueMarketSnapshot> {
+            Err(anyhow!("unused"))
+        }
+
+        async fn place_order(&self, _request: OrderRequest) -> Result<OrderFill> {
+            Err(anyhow!("unused"))
+        }
+
+        async fn fetch_position(&self, symbol: &str) -> Result<PositionSnapshot> {
+            Ok(PositionSnapshot {
+                venue: self.venue,
+                symbol: symbol.to_string(),
+                size: 0.0,
+                updated_at_ms: 0,
+            })
+        }
+
+        fn supports_market_data_activity_control(&self) -> bool {
+            self.supports_activity_control
+        }
+
+        async fn set_market_data_active(&self, active: bool, _symbols: &[String]) -> Result<()> {
+            self.activation_calls.fetch_add(1, Ordering::SeqCst);
+            if (active && self.fail_on_activate) || (!active && self.fail_on_deactivate) {
+                Err(anyhow!("simulated market data activity failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
     #[test]
     fn ws_worker_status_marks_suspicious_venues() {
         let temp = TempDir::new().expect("tempdir");
@@ -7509,6 +7618,102 @@ mod tests {
         assert!(records
             .iter()
             .any(|record| record.kind == "runtime.ws_worker_leak_suspected"));
+    }
+
+    #[tokio::test]
+    async fn market_data_activity_failure_degrades_only_failing_venue() {
+        let temp = TempDir::new().expect("tempdir");
+        let event_log_path = temp.path().join("events.jsonl");
+        let snapshot_path = temp.path().join("state.json");
+        let always_on_calls = Arc::new(AtomicUsize::new(0));
+        let failing_calls = Arc::new(AtomicUsize::new(0));
+        let mut engine = Engine {
+            config: AppConfig {
+                runtime: RuntimeConfig {
+                    mode: RuntimeMode::Live,
+                    ..RuntimeConfig::default()
+                },
+                strategy: StrategyConfig {
+                    max_scan_minutes_before_funding: 25,
+                    min_scan_minutes_before_funding: 5,
+                    ..StrategyConfig::default()
+                },
+                persistence: PersistenceConfig {
+                    event_log_path: event_log_path.to_string_lossy().into_owned(),
+                    snapshot_path: snapshot_path.to_string_lossy().into_owned(),
+                },
+                venues: vec![],
+                symbols: vec!["BTCUSDT".to_string()],
+                directed_pairs: vec![],
+            },
+            adapters: BTreeMap::from([
+                (
+                    Venue::Binance,
+                    Arc::new(MarketDataActivityAdapter {
+                        venue: Venue::Binance,
+                        activation_calls: Arc::clone(&always_on_calls),
+                        supports_activity_control: false,
+                        fail_on_activate: false,
+                        fail_on_deactivate: false,
+                    }) as Arc<dyn crate::venue::VenueAdapter>,
+                ),
+                (
+                    Venue::Aster,
+                    Arc::new(MarketDataActivityAdapter {
+                        venue: Venue::Aster,
+                        activation_calls: Arc::clone(&failing_calls),
+                        supports_activity_control: true,
+                        fail_on_activate: true,
+                        fail_on_deactivate: false,
+                    }) as Arc<dyn crate::venue::VenueAdapter>,
+                ),
+            ]),
+            opportunity_source: None,
+            transfer_status_source: None,
+            journal: crate::journal::JsonlJournal::with_capacity(
+                event_log_path.to_string_lossy().into_owned(),
+                32,
+            ),
+            store: crate::store::FileStateStore::new(snapshot_path.to_string_lossy().into_owned()),
+            state: EngineState::default(),
+            last_live_recovery_probe_ms: None,
+            last_running_slot_reconcile_probe_ms: None,
+            last_persisted_state: None,
+            recent_submit_ack_ms: BTreeMap::new(),
+            venue_entry_cooldowns: BTreeMap::new(),
+            venue_market_data_degradations: BTreeMap::new(),
+            recent_order_health: BTreeMap::new(),
+            venue_health_updated_at_ms: BTreeMap::new(),
+            cached_transfer_status_view: None,
+            scan_symbols: vec!["BTCUSDT".to_string()],
+            market_data_active: false,
+            market_data_activated_at_ms: None,
+            last_no_entry_diagnostics: None,
+            repeated_failure_logs: BTreeMap::new(),
+            cached_live_entry_venue_filter: None,
+            last_ws_worker_snapshot_ms: None,
+            buffered_entry_candidates: HashMap::new(),
+            last_new_entry_candidate_ms: None,
+        };
+
+        let active = engine
+            .sync_market_data_activity(50 * 60 * 1_000)
+            .await
+            .expect("activity sync should not fail");
+
+        assert!(active);
+        assert!(engine.market_data_active);
+        assert_eq!(always_on_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(failing_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            engine.market_data_degradation_reason(Venue::Aster, 50 * 60 * 1_000),
+            Some("market_data_degraded:aster:market_data_activity_failed".to_string())
+        );
+
+        let records = engine.journal.read_records().expect("records");
+        assert!(records
+            .iter()
+            .any(|record| record.kind == "runtime.market_data_degraded_started"));
     }
 
     #[test]
