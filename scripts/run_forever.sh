@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
+# 启动前自动补齐定时任务（可通过 LIGHTFEE_ENSURE_CRON=0 关闭）
+if [ "${LIGHTFEE_ENSURE_CRON:-1}" = "1" ]; then
+  "$(cd "$(dirname "$0")" && pwd)/ensure_cron_jobs.sh" || true
+fi
+
 bin_path="${LIGHTFEE_BIN:-./target/release/lightfee}"
 config_path="${1:-config/live.example.toml}"
 restart_sec="${LIGHTFEE_RESTART_SEC:-3}"
