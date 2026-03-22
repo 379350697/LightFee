@@ -177,7 +177,7 @@ pub(crate) fn spawn_ws_loop<F>(
                 Ok((mut socket, _)) => {
                     reconnect_backoff.on_success();
                     state_for_task.record_connection_success(chrono::Utc::now().timestamp_millis());
-                    debug!(venue = venue_name, "market websocket connected");
+                    debug!(venue = venue_name, "[{venue_name}] market websocket connected");
                     let mut failed = false;
                     for message in &subscribe_messages {
                         if let Err(error) = socket.send(Message::Text(message.clone().into())).await
@@ -190,7 +190,7 @@ pub(crate) fn spawn_ws_loop<F>(
                             warn!(
                                 venue = venue_name,
                                 ?error,
-                                "market websocket subscribe failed"
+                                "[{venue_name}] market websocket subscribe failed"
                             );
                             failed = true;
                             break;
@@ -211,7 +211,7 @@ pub(crate) fn spawn_ws_loop<F>(
                                     debug!(
                                         venue = venue_name,
                                         ?error,
-                                        "market websocket message ignored"
+                                        "[{venue_name}] market websocket message ignored"
                                     );
                                 }
                             }
@@ -226,13 +226,13 @@ pub(crate) fn spawn_ws_loop<F>(
                                         debug!(
                                             venue = venue_name,
                                             ?error,
-                                            "market websocket pong disconnected"
+                                            "[{venue_name}] market websocket pong disconnected"
                                         );
                                     } else {
                                         warn!(
                                             venue = venue_name,
                                             ?error,
-                                            "market websocket pong failed"
+                                            "[{venue_name}] market websocket pong failed"
                                         );
                                     }
                                     break;
@@ -244,7 +244,7 @@ pub(crate) fn spawn_ws_loop<F>(
                                     unhealthy_after_failures,
                                     format!("closed:{frame:?}"),
                                 );
-                                debug!(venue = venue_name, ?frame, "market websocket closed");
+                                debug!(venue = venue_name, ?frame, "[{venue_name}] market websocket closed");
                                 break;
                             }
                             Ok(_) => {}
@@ -258,13 +258,13 @@ pub(crate) fn spawn_ws_loop<F>(
                                     debug!(
                                         venue = venue_name,
                                         ?error,
-                                        "market websocket receive disconnected"
+                                        "[{venue_name}] market websocket receive disconnected"
                                     );
                                 } else {
                                     warn!(
                                         venue = venue_name,
                                         ?error,
-                                        "market websocket receive failed"
+                                        "[{venue_name}] market websocket receive failed"
                                     );
                                 }
                                 break;
@@ -281,7 +281,7 @@ pub(crate) fn spawn_ws_loop<F>(
                     warn!(
                         venue = venue_name,
                         ?error,
-                        "market websocket connect failed"
+                        "[{venue_name}] market websocket connect failed"
                     );
                 }
             }

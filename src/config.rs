@@ -168,6 +168,10 @@ pub struct StrategyConfig {
     pub min_entry_leg_notional_quote: f64,
     #[serde(default = "default_max_concurrent_positions")]
     pub max_concurrent_positions: usize,
+    #[serde(default = "default_entry_batch_quiet_window_secs")]
+    pub entry_batch_quiet_window_secs: i64,
+    #[serde(default = "default_entry_batch_selection_count")]
+    pub entry_batch_selection_count: usize,
     #[serde(default = "default_live_target_leverage")]
     pub live_target_leverage: u32,
     #[serde(default = "default_max_scan_minutes_before_funding")]
@@ -222,6 +226,8 @@ impl Default for StrategyConfig {
             forced_live_entry_notional_quote: default_forced_live_entry_notional_quote(),
             min_entry_leg_notional_quote: default_min_entry_leg_notional_quote(),
             max_concurrent_positions: default_max_concurrent_positions(),
+            entry_batch_quiet_window_secs: default_entry_batch_quiet_window_secs(),
+            entry_batch_selection_count: default_entry_batch_selection_count(),
             live_target_leverage: default_live_target_leverage(),
             max_scan_minutes_before_funding: default_max_scan_minutes_before_funding(),
             min_scan_minutes_before_funding: default_min_scan_minutes_before_funding(),
@@ -450,6 +456,14 @@ fn default_max_concurrent_positions() -> usize {
 
 fn default_live_target_leverage() -> u32 {
     4
+}
+
+fn default_entry_batch_quiet_window_secs() -> i64 {
+    120
+}
+
+fn default_entry_batch_selection_count() -> usize {
+    6
 }
 
 fn default_max_scan_minutes_before_funding() -> i64 {

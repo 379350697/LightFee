@@ -396,7 +396,7 @@ impl HyperliquidLiveAdapter {
                                 );
                                 warn!(
                                     idle_ms = current_now_ms.saturating_sub(last_message_ms),
-                                    "hyperliquid market websocket idle watchdog timed out"
+                                    "[hyperliquid] market websocket idle watchdog timed out"
                                 );
                                 should_rebuild = true;
                             }
@@ -478,15 +478,15 @@ impl HyperliquidLiveAdapter {
                                         unhealthy_after_failures,
                                         error.clone(),
                                     );
-                                    warn!(?error, "hyperliquid market websocket reported error");
+                                    warn!(?error, "[hyperliquid] market websocket reported error");
                                 }
                                 Some(HyperliquidMessage::NoData) => {
                                     cache.record_connection_failure(
                                         now_ms(),
                                         unhealthy_after_failures,
-                                        "hyperliquid market websocket disconnected".to_string(),
+                                        "[hyperliquid] market websocket disconnected".to_string(),
                                     );
-                                    debug!("hyperliquid market websocket disconnected");
+                                    debug!("[hyperliquid] market websocket disconnected");
                                     should_rebuild = true;
                                 }
                                 Some(_) => {}
@@ -494,9 +494,9 @@ impl HyperliquidLiveAdapter {
                                     cache.record_connection_failure(
                                         now_ms(),
                                         unhealthy_after_failures,
-                                        "hyperliquid market websocket receiver closed".to_string(),
+                                        "[hyperliquid] market websocket receiver closed".to_string(),
                                     );
-                                    debug!("hyperliquid market websocket receiver closed");
+                                    debug!("[hyperliquid] market websocket receiver closed");
                                     should_rebuild = true;
                                 }
                             }
@@ -676,15 +676,15 @@ impl HyperliquidLiveAdapter {
                                 unhealthy_after_failures,
                                 error.clone(),
                             );
-                            warn!(?error, "hyperliquid private websocket reported error");
+                            warn!(?error, "[hyperliquid] private websocket reported error");
                         }
                         Some(HyperliquidMessage::NoData) => {
                             private_state.record_connection_failure(
                                 now_ms(),
                                 unhealthy_after_failures,
-                                "hyperliquid private websocket disconnected".to_string(),
+                                "[hyperliquid] private websocket disconnected".to_string(),
                             );
-                            debug!("hyperliquid private websocket disconnected");
+                            debug!("[hyperliquid] private websocket disconnected");
                             should_rebuild = true;
                         }
                         Some(_) => {}
@@ -692,9 +692,9 @@ impl HyperliquidLiveAdapter {
                             private_state.record_connection_failure(
                                 now_ms(),
                                 unhealthy_after_failures,
-                                "hyperliquid private websocket receiver closed".to_string(),
+                                "[hyperliquid] private websocket receiver closed".to_string(),
                             );
-                            debug!("hyperliquid private websocket receiver closed");
+                            debug!("[hyperliquid] private websocket receiver closed");
                             should_rebuild = true;
                         }
                     }
