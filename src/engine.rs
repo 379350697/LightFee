@@ -114,6 +114,7 @@ const ENTRY_SELECTION_BUFFER_MULTIPLIER: usize = 4;
 const ENTRY_SELECTION_BUFFER_MAX: usize = 8;
 const ENTRY_LIQUIDITY_SCREEN_MULTIPLIER: usize = 3;
 const ENTRY_LIQUIDITY_SCREEN_MAX: usize = 24;
+const ENTRY_BATCH_FINALIZATION_LEAD_MS: i64 = 3 * 60 * 1_000;
 const SETTLEMENT_HALF_CLOSE_RATIO: f64 = 0.5;
 const SETTLEMENT_REMAINDER_CLOSE_DELAY_MS: i64 = 5 * 60 * 1_000;
 const SETTLEMENT_FORCE_CLOSE_DELAY_MS: i64 = 20 * 60 * 1_000;
@@ -824,6 +825,34 @@ impl Engine {
                 })
     }
 
+    fn log_no_scan_reason(&mut self, reason: &'static str, payload: &serde_json::Value) {
+        let payload = append_object_field(payload, "reason", json!(reason));
+        self.log_repeated_failure_event(
+            "runtime.no_scan_reason",
+            format!("runtime.no_scan_reason:{reason}"),
+            &payload,
+        );
+    }
+
+    fn candidate_in_entry_batch_finalization_window(
+        &self,
+        now_ms: i64,
+        candidate: &CandidateOpportunity,
+    ) -> bool {
+        is_entry_batch_finalization_window_ms(
+            &self.config,
+            candidate
+                .first_funding_timestamp_ms
+                .saturating_sub(now_ms.max(0)),
+        )
+    }
+
+    fn buffered_entry_batch_finalization_window(&self, now_ms: i64) -> bool {
+        self.buffered_entry_candidates
+            .values()
+            .any(|candidate| self.candidate_in_entry_batch_finalization_window(now_ms, candidate))
+    }
+
     async fn sync_market_data_activity(&mut self, now_ms: i64) -> Result<bool> {
         let should_be_active = self.should_activate_market_data(now_ms);
         let symbols = self.active_scan_symbols().to_vec();
@@ -1019,18 +1048,35 @@ impl Engine {
                 if self.active_positions().is_empty() {
                     self.process_pending_close_reconciliations(tick_started_at_ms, &market)
                         .await?;
+                    self.log_no_scan_reason(
+                        "market_data_inactive",
+                        &json!({
+                            "mode": self.state.mode,
+                            "open_position_count": self.active_position_count(),
+                            "scan_symbol_count": self.active_scan_symbols().len(),
+                            "windowed_market_data": true,
+                        }),
+                    );
                     return Ok(());
                 }
             }
             if self.market_data_warmup_pending(tick_started_at_ms) {
                 self.state.last_market_ts_ms = Some(tick_started_at_ms);
+                let warmup_ms =
+                    market_data_warmup_duration_ms(self.config.runtime.poll_interval_ms);
                 self.log_event(
                     "market_data.warmup_pending",
                     &json!({
                         "activated_at_ms": self.market_data_activated_at_ms,
-                        "warmup_ms": market_data_warmup_duration_ms(
-                            self.config.runtime.poll_interval_ms
-                        ),
+                        "warmup_ms": warmup_ms,
+                    }),
+                );
+                self.log_no_scan_reason(
+                    "market_data_warmup_pending",
+                    &json!({
+                        "mode": self.state.mode,
+                        "activated_at_ms": self.market_data_activated_at_ms,
+                        "warmup_ms": warmup_ms,
                     }),
                 );
                 return Ok(());
@@ -1069,6 +1115,14 @@ impl Engine {
                     )?;
                     self.persist_state()?;
                 }
+                self.log_no_scan_reason(
+                    "market_fetch_failed_hard",
+                    &json!({
+                        "mode": self.state.mode,
+                        "open_position_count": self.active_position_count(),
+                        "error": error.to_string(),
+                    }),
+                );
                 return Err(error);
             }
         };
@@ -1107,11 +1161,27 @@ impl Engine {
                     }),
                 )?;
                 self.persist_state()?;
+                self.log_no_scan_reason(
+                    "engine_not_running",
+                    &json!({
+                        "mode": self.state.mode,
+                        "stage": "open_positions_exceed_configured_max",
+                        "open_position_count": self.active_position_count(),
+                    }),
+                );
                 return Ok(());
             }
             self.reconcile_open_positions_internal(true).await?;
             self.persist_state()?;
             if self.state.mode != EngineMode::Running {
+                self.log_no_scan_reason(
+                    "engine_not_running",
+                    &json!({
+                        "mode": self.state.mode,
+                        "stage": "post_recovery_reconcile",
+                        "open_position_count": self.active_position_count(),
+                    }),
+                );
                 return Ok(());
             }
         }
@@ -1169,6 +1239,14 @@ impl Engine {
                 .await?;
             if self.state.mode != EngineMode::Running {
                 self.persist_state()?;
+                self.log_no_scan_reason(
+                    "engine_not_running",
+                    &json!({
+                        "mode": self.state.mode,
+                        "stage": "post_running_slot_reconcile",
+                        "open_position_count": self.active_position_count(),
+                    }),
+                );
                 return Ok(());
             }
             self.apply_perp_liquidity_guards(&market, &mut candidates)
@@ -1887,10 +1965,15 @@ impl Engine {
     fn update_entry_candidate_buffer(&mut self, now_ms: i64, candidates: &[CandidateOpportunity]) {
         let mut saw_new = false;
         for candidate in candidates.iter().filter(|item| item.is_tradeable()) {
-            if !self
+            let already_buffered = self
                 .buffered_entry_candidates
-                .contains_key(&candidate.pair_id)
+                .contains_key(&candidate.pair_id);
+            if !already_buffered
+                && self.candidate_in_entry_batch_finalization_window(now_ms, candidate)
             {
+                continue;
+            }
+            if !already_buffered {
                 saw_new = true;
             }
             self.buffered_entry_candidates
@@ -1909,17 +1992,20 @@ impl Engine {
         if self.buffered_entry_candidates.is_empty() {
             return Vec::new();
         }
+        let force_finalize_selection = self.buffered_entry_batch_finalization_window(now_ms);
         let quiet_window_ms = self
             .config
             .strategy
             .entry_batch_quiet_window_secs
             .max(0)
             .saturating_mul(1000);
-        let Some(last_new_ms) = self.last_new_entry_candidate_ms else {
-            return Vec::new();
-        };
-        if now_ms.saturating_sub(last_new_ms) < quiet_window_ms {
-            return Vec::new();
+        if !force_finalize_selection {
+            let Some(last_new_ms) = self.last_new_entry_candidate_ms else {
+                return Vec::new();
+            };
+            if now_ms.saturating_sub(last_new_ms) < quiet_window_ms {
+                return Vec::new();
+            }
         }
 
         let buffered = self
@@ -1943,6 +2029,7 @@ impl Engine {
                     "buffered_candidate_count": buffered.len(),
                     "selected_count": selected.len(),
                     "quiet_window_ms": quiet_window_ms,
+                    "forced_by_window_end": force_finalize_selection,
                     "selection_symbols": selected.iter().map(|c| c.symbol.clone()).collect::<Vec<_>>()
                 }),
             );
@@ -6820,6 +6907,39 @@ fn append_object_field(
     }
 }
 
+fn is_entry_batch_finalization_window_ms(config: &AppConfig, remaining_ms: i64) -> bool {
+    if remaining_ms <= 0 {
+        return false;
+    }
+
+    let max_before_ms = config
+        .strategy
+        .max_scan_minutes_before_funding
+        .max(0)
+        .saturating_mul(60_000);
+    let min_before_ms = config
+        .strategy
+        .min_scan_minutes_before_funding
+        .max(0)
+        .saturating_mul(60_000);
+
+    if max_before_ms > 0 {
+        return remaining_ms >= min_before_ms
+            && remaining_ms <= min_before_ms.saturating_add(ENTRY_BATCH_FINALIZATION_LEAD_MS);
+    }
+
+    let entry_window_ms = config
+        .strategy
+        .entry_window_secs
+        .max(0)
+        .saturating_mul(1_000);
+    if entry_window_ms <= 0 {
+        return false;
+    }
+
+    remaining_ms <= entry_window_ms.min(ENTRY_BATCH_FINALIZATION_LEAD_MS)
+}
+
 fn compact_outcome_diagnostics(
     diagnostics: Option<&serde_json::Value>,
 ) -> Option<serde_json::Value> {
@@ -6884,9 +7004,10 @@ mod tests {
     use crate::config::{
         AppConfig, PersistenceConfig, RuntimeConfig, RuntimeMode, StrategyConfig, VenueConfig,
     };
+    use crate::market::MarketView;
     use crate::models::{
         AccountFeeSnapshot, CandidateOpportunity, FundingLeg, FundingOpportunityType, OrderFill,
-        OrderRequest, VenueMarketSnapshot,
+        OrderRequest, SymbolMarketSnapshot, VenueMarketSnapshot,
     };
     use anyhow::{anyhow, Result};
     use async_trait::async_trait;
@@ -6895,13 +7016,72 @@ mod tests {
     use super::{
         apply_cached_fee_snapshots_to_candidates, cached_flat_guard_reason,
         compact_client_order_id, effective_entry_leg_notional_floor, hyperliquid_entry_gate_reason,
-        market_data_warmup_duration_ms, order_error_may_have_created_exposure,
-        order_quote_expired_reason, persistent_state_view, remap_no_entry_diagnostic_reason,
-        resolved_fee_log_entry, should_activate_windowed_market_data_with_hysteresis,
-        should_probe_live_recovery, venue_order_health_risk_score, Engine, EngineMode, EngineState,
+        is_entry_batch_finalization_window_ms, market_data_warmup_duration_ms,
+        order_error_may_have_created_exposure, order_quote_expired_reason, persistent_state_view,
+        remap_no_entry_diagnostic_reason, resolved_fee_log_entry,
+        should_activate_windowed_market_data_with_hysteresis, should_probe_live_recovery,
+        venue_order_health_risk_score, Engine, EngineMode, EngineState, OpenPosition,
         VenueEntryCooldown, VenueOrderHealthSample, MARKET_DATA_DEGRADATION_COOLDOWN_MS,
     };
     use crate::models::{PositionSnapshot, Venue};
+    use crate::ScriptedVenueAdapter;
+
+    fn test_symbol_snapshot(
+        symbol: &str,
+        best_bid: f64,
+        best_ask: f64,
+        funding_timestamp_ms: i64,
+    ) -> SymbolMarketSnapshot {
+        SymbolMarketSnapshot {
+            symbol: symbol.to_string(),
+            best_bid,
+            best_ask,
+            bid_size: 100.0,
+            ask_size: 100.0,
+            mark_price: Some((best_bid + best_ask) / 2.0),
+            funding_rate: 0.0001,
+            funding_timestamp_ms,
+        }
+    }
+
+    fn test_candidate(
+        pair_id: &str,
+        symbol: &str,
+        ranking_edge_bps: f64,
+        first_funding_timestamp_ms: i64,
+    ) -> CandidateOpportunity {
+        CandidateOpportunity {
+            pair_id: pair_id.to_string(),
+            symbol: symbol.to_string(),
+            long_venue: Venue::Binance,
+            short_venue: Venue::Okx,
+            quantity: 1.0,
+            entry_notional_quote: 100.0,
+            funding_timestamp_ms: first_funding_timestamp_ms,
+            long_funding_timestamp_ms: first_funding_timestamp_ms,
+            short_funding_timestamp_ms: first_funding_timestamp_ms,
+            opportunity_type: FundingOpportunityType::Aligned,
+            first_funding_leg: FundingLeg::Short,
+            first_funding_timestamp_ms,
+            second_funding_timestamp_ms: first_funding_timestamp_ms,
+            funding_edge_bps: ranking_edge_bps,
+            total_funding_edge_bps: ranking_edge_bps,
+            first_stage_funding_edge_bps: ranking_edge_bps,
+            first_stage_expected_edge_bps: ranking_edge_bps,
+            second_stage_incremental_funding_edge_bps: 0.0,
+            stagger_gap_ms: 0,
+            entry_cross_bps: 0.0,
+            fee_bps: 1.0,
+            entry_slippage_bps: 0.5,
+            expected_edge_bps: ranking_edge_bps,
+            worst_case_edge_bps: ranking_edge_bps - 0.5,
+            ranking_edge_bps,
+            transfer_bias_bps: 0.0,
+            transfer_state: None,
+            advisories: Vec::new(),
+            blocked_reasons: Vec::new(),
+        }
+    }
 
     #[test]
     fn cached_fee_snapshots_can_unblock_candidates() {
@@ -7010,6 +7190,585 @@ mod tests {
         assert!(candidate.blocked_reasons.is_empty());
 
         config.strategy.min_expected_edge_bps = 0.0;
+    }
+
+    #[test]
+    fn entry_batch_finalization_window_starts_three_minutes_before_scan_end() {
+        let config = AppConfig {
+            runtime: RuntimeConfig::default(),
+            strategy: StrategyConfig {
+                max_scan_minutes_before_funding: 25,
+                min_scan_minutes_before_funding: 5,
+                ..StrategyConfig::default()
+            },
+            persistence: PersistenceConfig {
+                event_log_path: "runtime/test-events.jsonl".to_string(),
+                snapshot_path: "runtime/test-state.json".to_string(),
+            },
+            venues: vec![],
+            symbols: vec![],
+            directed_pairs: vec![],
+        };
+
+        assert!(!is_entry_batch_finalization_window_ms(
+            &config,
+            9 * 60 * 1_000
+        ));
+        assert!(is_entry_batch_finalization_window_ms(
+            &config,
+            8 * 60 * 1_000
+        ));
+        assert!(is_entry_batch_finalization_window_ms(
+            &config,
+            5 * 60 * 1_000
+        ));
+        assert!(!is_entry_batch_finalization_window_ms(
+            &config,
+            4 * 60 * 1_000
+        ));
+    }
+
+    #[test]
+    fn entry_batch_finalization_freezes_new_pairs_but_keeps_existing_updates() {
+        let mut engine = Engine {
+            config: AppConfig {
+                runtime: RuntimeConfig::default(),
+                strategy: StrategyConfig {
+                    max_scan_minutes_before_funding: 25,
+                    min_scan_minutes_before_funding: 5,
+                    entry_batch_quiet_window_secs: 120,
+                    entry_batch_selection_count: 6,
+                    max_concurrent_positions: 6,
+                    ..StrategyConfig::default()
+                },
+                persistence: PersistenceConfig {
+                    event_log_path: "runtime/test-events.jsonl".to_string(),
+                    snapshot_path: "runtime/test-state.json".to_string(),
+                },
+                venues: vec![],
+                symbols: vec![],
+                directed_pairs: vec![],
+            },
+            adapters: BTreeMap::new(),
+            opportunity_source: None,
+            transfer_status_source: None,
+            journal: crate::journal::JsonlJournal::with_capacity("runtime/test-events.jsonl", 32),
+            store: crate::store::FileStateStore::new("runtime/test-state.json"),
+            state: EngineState::default(),
+            last_live_recovery_probe_ms: None,
+            last_running_slot_reconcile_probe_ms: None,
+            last_persisted_state: None,
+            recent_submit_ack_ms: BTreeMap::new(),
+            venue_entry_cooldowns: BTreeMap::new(),
+            venue_market_data_degradations: BTreeMap::new(),
+            recent_order_health: BTreeMap::new(),
+            venue_health_updated_at_ms: BTreeMap::new(),
+            cached_transfer_status_view: None,
+            scan_symbols: vec![],
+            market_data_active: false,
+            market_data_activated_at_ms: None,
+            last_no_entry_diagnostics: None,
+            repeated_failure_logs: BTreeMap::new(),
+            cached_live_entry_venue_filter: None,
+            last_ws_worker_snapshot_ms: None,
+            buffered_entry_candidates: HashMap::new(),
+            last_new_entry_candidate_ms: None,
+        };
+
+        let initial_candidate =
+            test_candidate("btcusdt:binance->okx", "BTCUSDT", 8.0, 12 * 60 * 1_000);
+        engine.update_entry_candidate_buffer(0, &[initial_candidate.clone()]);
+        assert_eq!(engine.buffered_entry_candidates.len(), 1);
+        assert_eq!(engine.last_new_entry_candidate_ms, Some(0));
+
+        let refreshed_candidate =
+            test_candidate("btcusdt:binance->okx", "BTCUSDT", 12.0, 12 * 60 * 1_000);
+        let new_candidate =
+            test_candidate("ethusdt:binance->okx", "ETHUSDT", 30.0, 12 * 60 * 1_000);
+        engine.update_entry_candidate_buffer(
+            4 * 60 * 1_000,
+            &[refreshed_candidate.clone(), new_candidate],
+        );
+
+        assert_eq!(engine.buffered_entry_candidates.len(), 1);
+        assert_eq!(
+            engine
+                .buffered_entry_candidates
+                .get("btcusdt:binance->okx")
+                .map(|candidate| candidate.ranking_edge_bps),
+            Some(refreshed_candidate.ranking_edge_bps)
+        );
+        assert_eq!(engine.last_new_entry_candidate_ms, Some(0));
+    }
+
+    #[test]
+    fn entry_batch_finalization_forces_selection_without_waiting_for_quiet_window() {
+        let temp = TempDir::new().expect("tempdir");
+        let event_log_path = temp.path().join("events.jsonl");
+        let snapshot_path = temp.path().join("state.json");
+        let mut engine = Engine {
+            config: AppConfig {
+                runtime: RuntimeConfig::default(),
+                strategy: StrategyConfig {
+                    max_scan_minutes_before_funding: 25,
+                    min_scan_minutes_before_funding: 5,
+                    entry_batch_quiet_window_secs: 120,
+                    entry_batch_selection_count: 6,
+                    max_concurrent_positions: 6,
+                    ..StrategyConfig::default()
+                },
+                persistence: PersistenceConfig {
+                    event_log_path: event_log_path.to_string_lossy().into_owned(),
+                    snapshot_path: snapshot_path.to_string_lossy().into_owned(),
+                },
+                venues: vec![],
+                symbols: vec![],
+                directed_pairs: vec![],
+            },
+            adapters: BTreeMap::new(),
+            opportunity_source: None,
+            transfer_status_source: None,
+            journal: crate::journal::JsonlJournal::with_capacity(
+                event_log_path.to_string_lossy().into_owned(),
+                32,
+            ),
+            store: crate::store::FileStateStore::new(snapshot_path.to_string_lossy().into_owned()),
+            state: EngineState::default(),
+            last_live_recovery_probe_ms: None,
+            last_running_slot_reconcile_probe_ms: None,
+            last_persisted_state: None,
+            recent_submit_ack_ms: BTreeMap::new(),
+            venue_entry_cooldowns: BTreeMap::new(),
+            venue_market_data_degradations: BTreeMap::new(),
+            recent_order_health: BTreeMap::new(),
+            venue_health_updated_at_ms: BTreeMap::new(),
+            cached_transfer_status_view: None,
+            scan_symbols: vec![],
+            market_data_active: false,
+            market_data_activated_at_ms: None,
+            last_no_entry_diagnostics: None,
+            repeated_failure_logs: BTreeMap::new(),
+            cached_live_entry_venue_filter: None,
+            last_ws_worker_snapshot_ms: None,
+            buffered_entry_candidates: HashMap::from([
+                (
+                    "btcusdt:binance->okx".to_string(),
+                    test_candidate("btcusdt:binance->okx", "BTCUSDT", 12.0, 12 * 60 * 1_000),
+                ),
+                (
+                    "ethusdt:binance->okx".to_string(),
+                    test_candidate("ethusdt:binance->okx", "ETHUSDT", 10.0, 12 * 60 * 1_000),
+                ),
+            ]),
+            last_new_entry_candidate_ms: Some(4 * 60 * 1_000),
+        };
+
+        let market = MarketView::from_snapshots(vec![
+            VenueMarketSnapshot {
+                venue: Venue::Binance,
+                observed_at_ms: 4 * 60 * 1_000,
+                symbols: vec![
+                    test_symbol_snapshot("BTCUSDT", 100.0, 101.0, 12 * 60 * 1_000),
+                    test_symbol_snapshot("ETHUSDT", 200.0, 201.0, 12 * 60 * 1_000),
+                ],
+            },
+            VenueMarketSnapshot {
+                venue: Venue::Okx,
+                observed_at_ms: 4 * 60 * 1_000,
+                symbols: vec![
+                    test_symbol_snapshot("BTCUSDT", 100.1, 101.1, 12 * 60 * 1_000),
+                    test_symbol_snapshot("ETHUSDT", 200.1, 201.1, 12 * 60 * 1_000),
+                ],
+            },
+        ]);
+
+        let selected = engine.select_entry_candidates_from_buffer_if_quiet(4 * 60 * 1_000, &market);
+
+        assert_eq!(selected.len(), 2);
+        assert!(engine.buffered_entry_candidates.is_empty());
+        assert_eq!(engine.last_new_entry_candidate_ms, None);
+    }
+
+    #[tokio::test]
+    async fn tick_logs_no_scan_reason_for_market_data_inactive() {
+        let temp = TempDir::new().expect("tempdir");
+        let event_log_path = temp.path().join("events.jsonl");
+        let snapshot_path = temp.path().join("state.json");
+        let mut engine = Engine {
+            config: AppConfig {
+                runtime: RuntimeConfig {
+                    mode: RuntimeMode::Live,
+                    ..RuntimeConfig::default()
+                },
+                strategy: StrategyConfig {
+                    max_scan_minutes_before_funding: 25,
+                    min_scan_minutes_before_funding: 5,
+                    ..StrategyConfig::default()
+                },
+                persistence: PersistenceConfig {
+                    event_log_path: event_log_path.to_string_lossy().into_owned(),
+                    snapshot_path: snapshot_path.to_string_lossy().into_owned(),
+                },
+                venues: vec![],
+                symbols: vec![],
+                directed_pairs: vec![],
+            },
+            adapters: BTreeMap::from([(
+                Venue::Aster,
+                Arc::new(MarketDataActivityAdapter {
+                    venue: Venue::Aster,
+                    activation_calls: Arc::new(AtomicUsize::new(0)),
+                    supports_activity_control: true,
+                    fail_on_activate: false,
+                    fail_on_deactivate: false,
+                }) as Arc<dyn crate::venue::VenueAdapter>,
+            )]),
+            opportunity_source: None,
+            transfer_status_source: None,
+            journal: crate::journal::JsonlJournal::with_capacity(
+                event_log_path.to_string_lossy().into_owned(),
+                32,
+            ),
+            store: crate::store::FileStateStore::new(snapshot_path.to_string_lossy().into_owned()),
+            state: EngineState::default(),
+            last_live_recovery_probe_ms: None,
+            last_running_slot_reconcile_probe_ms: None,
+            last_persisted_state: None,
+            recent_submit_ack_ms: BTreeMap::new(),
+            venue_entry_cooldowns: BTreeMap::new(),
+            venue_market_data_degradations: BTreeMap::new(),
+            recent_order_health: BTreeMap::new(),
+            venue_health_updated_at_ms: BTreeMap::new(),
+            cached_transfer_status_view: None,
+            scan_symbols: vec![],
+            market_data_active: false,
+            market_data_activated_at_ms: None,
+            last_no_entry_diagnostics: None,
+            repeated_failure_logs: BTreeMap::new(),
+            cached_live_entry_venue_filter: None,
+            last_ws_worker_snapshot_ms: None,
+            buffered_entry_candidates: HashMap::new(),
+            last_new_entry_candidate_ms: None,
+        };
+
+        engine.tick().await.expect("tick");
+        let records = engine.journal.read_records().expect("records");
+        assert!(records.iter().any(|record| {
+            record.kind == "runtime.no_scan_reason"
+                && record.payload["reason"].as_str() == Some("market_data_inactive")
+        }));
+    }
+
+    #[tokio::test]
+    async fn tick_logs_no_scan_reason_for_market_data_warmup_pending() {
+        let temp = TempDir::new().expect("tempdir");
+        let event_log_path = temp.path().join("events.jsonl");
+        let snapshot_path = temp.path().join("state.json");
+        let mut engine = Engine {
+            config: AppConfig {
+                runtime: RuntimeConfig {
+                    mode: RuntimeMode::Live,
+                    ..RuntimeConfig::default()
+                },
+                strategy: StrategyConfig {
+                    max_scan_minutes_before_funding: 60,
+                    min_scan_minutes_before_funding: 0,
+                    ..StrategyConfig::default()
+                },
+                persistence: PersistenceConfig {
+                    event_log_path: event_log_path.to_string_lossy().into_owned(),
+                    snapshot_path: snapshot_path.to_string_lossy().into_owned(),
+                },
+                venues: vec![],
+                symbols: vec!["BTCUSDT".to_string()],
+                directed_pairs: vec![],
+            },
+            adapters: BTreeMap::from([(
+                Venue::Aster,
+                Arc::new(MarketDataActivityAdapter {
+                    venue: Venue::Aster,
+                    activation_calls: Arc::new(AtomicUsize::new(0)),
+                    supports_activity_control: true,
+                    fail_on_activate: false,
+                    fail_on_deactivate: false,
+                }) as Arc<dyn crate::venue::VenueAdapter>,
+            )]),
+            opportunity_source: None,
+            transfer_status_source: None,
+            journal: crate::journal::JsonlJournal::with_capacity(
+                event_log_path.to_string_lossy().into_owned(),
+                32,
+            ),
+            store: crate::store::FileStateStore::new(snapshot_path.to_string_lossy().into_owned()),
+            state: EngineState::default(),
+            last_live_recovery_probe_ms: None,
+            last_running_slot_reconcile_probe_ms: None,
+            last_persisted_state: None,
+            recent_submit_ack_ms: BTreeMap::new(),
+            venue_entry_cooldowns: BTreeMap::new(),
+            venue_market_data_degradations: BTreeMap::new(),
+            recent_order_health: BTreeMap::new(),
+            venue_health_updated_at_ms: BTreeMap::new(),
+            cached_transfer_status_view: None,
+            scan_symbols: vec!["BTCUSDT".to_string()],
+            market_data_active: true,
+            market_data_activated_at_ms: Some(crate::live::now_ms()),
+            last_no_entry_diagnostics: None,
+            repeated_failure_logs: BTreeMap::new(),
+            cached_live_entry_venue_filter: None,
+            last_ws_worker_snapshot_ms: None,
+            buffered_entry_candidates: HashMap::new(),
+            last_new_entry_candidate_ms: None,
+        };
+
+        engine.tick().await.expect("tick");
+        let records = engine.journal.read_records().expect("records");
+        assert!(records.iter().any(|record| {
+            record.kind == "runtime.no_scan_reason"
+                && record.payload["reason"].as_str() == Some("market_data_warmup_pending")
+        }));
+    }
+
+    #[tokio::test]
+    async fn tick_logs_no_scan_reason_for_market_fetch_failed_hard() {
+        let temp = TempDir::new().expect("tempdir");
+        let event_log_path = temp.path().join("events.jsonl");
+        let snapshot_path = temp.path().join("state.json");
+        let mut engine = Engine {
+            config: AppConfig {
+                runtime: RuntimeConfig {
+                    mode: RuntimeMode::Live,
+                    ..RuntimeConfig::default()
+                },
+                strategy: StrategyConfig::default(),
+                persistence: PersistenceConfig {
+                    event_log_path: event_log_path.to_string_lossy().into_owned(),
+                    snapshot_path: snapshot_path.to_string_lossy().into_owned(),
+                },
+                venues: vec![],
+                symbols: vec!["BTCUSDT".to_string()],
+                directed_pairs: vec![],
+            },
+            adapters: BTreeMap::from([(
+                Venue::Aster,
+                Arc::new(MarketDataActivityAdapter {
+                    venue: Venue::Aster,
+                    activation_calls: Arc::new(AtomicUsize::new(0)),
+                    supports_activity_control: false,
+                    fail_on_activate: false,
+                    fail_on_deactivate: false,
+                }) as Arc<dyn crate::venue::VenueAdapter>,
+            )]),
+            opportunity_source: None,
+            transfer_status_source: None,
+            journal: crate::journal::JsonlJournal::with_capacity(
+                event_log_path.to_string_lossy().into_owned(),
+                32,
+            ),
+            store: crate::store::FileStateStore::new(snapshot_path.to_string_lossy().into_owned()),
+            state: EngineState::default(),
+            last_live_recovery_probe_ms: None,
+            last_running_slot_reconcile_probe_ms: None,
+            last_persisted_state: None,
+            recent_submit_ack_ms: BTreeMap::new(),
+            venue_entry_cooldowns: BTreeMap::new(),
+            venue_market_data_degradations: BTreeMap::new(),
+            recent_order_health: BTreeMap::new(),
+            venue_health_updated_at_ms: BTreeMap::new(),
+            cached_transfer_status_view: None,
+            scan_symbols: vec!["BTCUSDT".to_string()],
+            market_data_active: false,
+            market_data_activated_at_ms: None,
+            last_no_entry_diagnostics: None,
+            repeated_failure_logs: BTreeMap::new(),
+            cached_live_entry_venue_filter: None,
+            last_ws_worker_snapshot_ms: None,
+            buffered_entry_candidates: HashMap::new(),
+            last_new_entry_candidate_ms: None,
+        };
+
+        assert!(engine.tick().await.is_err());
+        let records = engine.journal.read_records().expect("records");
+        assert!(records.iter().any(|record| {
+            record.kind == "runtime.no_scan_reason"
+                && record.payload["reason"].as_str() == Some("market_fetch_failed_hard")
+        }));
+    }
+
+    #[tokio::test]
+    async fn tick_logs_no_scan_reason_for_engine_not_running() {
+        let temp = TempDir::new().expect("tempdir");
+        let event_log_path = temp.path().join("events.jsonl");
+        let snapshot_path = temp.path().join("state.json");
+        let binance = Arc::new(ScriptedVenueAdapter::new(
+            Venue::Binance,
+            0.5,
+            vec![VenueMarketSnapshot {
+                venue: Venue::Binance,
+                observed_at_ms: 1_000,
+                symbols: vec![test_symbol_snapshot(
+                    "BTCUSDT",
+                    100.0,
+                    101.0,
+                    30 * 60 * 1_000,
+                )],
+            }],
+        ));
+        let okx = Arc::new(ScriptedVenueAdapter::new(
+            Venue::Okx,
+            0.5,
+            vec![VenueMarketSnapshot {
+                venue: Venue::Okx,
+                observed_at_ms: 1_000,
+                symbols: vec![test_symbol_snapshot(
+                    "BTCUSDT",
+                    100.1,
+                    101.1,
+                    30 * 60 * 1_000,
+                )],
+            }],
+        ));
+        let mut engine = Engine {
+            config: AppConfig {
+                runtime: RuntimeConfig::default(),
+                strategy: StrategyConfig {
+                    max_concurrent_positions: 1,
+                    ..StrategyConfig::default()
+                },
+                persistence: PersistenceConfig {
+                    event_log_path: event_log_path.to_string_lossy().into_owned(),
+                    snapshot_path: snapshot_path.to_string_lossy().into_owned(),
+                },
+                venues: vec![],
+                symbols: vec!["BTCUSDT".to_string()],
+                directed_pairs: vec![],
+            },
+            adapters: BTreeMap::from([
+                (
+                    Venue::Binance,
+                    binance as Arc<dyn crate::venue::VenueAdapter>,
+                ),
+                (Venue::Okx, okx as Arc<dyn crate::venue::VenueAdapter>),
+            ]),
+            opportunity_source: None,
+            transfer_status_source: None,
+            journal: crate::journal::JsonlJournal::with_capacity(
+                event_log_path.to_string_lossy().into_owned(),
+                32,
+            ),
+            store: crate::store::FileStateStore::new(snapshot_path.to_string_lossy().into_owned()),
+            state: EngineState {
+                mode: EngineMode::FailClosed,
+                open_positions: vec![
+                    OpenPosition {
+                        position_id: "pos-1".to_string(),
+                        symbol: "BTCUSDT".to_string(),
+                        long_venue: Venue::Binance,
+                        short_venue: Venue::Okx,
+                        quantity: 1.0,
+                        initial_quantity: 1.0,
+                        long_entry_price: 100.0,
+                        short_entry_price: 100.0,
+                        entry_notional_quote: 100.0,
+                        funding_timestamp_ms: 30 * 60 * 1_000,
+                        long_funding_timestamp_ms: 30 * 60 * 1_000,
+                        short_funding_timestamp_ms: 30 * 60 * 1_000,
+                        opportunity_type: FundingOpportunityType::Aligned,
+                        first_funding_leg: FundingLeg::Short,
+                        second_funding_timestamp_ms: 30 * 60 * 1_000,
+                        funding_edge_bps_entry: 10.0,
+                        total_funding_edge_bps_entry: 10.0,
+                        expected_edge_bps_entry: 2.0,
+                        worst_case_edge_bps_entry: 1.0,
+                        entry_cross_bps_entry: 0.0,
+                        fee_bps_entry: 1.0,
+                        entry_slippage_bps_entry: 0.1,
+                        entry_depth_capped_at_entry: false,
+                        total_entry_fee_quote: 0.1,
+                        realized_price_pnl_quote: 0.0,
+                        realized_exit_fee_quote: 0.0,
+                        entered_at_ms: 1,
+                        current_net_quote: 0.0,
+                        peak_net_quote: 0.0,
+                        funding_captured: false,
+                        second_stage_funding_captured: false,
+                        captured_funding_quote: 0.0,
+                        second_stage_funding_quote: 0.0,
+                        settlement_half_closed_quantity: 0.0,
+                        settlement_half_closed_at_ms: 0,
+                        exit_after_first_stage: true,
+                        second_stage_enabled_at_entry: false,
+                        exit_reason: None,
+                    },
+                    OpenPosition {
+                        position_id: "pos-2".to_string(),
+                        symbol: "ETHUSDT".to_string(),
+                        long_venue: Venue::Binance,
+                        short_venue: Venue::Okx,
+                        quantity: 1.0,
+                        initial_quantity: 1.0,
+                        long_entry_price: 100.0,
+                        short_entry_price: 100.0,
+                        entry_notional_quote: 100.0,
+                        funding_timestamp_ms: 30 * 60 * 1_000,
+                        long_funding_timestamp_ms: 30 * 60 * 1_000,
+                        short_funding_timestamp_ms: 30 * 60 * 1_000,
+                        opportunity_type: FundingOpportunityType::Aligned,
+                        first_funding_leg: FundingLeg::Short,
+                        second_funding_timestamp_ms: 30 * 60 * 1_000,
+                        funding_edge_bps_entry: 10.0,
+                        total_funding_edge_bps_entry: 10.0,
+                        expected_edge_bps_entry: 2.0,
+                        worst_case_edge_bps_entry: 1.0,
+                        entry_cross_bps_entry: 0.0,
+                        fee_bps_entry: 1.0,
+                        entry_slippage_bps_entry: 0.1,
+                        entry_depth_capped_at_entry: false,
+                        total_entry_fee_quote: 0.1,
+                        realized_price_pnl_quote: 0.0,
+                        realized_exit_fee_quote: 0.0,
+                        entered_at_ms: 1,
+                        current_net_quote: 0.0,
+                        peak_net_quote: 0.0,
+                        funding_captured: false,
+                        second_stage_funding_captured: false,
+                        captured_funding_quote: 0.0,
+                        second_stage_funding_quote: 0.0,
+                        settlement_half_closed_quantity: 0.0,
+                        settlement_half_closed_at_ms: 0,
+                        exit_after_first_stage: true,
+                        second_stage_enabled_at_entry: false,
+                        exit_reason: None,
+                    },
+                ],
+                ..EngineState::default()
+            },
+            last_live_recovery_probe_ms: None,
+            last_running_slot_reconcile_probe_ms: None,
+            last_persisted_state: None,
+            recent_submit_ack_ms: BTreeMap::new(),
+            venue_entry_cooldowns: BTreeMap::new(),
+            venue_market_data_degradations: BTreeMap::new(),
+            recent_order_health: BTreeMap::new(),
+            venue_health_updated_at_ms: BTreeMap::new(),
+            cached_transfer_status_view: None,
+            scan_symbols: vec!["BTCUSDT".to_string(), "ETHUSDT".to_string()],
+            market_data_active: false,
+            market_data_activated_at_ms: None,
+            last_no_entry_diagnostics: None,
+            repeated_failure_logs: BTreeMap::new(),
+            cached_live_entry_venue_filter: None,
+            last_ws_worker_snapshot_ms: None,
+            buffered_entry_candidates: HashMap::new(),
+            last_new_entry_candidate_ms: None,
+        };
+
+        engine.tick().await.expect("tick");
+        let records = engine.journal.read_records().expect("records");
+        assert!(records.iter().any(|record| {
+            record.kind == "runtime.no_scan_reason"
+                && record.payload["reason"].as_str() == Some("engine_not_running")
+        }));
     }
 
     #[test]
