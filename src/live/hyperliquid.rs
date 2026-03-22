@@ -442,15 +442,15 @@ impl HyperliquidLiveAdapter {
                                 unhealthy_after_failures,
                                 error.clone(),
                             );
-                            warn!(?error, "hyperliquid private websocket reported error");
+                            warn!(?error, "[hyperliquid] private websocket reported error");
                         }
                         Some(HyperliquidMessage::NoData) => {
                             private_state.record_connection_failure(
                                 now_ms(),
                                 unhealthy_after_failures,
-                                "hyperliquid private websocket disconnected".to_string(),
+                                "[hyperliquid] private websocket disconnected".to_string(),
                             );
-                            debug!("hyperliquid private websocket disconnected");
+                            debug!("[hyperliquid] private websocket disconnected");
                             should_rebuild = true;
                         }
                         Some(_) => {}
@@ -458,9 +458,9 @@ impl HyperliquidLiveAdapter {
                             private_state.record_connection_failure(
                                 now_ms(),
                                 unhealthy_after_failures,
-                                "hyperliquid private websocket receiver closed".to_string(),
+                                "[hyperliquid] private websocket receiver closed".to_string(),
                             );
-                            debug!("hyperliquid private websocket receiver closed");
+                            debug!("[hyperliquid] private websocket receiver closed");
                             should_rebuild = true;
                         }
                     }

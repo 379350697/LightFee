@@ -296,6 +296,8 @@ pub struct Engine {
     repeated_failure_logs: BTreeMap<String, RepeatedFailureLogState>,
     cached_live_entry_venue_filter: Option<CachedLiveEntryVenueFilter>,
     last_ws_worker_snapshot_ms: Option<i64>,
+    buffered_entry_candidates: HashMap<String, CandidateOpportunity>,
+    last_new_entry_candidate_ms: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -702,6 +704,8 @@ impl Engine {
             repeated_failure_logs: BTreeMap::new(),
             cached_live_entry_venue_filter: None,
             last_ws_worker_snapshot_ms: None,
+            buffered_entry_candidates: HashMap::new(),
+            last_new_entry_candidate_ms: None,
         };
         engine.finalize_startup_position_recovery().await?;
         engine.initialize_scan_symbols(cached_scan_symbol_state.as_ref());
@@ -1128,7 +1132,12 @@ impl Engine {
             );
             let selected_candidates = if self.state.mode == EngineMode::Running {
                 let selected = if self.config.runtime.auto_trade_enabled {
-                    self.select_entry_candidates(&market, &candidates)
+                    if self.config.strategy.entry_batch_quiet_window_secs > 0 {
+                        self.update_entry_candidate_buffer(now_ms, &candidates);
+                        self.select_entry_candidates_from_buffer_if_quiet(now_ms, &market)
+                    } else {
+                        self.select_entry_candidates(&market, &candidates)
+                    }
                 } else {
                     Vec::new()
                 };
@@ -1813,6 +1822,74 @@ impl Engine {
             }
         }
         self.sync_open_position_mirror();
+    }
+
+    fn update_entry_candidate_buffer(&mut self, now_ms: i64, candidates: &[CandidateOpportunity]) {
+        let mut saw_new = false;
+        for candidate in candidates.iter().filter(|item| item.is_tradeable()) {
+            if !self
+                .buffered_entry_candidates
+                .contains_key(&candidate.pair_id)
+            {
+                saw_new = true;
+            }
+            self.buffered_entry_candidates
+                .insert(candidate.pair_id.clone(), candidate.clone());
+        }
+        if saw_new {
+            self.last_new_entry_candidate_ms = Some(now_ms.max(0));
+        }
+    }
+
+    fn select_entry_candidates_from_buffer_if_quiet(
+        &mut self,
+        now_ms: i64,
+        market: &MarketView,
+    ) -> Vec<CandidateOpportunity> {
+        if self.buffered_entry_candidates.is_empty() {
+            return Vec::new();
+        }
+        let quiet_window_ms = self
+            .config
+            .strategy
+            .entry_batch_quiet_window_secs
+            .max(0)
+            .saturating_mul(1000);
+        let Some(last_new_ms) = self.last_new_entry_candidate_ms else {
+            return Vec::new();
+        };
+        if now_ms.saturating_sub(last_new_ms) < quiet_window_ms {
+            return Vec::new();
+        }
+
+        let buffered = self
+            .buffered_entry_candidates
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut selected = self.select_entry_candidates(market, &buffered);
+        let hard_cap = self
+            .config
+            .strategy
+            .entry_batch_selection_count
+            .max(1)
+            .min(self.config.strategy.max_concurrent_positions.max(1));
+        selected.truncate(hard_cap);
+
+        if !selected.is_empty() {
+            self.log_event(
+                "execution.entry_batch_selected",
+                &json!({
+                    "buffered_candidate_count": buffered.len(),
+                    "selected_count": selected.len(),
+                    "quiet_window_ms": quiet_window_ms,
+                    "selection_symbols": selected.iter().map(|c| c.symbol.clone()).collect::<Vec<_>>()
+                }),
+            );
+            self.buffered_entry_candidates.clear();
+            self.last_new_entry_candidate_ms = None;
+        }
+        selected
     }
 
     fn select_entry_candidates(
@@ -6737,7 +6814,7 @@ fn checklist_item(key: &'static str, ok: bool, detail: String) -> OpportunityChe
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::{BTreeMap, VecDeque},
+        collections::{BTreeMap, HashMap, VecDeque},
         sync::Arc,
     };
 
@@ -7235,6 +7312,8 @@ mod tests {
             repeated_failure_logs: BTreeMap::new(),
             cached_live_entry_venue_filter: None,
             last_ws_worker_snapshot_ms: None,
+            buffered_entry_candidates: HashMap::new(),
+            last_new_entry_candidate_ms: None,
         };
 
         assert_eq!(
@@ -7351,6 +7430,8 @@ mod tests {
             repeated_failure_logs: BTreeMap::new(),
             cached_live_entry_venue_filter: None,
             last_ws_worker_snapshot_ms: None,
+            buffered_entry_candidates: HashMap::new(),
+            last_new_entry_candidate_ms: None,
         };
 
         let statuses = engine.current_ws_worker_statuses();
@@ -7415,6 +7496,8 @@ mod tests {
             repeated_failure_logs: BTreeMap::new(),
             cached_live_entry_venue_filter: None,
             last_ws_worker_snapshot_ms: None,
+            buffered_entry_candidates: HashMap::new(),
+            last_new_entry_candidate_ms: None,
         };
 
         engine.maybe_log_ws_worker_status(1_000);
