@@ -86,17 +86,16 @@ fn ensure_fee_snapshot_schema(connection: &Connection) -> rusqlite::Result<()> {
         )",
         [],
     )?;
-    for (column, default_value) in [
-        ("taker_fee_pct", "0"),
-        ("maker_fee_pct", "0"),
-    ] {
+    for (column, default_value) in [("taker_fee_pct", "0"), ("maker_fee_pct", "0")] {
         let alter = format!(
             "ALTER TABLE account_fee_snapshots ADD COLUMN {column} REAL NOT NULL DEFAULT {default_value}"
         );
         match connection.execute(&alter, []) {
             Ok(_) => {}
             Err(rusqlite::Error::SqliteFailure(_, Some(message)))
-                if message.to_ascii_lowercase().contains("duplicate column name") => {}
+                if message
+                    .to_ascii_lowercase()
+                    .contains("duplicate column name") => {}
             Err(error) => return Err(error),
         }
     }

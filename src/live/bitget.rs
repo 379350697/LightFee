@@ -193,8 +193,13 @@ impl BitgetLiveAdapter {
         {
             Ok(payload) => payload,
             Err(error) if is_bitget_classic_account_fee_error(&error) => {
-                debug!(?error, "bitget unified fee endpoint unsupported; trying classic trade rate");
-                return self.refresh_classic_account_fee_snapshot(&symbol, &venue_symbol).await;
+                debug!(
+                    ?error,
+                    "bitget unified fee endpoint unsupported; trying classic trade rate"
+                );
+                return self
+                    .refresh_classic_account_fee_snapshot(&symbol, &venue_symbol)
+                    .await;
             }
             Err(error) => return Err(error),
         };
@@ -202,7 +207,9 @@ impl BitgetLiveAdapter {
             Ok(row) => row,
             Err(error) if is_bitget_classic_account_fee_error(&error) => {
                 debug!(?error, "bitget unified fee payload reported classic account; trying classic trade rate");
-                return self.refresh_classic_account_fee_snapshot(&symbol, &venue_symbol).await;
+                return self
+                    .refresh_classic_account_fee_snapshot(&symbol, &venue_symbol)
+                    .await;
             }
             Err(error) => return Err(error),
         };
@@ -1831,11 +1838,10 @@ mod tests {
         assert_eq!(meta.min_notional, Some(5.0));
         assert_eq!(meta.max_qty, Some(1000.0));
         assert_eq!(meta.maker_fee_rate_bps, Some(2.0));
-        assert!(
-            meta.taker_fee_rate_bps
-                .map(|value| (value - 6.0).abs() < 1e-9)
-                .unwrap_or(false)
-        );
+        assert!(meta
+            .taker_fee_rate_bps
+            .map(|value| (value - 6.0).abs() < 1e-9)
+            .unwrap_or(false));
     }
 
     #[test]
@@ -1845,8 +1851,8 @@ mod tests {
             "takerFeeRate": "0.0006"
         });
 
-        let snapshot = parse_bitget_trade_rate_snapshot("BTCUSDT", &row)
-            .expect("parse classic trade rate");
+        let snapshot =
+            parse_bitget_trade_rate_snapshot("BTCUSDT", &row).expect("parse classic trade rate");
         assert_eq!(snapshot.venue, crate::models::Venue::Bitget);
         assert_eq!(snapshot.maker_fee_bps, 2.0);
         assert!((snapshot.taker_fee_bps - 6.0).abs() < 1e-9);

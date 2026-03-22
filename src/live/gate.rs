@@ -193,7 +193,10 @@ impl GateLiveAdapter {
         let snapshot = match parse_gate_fee_snapshot(&payload) {
             Ok(snapshot) => snapshot,
             Err(wallet_error) => {
-                debug!(?wallet_error, "gate wallet fee missing futures fee fields; trying contract catalog rate");
+                debug!(
+                    ?wallet_error,
+                    "gate wallet fee missing futures fee fields; trying contract catalog rate"
+                );
                 let Some(symbol) = self.fee_reference_symbol() else {
                     return Ok(self.cached_account_fee_snapshot());
                 };
@@ -1385,16 +1388,10 @@ fn parse_gate_contract_meta(row: &Value) -> Result<(String, GateContractMeta)> {
                     "max_order_size",
                 ],
             ),
-            maker_fee_rate_bps: json_f64(
-                row,
-                &["maker_fee_rate", "makerFeeRate"],
-            )
-            .map(|value| value * 10_000.0),
-            taker_fee_rate_bps: json_f64(
-                row,
-                &["taker_fee_rate", "takerFeeRate"],
-            )
-            .map(|value| value * 10_000.0),
+            maker_fee_rate_bps: json_f64(row, &["maker_fee_rate", "makerFeeRate"])
+                .map(|value| value * 10_000.0),
+            taker_fee_rate_bps: json_f64(row, &["taker_fee_rate", "takerFeeRate"])
+                .map(|value| value * 10_000.0),
         },
     ))
 }

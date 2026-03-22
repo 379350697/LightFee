@@ -3120,6 +3120,140 @@ async fn live_scan_skips_venues_with_balance_fetch_failures() {
 }
 
 #[tokio::test]
+async fn live_scan_degrades_unstable_market_venue_without_blocking_other_pairs() {
+    let temp = TempDir::new().expect("tempdir");
+    let mut config = test_config(&temp, false);
+    config.runtime.mode = RuntimeMode::Live;
+    config.strategy.entry_window_secs = 3_600;
+    config.symbols = vec!["BTCUSDT".to_string()];
+    config.venues = vec![
+        venue(Venue::Binance, 0.5),
+        venue(Venue::Hyperliquid, 0.3),
+        venue(Venue::Aster, 0.4),
+    ];
+    config.directed_pairs = vec![
+        DirectedPairConfig {
+            long: Venue::Binance,
+            short: Venue::Hyperliquid,
+            symbols: config.symbols.clone(),
+        },
+        DirectedPairConfig {
+            long: Venue::Aster,
+            short: Venue::Hyperliquid,
+            symbols: config.symbols.clone(),
+        },
+    ];
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let funding_timestamp_ms = now_ms + 60_000;
+
+    let binance = Arc::new(
+        ScriptedVenueAdapter::new(
+            Venue::Binance,
+            0.5,
+            vec![venue_snapshot(
+                Venue::Binance,
+                now_ms,
+                vec![symbol_snapshot(
+                    "BTCUSDT",
+                    100.0,
+                    100.1,
+                    500.0,
+                    500.0,
+                    -0.0005,
+                    funding_timestamp_ms,
+                )],
+            )],
+        )
+        .with_balance_snapshot(120.0, Some(120.0), Some(120.0))
+        .with_entry_balance_gate()
+        .with_perp_liquidity_snapshot("BTCUSDT", 10_000_000.0, 10_000_000.0),
+    );
+    let hyperliquid = Arc::new(
+        ScriptedVenueAdapter::new(
+            Venue::Hyperliquid,
+            0.3,
+            vec![venue_snapshot(
+                Venue::Hyperliquid,
+                now_ms,
+                vec![symbol_snapshot(
+                    "BTCUSDT",
+                    100.2,
+                    100.3,
+                    500.0,
+                    500.0,
+                    0.0015,
+                    funding_timestamp_ms,
+                )],
+            )],
+        )
+        .with_balance_snapshot(120.0, Some(120.0), Some(120.0))
+        .with_entry_balance_gate()
+        .with_perp_liquidity_snapshot("BTCUSDT", 10_000_000.0, 10_000_000.0),
+    );
+    let aster = Arc::new(
+        FlakyMarketBalanceAdapter::new(
+            Venue::Aster,
+            venue_snapshot(
+                Venue::Aster,
+                now_ms,
+                vec![symbol_snapshot(
+                    "BTCUSDT",
+                    100.1,
+                    100.2,
+                    500.0,
+                    500.0,
+                    -0.0004,
+                    funding_timestamp_ms,
+                )],
+            ),
+            1,
+        )
+        .with_balance_snapshot(120.0),
+    );
+
+    let mut engine = Engine::new(
+        config.clone(),
+        vec![
+            binance as Arc<dyn VenueAdapter>,
+            hyperliquid as Arc<dyn VenueAdapter>,
+            aster.clone() as Arc<dyn VenueAdapter>,
+        ],
+    )
+    .await
+    .expect("engine");
+
+    engine.tick().await.expect("first tick");
+    sleep(Duration::from_millis(100)).await;
+    engine.tick().await.expect("second tick");
+    sleep(Duration::from_millis(100)).await;
+
+    let scan = engine.state().last_scan.as_ref().expect("scan");
+    assert!(scan.candidate_count > 0);
+    assert!(scan.tradeable_count > 0);
+    assert_eq!(aster.fetch_calls(), 1);
+
+    let records = read_event_records(&config.persistence.event_log_path);
+    assert!(has_event(&records, "runtime.market_data_degraded_started"));
+    let filter_event = records
+        .iter()
+        .rev()
+        .find(|record| record_kind(record) == Some("runtime.entry_venue_filter.refreshed"))
+        .expect("filter event");
+    let statuses = filter_event["payload"]["statuses"]
+        .as_array()
+        .expect("statuses");
+    let aster_status = statuses
+        .iter()
+        .find(|item| item["venue"] == "aster")
+        .expect("aster status");
+    assert_eq!(aster_status["eligible"], false);
+    assert_eq!(
+        aster_status["reason"],
+        "market_data_degraded:aster:market_fetch_failed"
+    );
+}
+
+#[tokio::test]
 async fn hard_market_failures_on_all_venues_still_fail_tick() {
     let temp = TempDir::new().expect("tempdir");
     let config = test_config(&temp, false);
@@ -4749,6 +4883,15 @@ struct SoftFailingMarketAdapter {
 }
 
 #[derive(Debug)]
+struct FlakyMarketBalanceAdapter {
+    venue: Venue,
+    snapshot: VenueMarketSnapshot,
+    balance_snapshot: Mutex<Option<lightfee::AccountBalanceSnapshot>>,
+    failures_remaining: Mutex<usize>,
+    fetch_calls: Arc<Mutex<usize>>,
+}
+
+#[derive(Debug)]
 struct TimedFillAdapter {
     venue: Venue,
     snapshots: Mutex<Vec<VenueMarketSnapshot>>,
@@ -5039,6 +5182,95 @@ impl VenueAdapter for SoftFailingMarketAdapter {
             size: 0.0,
             updated_at_ms: 0,
         })
+    }
+}
+
+impl FlakyMarketBalanceAdapter {
+    fn new(venue: Venue, snapshot: VenueMarketSnapshot, failures: usize) -> Self {
+        Self {
+            venue,
+            snapshot,
+            balance_snapshot: Mutex::new(None),
+            failures_remaining: Mutex::new(failures),
+            fetch_calls: Arc::new(Mutex::new(0)),
+        }
+    }
+
+    fn with_balance_snapshot(self, equity_quote: f64) -> Self {
+        *self.balance_snapshot.lock().expect("lock") = Some(lightfee::AccountBalanceSnapshot {
+            venue: self.venue,
+            equity_quote,
+            wallet_balance_quote: Some(equity_quote),
+            available_balance_quote: Some(equity_quote),
+            observed_at_ms: self.snapshot.observed_at_ms,
+        });
+        self
+    }
+
+    fn fetch_calls(&self) -> usize {
+        *self.fetch_calls.lock().expect("lock")
+    }
+}
+
+#[async_trait]
+impl VenueAdapter for FlakyMarketBalanceAdapter {
+    fn venue(&self) -> Venue {
+        self.venue
+    }
+
+    async fn fetch_market_snapshot(&self, symbols: &[String]) -> Result<VenueMarketSnapshot> {
+        *self.fetch_calls.lock().expect("lock") += 1;
+        let mut failures_remaining = self.failures_remaining.lock().expect("lock");
+        if *failures_remaining > 0 {
+            *failures_remaining -= 1;
+            return Err(anyhow!("{} websocket bootstrap failed", self.venue));
+        }
+
+        let mut filtered = self.snapshot.clone();
+        if !symbols.is_empty() {
+            filtered
+                .symbols
+                .retain(|item| symbols.iter().any(|symbol| symbol == &item.symbol));
+        }
+        Ok(filtered)
+    }
+
+    async fn place_order(&self, request: lightfee::OrderRequest) -> Result<lightfee::OrderFill> {
+        Err(anyhow!(
+            "{} should not place order for {}",
+            self.venue,
+            request.symbol
+        ))
+    }
+
+    async fn fetch_position(&self, symbol: &str) -> Result<lightfee::PositionSnapshot> {
+        Ok(lightfee::PositionSnapshot {
+            venue: self.venue,
+            symbol: symbol.to_string(),
+            size: 0.0,
+            updated_at_ms: self.snapshot.observed_at_ms,
+        })
+    }
+
+    async fn fetch_account_balance_snapshot(
+        &self,
+    ) -> Result<Option<lightfee::AccountBalanceSnapshot>> {
+        Ok(self.balance_snapshot.lock().expect("lock").clone())
+    }
+
+    fn enforces_entry_balance_gate(&self) -> bool {
+        true
+    }
+
+    async fn fetch_perp_liquidity_snapshot(
+        &self,
+        symbol: &str,
+    ) -> Result<Option<lightfee::PerpLiquiditySnapshot>> {
+        Ok(Some(ample_perp_liquidity_snapshot(
+            self.venue,
+            symbol,
+            self.snapshot.observed_at_ms,
+        )))
     }
 }
 

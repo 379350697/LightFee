@@ -285,6 +285,7 @@ pub struct Engine {
     last_persisted_state: Option<EngineState>,
     recent_submit_ack_ms: BTreeMap<Venue, VecDeque<u64>>,
     venue_entry_cooldowns: BTreeMap<Venue, VenueEntryCooldown>,
+    venue_market_data_degradations: BTreeMap<Venue, VenueEntryCooldown>,
     recent_order_health: BTreeMap<Venue, VecDeque<VenueOrderHealthSample>>,
     venue_health_updated_at_ms: BTreeMap<Venue, i64>,
     cached_transfer_status_view: Option<CachedTransferStatusView>,
@@ -601,6 +602,7 @@ const REPEATED_FAILURE_LOG_RETENTION_CYCLES: u64 = 200;
 const RECONCILIATION_SUMMARY_ONLY_DELTA_QUOTE: f64 = 0.05;
 const LIVE_ENTRY_VENUE_FILTER_TTL_MS: i64 = 60_000;
 const MIN_LIVE_ENTRY_VENUE_BALANCE_QUOTE: f64 = 50.0;
+const MARKET_DATA_DEGRADATION_COOLDOWN_MS: i64 = 60_000;
 
 fn default_exit_after_first_stage() -> bool {
     true
@@ -679,6 +681,7 @@ impl Engine {
             last_persisted_state: loaded_state.as_ref().map(persistent_state_view),
             recent_submit_ack_ms,
             venue_entry_cooldowns: BTreeMap::new(),
+            venue_market_data_degradations: BTreeMap::new(),
             recent_order_health,
             venue_health_updated_at_ms,
             cached_transfer_status_view: None,
@@ -1231,6 +1234,11 @@ impl Engine {
                             "soft": soft_failure,
                         }),
                     );
+                    if matches!(self.config.runtime.mode, RuntimeMode::Live)
+                        && self.active_positions().is_empty()
+                    {
+                        self.arm_market_data_degradation(venue, "market_fetch_failed");
+                    }
                 }
             }
         }
@@ -1268,6 +1276,9 @@ impl Engine {
     }
 
     async fn live_entry_venue_filter(&mut self, now_ms: i64) -> CachedLiveEntryVenueFilter {
+        if self.expire_market_data_degradations(now_ms) {
+            self.cached_live_entry_venue_filter = None;
+        }
         if let Some(cache) = self.cached_live_entry_venue_filter.as_ref() {
             if now_ms.saturating_sub(cache.observed_at_ms) <= LIVE_ENTRY_VENUE_FILTER_TTL_MS {
                 return cache.clone();
@@ -1277,6 +1288,20 @@ impl Engine {
         let mut statuses = BTreeMap::new();
         let mut eligible_venues = BTreeSet::new();
         for (venue, adapter) in &self.adapters {
+            if let Some(reason) = self.market_data_degradation_reason(*venue, now_ms) {
+                statuses.insert(
+                    *venue,
+                    LiveEntryVenueStatus {
+                        eligible: false,
+                        reason,
+                        effective_balance_quote: None,
+                        equity_quote: None,
+                        available_balance_quote: None,
+                        error: None,
+                    },
+                );
+                continue;
+            }
             if !adapter.enforces_entry_balance_gate() {
                 eligible_venues.insert(*venue);
                 statuses.insert(
@@ -5686,6 +5711,13 @@ impl Engine {
             .retain(|_, cooldown| cooldown.until_wall_clock_ms > now_ms);
     }
 
+    fn expire_market_data_degradations(&mut self, now_ms: i64) -> bool {
+        let previous_len = self.venue_market_data_degradations.len();
+        self.venue_market_data_degradations
+            .retain(|_, cooldown| cooldown.until_wall_clock_ms > now_ms);
+        previous_len != self.venue_market_data_degradations.len()
+    }
+
     fn venue_entry_cooldown_reason(&self, venue: Venue) -> Option<String> {
         let cooldown = self.venue_entry_cooldowns.get(&venue)?;
         if cooldown.until_wall_clock_ms <= wall_clock_now_ms() {
@@ -5693,6 +5725,15 @@ impl Engine {
         }
 
         Some(format!("venue_entry_cooldown:{venue}:{}", cooldown.reason))
+    }
+
+    fn market_data_degradation_reason(&self, venue: Venue, now_ms: i64) -> Option<String> {
+        let cooldown = self.venue_market_data_degradations.get(&venue)?;
+        if cooldown.until_wall_clock_ms <= now_ms {
+            return None;
+        }
+
+        Some(format!("market_data_degraded:{venue}:{}", cooldown.reason))
     }
 
     fn arm_venue_entry_cooldown(&mut self, venue: Venue, reason: &str) {
@@ -5716,6 +5757,33 @@ impl Engine {
                 "venue": venue,
                 "reason": reason,
                 "cooldown_ms": cooldown_ms,
+                "until_wall_clock_ms": until_wall_clock_ms,
+            }),
+        );
+    }
+
+    fn arm_market_data_degradation(&mut self, venue: Venue, reason: &str) {
+        if MARKET_DATA_DEGRADATION_COOLDOWN_MS <= 0 {
+            return;
+        }
+
+        let now_ms = wall_clock_now_ms();
+        let until_wall_clock_ms = now_ms.saturating_add(MARKET_DATA_DEGRADATION_COOLDOWN_MS);
+        self.venue_market_data_degradations.insert(
+            venue,
+            VenueEntryCooldown {
+                until_wall_clock_ms,
+                reason: reason.to_string(),
+            },
+        );
+        self.cached_live_entry_venue_filter = None;
+        self.log_repeated_failure_event(
+            "runtime.market_data_degraded_started",
+            format!("market_data_degraded_started:{venue}:{reason}"),
+            &json!({
+                "venue": venue,
+                "reason": reason,
+                "cooldown_ms": MARKET_DATA_DEGRADATION_COOLDOWN_MS,
                 "until_wall_clock_ms": until_wall_clock_ms,
             }),
         );
@@ -6607,8 +6675,8 @@ mod tests {
         market_data_warmup_duration_ms, order_error_may_have_created_exposure,
         order_quote_expired_reason, persistent_state_view, remap_no_entry_diagnostic_reason,
         resolved_fee_log_entry, should_activate_windowed_market_data_with_hysteresis,
-        should_probe_live_recovery, venue_order_health_risk_score, EngineMode, EngineState,
-        VenueOrderHealthSample,
+        should_probe_live_recovery, venue_order_health_risk_score, Engine, EngineMode, EngineState,
+        VenueEntryCooldown, VenueOrderHealthSample, MARKET_DATA_DEGRADATION_COOLDOWN_MS,
     };
     use crate::models::{PositionSnapshot, Venue};
 
@@ -7040,6 +7108,65 @@ mod tests {
             remap_no_entry_diagnostic_reason("outside_entry_window");
         assert_eq!(blocked_reason, Some("outside_entry_window".to_string()));
         assert!(advisory_reason.is_none());
+    }
+
+    #[test]
+    fn market_data_degradation_expires_after_cooldown_window() {
+        let mut engine = Engine {
+            config: AppConfig {
+                runtime: RuntimeConfig::default(),
+                strategy: StrategyConfig::default(),
+                persistence: PersistenceConfig {
+                    event_log_path: "runtime/test-events.jsonl".to_string(),
+                    snapshot_path: "runtime/test-state.json".to_string(),
+                },
+                venues: vec![],
+                symbols: vec![],
+                directed_pairs: vec![],
+            },
+            adapters: BTreeMap::new(),
+            opportunity_source: None,
+            transfer_status_source: None,
+            journal: crate::journal::JsonlJournal::with_capacity("runtime/test-events.jsonl", 32),
+            store: crate::store::FileStateStore::new("runtime/test-state.json"),
+            state: EngineState::default(),
+            last_live_recovery_probe_ms: None,
+            last_running_slot_reconcile_probe_ms: None,
+            last_persisted_state: None,
+            recent_submit_ack_ms: BTreeMap::new(),
+            venue_entry_cooldowns: BTreeMap::new(),
+            venue_market_data_degradations: BTreeMap::from([(
+                Venue::Aster,
+                VenueEntryCooldown {
+                    until_wall_clock_ms: 1_000 + MARKET_DATA_DEGRADATION_COOLDOWN_MS,
+                    reason: "market_fetch_failed".to_string(),
+                },
+            )]),
+            recent_order_health: BTreeMap::new(),
+            venue_health_updated_at_ms: BTreeMap::new(),
+            cached_transfer_status_view: None,
+            scan_symbols: vec![],
+            market_data_active: false,
+            market_data_activated_at_ms: None,
+            last_no_entry_diagnostics: None,
+            repeated_failure_logs: BTreeMap::new(),
+            cached_live_entry_venue_filter: None,
+        };
+
+        assert_eq!(
+            engine.market_data_degradation_reason(Venue::Aster, 1_000),
+            Some("market_data_degraded:aster:market_fetch_failed".to_string())
+        );
+        assert!(!engine.expire_market_data_degradations(1_000));
+        assert!(
+            engine.expire_market_data_degradations(1_000 + MARKET_DATA_DEGRADATION_COOLDOWN_MS + 1)
+        );
+        assert!(engine
+            .market_data_degradation_reason(
+                Venue::Aster,
+                1_000 + MARKET_DATA_DEGRADATION_COOLDOWN_MS + 1
+            )
+            .is_none());
     }
 
     #[test]

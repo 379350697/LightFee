@@ -580,6 +580,49 @@ impl AsterLiveAdapter {
         build_aster_snapshots_from_bulk_rows(&requested_symbols, books, premiums)
     }
 
+    async fn fetch_missing_symbol_snapshots_with_fallback(
+        &self,
+        symbols: &[String],
+    ) -> Result<Vec<SymbolMarketSnapshot>> {
+        if symbols.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut snapshots = Vec::new();
+        let mut unresolved = symbols.to_vec();
+        match self.fetch_bulk_symbol_snapshots(symbols).await {
+            Ok(bulk_snapshots) => {
+                let resolved_symbols = bulk_snapshots
+                    .iter()
+                    .map(|snapshot| snapshot.symbol.clone())
+                    .collect::<HashSet<_>>();
+                unresolved.retain(|symbol| !resolved_symbols.contains(symbol));
+                snapshots.extend(bulk_snapshots);
+            }
+            Err(error) => {
+                debug!(
+                    ?error,
+                    missing = ?symbols,
+                    "aster bulk market snapshot bootstrap failed; retrying missing symbols directly"
+                );
+            }
+        }
+
+        for symbol in unresolved {
+            match self.fetch_symbol_snapshot(&symbol).await {
+                Ok(snapshot) => snapshots.push(snapshot),
+                Err(error) => {
+                    debug!(
+                        ?error,
+                        symbol, "aster direct market snapshot fallback failed"
+                    );
+                }
+            }
+        }
+
+        Ok(snapshots)
+    }
+
     async fn symbol_meta(&self, symbol: &str) -> Result<BinanceSymbolMeta> {
         if let Some(meta) = self.metadata.lock().expect("lock").get(symbol).cloned() {
             return Ok(meta);
@@ -912,7 +955,9 @@ impl VenueAdapter for AsterLiveAdapter {
             }
         }
         if !missing.is_empty() && !allow_direct_fallback {
-            let bulk_snapshots = self.fetch_bulk_symbol_snapshots(&missing).await?;
+            let bulk_snapshots = self
+                .fetch_missing_symbol_snapshots_with_fallback(&missing)
+                .await?;
             for snapshot in bulk_snapshots {
                 observed_at_ms = observed_at_ms.max(snapshot.funding_timestamp_ms.min(now_ms()));
                 quotes.push(snapshot);
@@ -2066,13 +2111,26 @@ mod tests {
     use super::{
         aster_position_side, aster_private_fill_wait_ms, build_aster_snapshots_from_bulk_rows,
         build_aster_subscribe_messages, ensure_aster_client_order_id, format_aster_http_error,
-        should_retry_aster_order_error, validate_aster_order_request, BinanceBookTicker,
-        BinancePositionMode, BinancePremiumIndex, BinanceSymbolMeta,
+        should_retry_aster_order_error, validate_aster_order_request, AsterLiveAdapter,
+        BinanceBookTicker, BinancePositionMode, BinancePremiumIndex, BinanceSymbolMeta,
         BINANCE_MAX_SUBSCRIBE_STREAMS_PER_MESSAGE,
     };
-    use crate::models::Side;
+    use crate::{
+        config::{LiveVenueConfig, RuntimeConfig, VenueConfig},
+        models::{Side, Venue},
+    };
     use anyhow::anyhow;
-    use std::collections::HashMap;
+    use std::{
+        collections::HashMap,
+        io::{Read, Write},
+        net::TcpListener,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        thread,
+        time::Duration,
+    };
 
     #[test]
     fn premium_index_accepts_integer_next_funding_time() {
@@ -2260,6 +2318,250 @@ mod tests {
                 .to_string()
                 .contains("marketTakeBound")
         );
+    }
+
+    #[tokio::test]
+    async fn market_snapshot_falls_back_to_direct_symbol_requests_when_bulk_bootstrap_fails() {
+        let server = TestAsterHttpServer::spawn();
+        let config = VenueConfig {
+            venue: Venue::Aster,
+            enabled: true,
+            taker_fee_bps: 1.0,
+            max_notional: 100.0,
+            market_data_file: None,
+            live: LiveVenueConfig {
+                base_url: Some(server.base_url()),
+                wallet_base_url: Some(server.base_url()),
+                ..LiveVenueConfig::default()
+            },
+        };
+        let runtime = RuntimeConfig {
+            exchange_http_timeout_ms: 500,
+            ..RuntimeConfig::default()
+        };
+        let adapter = AsterLiveAdapter::new(&config, &runtime, &[])
+            .await
+            .expect("adapter");
+
+        let snapshot = crate::venue::VenueAdapter::fetch_market_snapshot(
+            &adapter,
+            &["ETHUSDT".to_string(), "BTCUSDT".to_string()],
+        )
+        .await
+        .expect("market snapshot");
+
+        assert_eq!(snapshot.symbols.len(), 2);
+        assert!(snapshot.symbols.iter().any(|item| item.symbol == "ETHUSDT"));
+        assert!(snapshot.symbols.iter().any(|item| item.symbol == "BTCUSDT"));
+        assert!(server.bulk_bootstrap_failed_once());
+        assert!(server.direct_book_ticker_requests() >= 2);
+        assert!(server.direct_premium_requests() >= 2);
+    }
+
+    struct TestAsterHttpServer {
+        base_url: String,
+        shutdown: Arc<AtomicBool>,
+        bulk_bootstrap_failed_once: Arc<AtomicBool>,
+        direct_book_ticker_requests: Arc<std::sync::atomic::AtomicUsize>,
+        direct_premium_requests: Arc<std::sync::atomic::AtomicUsize>,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+
+    impl TestAsterHttpServer {
+        fn spawn() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener
+                .set_nonblocking(true)
+                .expect("set listener nonblocking");
+            let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let bulk_bootstrap_failed_once = Arc::new(AtomicBool::new(false));
+            let direct_book_ticker_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let direct_premium_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+            let shutdown_flag = shutdown.clone();
+            let bulk_failed_flag = bulk_bootstrap_failed_once.clone();
+            let direct_book_counter = direct_book_ticker_requests.clone();
+            let direct_premium_counter = direct_premium_requests.clone();
+            let handle = thread::spawn(move || {
+                while !shutdown_flag.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let request_path = read_request_path(&mut stream);
+                            let (status, body) = respond_to_aster_request(
+                                &request_path,
+                                &bulk_failed_flag,
+                                &direct_book_counter,
+                                &direct_premium_counter,
+                            );
+                            write_http_response(&mut stream, status, &body);
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+
+            Self {
+                base_url,
+                shutdown,
+                bulk_bootstrap_failed_once,
+                direct_book_ticker_requests,
+                direct_premium_requests,
+                handle: Some(handle),
+            }
+        }
+
+        fn base_url(&self) -> String {
+            self.base_url.clone()
+        }
+
+        fn bulk_bootstrap_failed_once(&self) -> bool {
+            self.bulk_bootstrap_failed_once.load(Ordering::Relaxed)
+        }
+
+        fn direct_book_ticker_requests(&self) -> usize {
+            self.direct_book_ticker_requests.load(Ordering::Relaxed)
+        }
+
+        fn direct_premium_requests(&self) -> usize {
+            self.direct_premium_requests.load(Ordering::Relaxed)
+        }
+    }
+
+    impl Drop for TestAsterHttpServer {
+        fn drop(&mut self) {
+            self.shutdown.store(true, Ordering::Relaxed);
+            let _ = std::net::TcpStream::connect(
+                self.base_url
+                    .trim_start_matches("http://")
+                    .trim_start_matches("https://"),
+            );
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    fn read_request_path(stream: &mut std::net::TcpStream) -> String {
+        let mut buffer = [0_u8; 4096];
+        let read = stream.read(&mut buffer).expect("read request");
+        let request = String::from_utf8_lossy(&buffer[..read]);
+        request
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or("/")
+            .to_string()
+    }
+
+    fn write_http_response(stream: &mut std::net::TcpStream, status: u16, body: &str) {
+        let reason = match status {
+            200 => "OK",
+            500 => "Internal Server Error",
+            503 => "Service Unavailable",
+            _ => "Unknown",
+        };
+        let response = format!(
+            "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write response");
+        stream.flush().expect("flush response");
+    }
+
+    fn respond_to_aster_request(
+        request_path: &str,
+        bulk_failed_flag: &AtomicBool,
+        direct_book_counter: &std::sync::atomic::AtomicUsize,
+        direct_premium_counter: &std::sync::atomic::AtomicUsize,
+    ) -> (u16, String) {
+        let (path, query) = request_path
+            .split_once('?')
+            .map(|(path, query)| (path, Some(query)))
+            .unwrap_or((request_path, None));
+        match (path, query.and_then(parse_symbol_query)) {
+            ("/fapi/v1/exchangeInfo", _) => (200, exchange_info_payload()),
+            ("/fapi/v1/ticker/bookTicker", None) => {
+                bulk_failed_flag.store(true, Ordering::Relaxed);
+                (
+                    503,
+                    r#"{"code":-1000,"msg":"bulk unavailable"}"#.to_string(),
+                )
+            }
+            ("/fapi/v1/premiumIndex", None) => {
+                bulk_failed_flag.store(true, Ordering::Relaxed);
+                (
+                    503,
+                    r#"{"code":-1001,"msg":"bulk unavailable"}"#.to_string(),
+                )
+            }
+            ("/fapi/v1/ticker/bookTicker", Some(symbol)) => {
+                direct_book_counter.fetch_add(1, Ordering::Relaxed);
+                (200, book_ticker_payload(symbol))
+            }
+            ("/fapi/v1/premiumIndex", Some(symbol)) => {
+                direct_premium_counter.fetch_add(1, Ordering::Relaxed);
+                (200, premium_index_payload(symbol))
+            }
+            _ => (500, r#"{"code":-9999,"msg":"unexpected path"}"#.to_string()),
+        }
+    }
+
+    fn parse_symbol_query(query: &str) -> Option<&str> {
+        query
+            .split('&')
+            .find_map(|entry| entry.split_once('='))
+            .and_then(|(key, value)| (key == "symbol").then_some(value))
+    }
+
+    fn exchange_info_payload() -> String {
+        r#"{
+            "symbols": [
+                {
+                    "symbol": "ETHUSDT",
+                    "status": "TRADING",
+                    "contractType": "PERPETUAL",
+                    "quoteAsset": "USDT",
+                    "filters": [
+                        {"filterType": "LOT_SIZE", "minQty": "0.001", "maxQty": "1000", "stepSize": "0.001"},
+                        {"filterType": "MIN_NOTIONAL", "notional": "5"}
+                    ]
+                },
+                {
+                    "symbol": "BTCUSDT",
+                    "status": "TRADING",
+                    "contractType": "PERPETUAL",
+                    "quoteAsset": "USDT",
+                    "filters": [
+                        {"filterType": "LOT_SIZE", "minQty": "0.001", "maxQty": "1000", "stepSize": "0.001"},
+                        {"filterType": "MIN_NOTIONAL", "notional": "5"}
+                    ]
+                }
+            ]
+        }"#
+        .to_string()
+    }
+
+    fn book_ticker_payload(symbol: &str) -> String {
+        match symbol {
+            "ETHUSDT" => r#"{"symbol":"ETHUSDT","bidPrice":"2100.1","bidQty":"12.0","askPrice":"2100.2","askQty":"10.0"}"#.to_string(),
+            "BTCUSDT" => r#"{"symbol":"BTCUSDT","bidPrice":"65000.1","bidQty":"6.0","askPrice":"65000.2","askQty":"5.0"}"#.to_string(),
+            _ => r#"{"symbol":"UNKNOWN","bidPrice":"1","bidQty":"1","askPrice":"1.1","askQty":"1"}"#.to_string(),
+        }
+    }
+
+    fn premium_index_payload(symbol: &str) -> String {
+        match symbol {
+            "ETHUSDT" => r#"{"symbol":"ETHUSDT","markPrice":"2100.15","lastFundingRate":"0.0001","nextFundingTime":"1773964800000"}"#.to_string(),
+            "BTCUSDT" => r#"{"symbol":"BTCUSDT","markPrice":"65000.15","lastFundingRate":"0.0002","nextFundingTime":"1773964800000"}"#.to_string(),
+            _ => r#"{"symbol":"UNKNOWN","markPrice":"1.0","lastFundingRate":"0.0","nextFundingTime":"1773964800000"}"#.to_string(),
+        }
     }
 }
 

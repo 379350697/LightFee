@@ -1114,14 +1114,16 @@ fn okx_trade_fee_snapshot_from_row(
         row.taker.as_str(),
         row.taker_u.as_str(),
         row.taker_usdc.as_str(),
-    ])? else {
+    ])?
+    else {
         return Ok(None);
     };
     let Some(maker_fee_bps) = parse_first_okx_trade_fee_bps(&[
         row.maker.as_str(),
         row.maker_u.as_str(),
         row.maker_usdc.as_str(),
-    ])? else {
+    ])?
+    else {
         return Ok(None);
     };
     Ok(Some(AccountFeeSnapshot {
