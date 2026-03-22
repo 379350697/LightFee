@@ -204,13 +204,23 @@ impl WsPrivateState {
     }
 
     pub(crate) fn push_worker(&self, worker: JoinHandle<()>) {
-        self.workers.lock().expect("lock").push(worker);
+        let mut workers = self.workers.lock().expect("lock");
+        prune_finished_workers(&mut workers);
+        workers.push(worker);
     }
 
     pub(crate) fn abort_workers(&self) {
-        for worker in self.workers.lock().expect("lock").drain(..) {
+        let mut workers = self.workers.lock().expect("lock");
+        prune_finished_workers(&mut workers);
+        for worker in workers.drain(..) {
             worker.abort();
         }
+    }
+
+    pub(crate) fn worker_count(&self) -> usize {
+        let mut workers = self.workers.lock().expect("lock");
+        prune_finished_workers(&mut workers);
+        workers.len()
     }
 }
 
@@ -290,6 +300,10 @@ fn canonical_order_key(update: &PrivateOrderUpdate) -> Option<String> {
     }
 }
 
+fn prune_finished_workers(workers: &mut Vec<JoinHandle<()>>) {
+    workers.retain(|worker| !worker.is_finished());
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -349,6 +363,15 @@ mod tests {
         assert_eq!(fill.average_price, 2141.5);
         assert_eq!(fill.fee_quote, 0.002);
         assert_eq!(fill.filled_at_ms, 20);
+    }
+
+    #[tokio::test]
+    async fn worker_count_prunes_finished_handles() {
+        let state = WsPrivateState::new();
+        state.push_worker(tokio::spawn(async {}));
+        sleep(Duration::from_millis(10)).await;
+
+        assert_eq!(state.worker_count(), 0);
     }
 
     #[test]

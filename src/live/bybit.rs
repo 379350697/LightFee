@@ -1512,6 +1512,14 @@ impl VenueAdapter for BybitLiveAdapter {
         Ok(())
     }
 
+    fn market_worker_count(&self) -> usize {
+        self.market_ws.worker_count()
+    }
+
+    fn private_worker_count(&self) -> usize {
+        self.private_ws.worker_count()
+    }
+
     async fn shutdown(&self) -> Result<()> {
         self.market_ws.abort_worker();
         self.private_ws.abort_workers();

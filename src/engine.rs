@@ -295,6 +295,7 @@ pub struct Engine {
     last_no_entry_diagnostics: Option<NoEntryDiagnosticsLogState>,
     repeated_failure_logs: BTreeMap<String, RepeatedFailureLogState>,
     cached_live_entry_venue_filter: Option<CachedLiveEntryVenueFilter>,
+    last_ws_worker_snapshot_ms: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -319,6 +320,14 @@ struct CloseExecution {
     long_latency_ms: u64,
     realized_price_pnl_quote: f64,
     total_exit_fee_quote: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct VenueWsWorkerStatus {
+    venue: Venue,
+    market_worker_count: usize,
+    private_worker_count: usize,
+    suspicious: bool,
 }
 
 struct EntryQuoteRefreshLeg {
@@ -603,6 +612,7 @@ const RECONCILIATION_SUMMARY_ONLY_DELTA_QUOTE: f64 = 0.05;
 const LIVE_ENTRY_VENUE_FILTER_TTL_MS: i64 = 60_000;
 const MIN_LIVE_ENTRY_VENUE_BALANCE_QUOTE: f64 = 50.0;
 const MARKET_DATA_DEGRADATION_COOLDOWN_MS: i64 = 60_000;
+const WS_WORKER_SNAPSHOT_INTERVAL_MS: i64 = 300_000;
 
 fn default_exit_after_first_stage() -> bool {
     true
@@ -691,6 +701,7 @@ impl Engine {
             last_no_entry_diagnostics: None,
             repeated_failure_logs: BTreeMap::new(),
             cached_live_entry_venue_filter: None,
+            last_ws_worker_snapshot_ms: None,
         };
         engine.finalize_startup_position_recovery().await?;
         engine.initialize_scan_symbols(cached_scan_symbol_state.as_ref());
@@ -921,6 +932,7 @@ impl Engine {
     pub async fn tick(&mut self) -> Result<()> {
         self.state.cycle += 1;
         let tick_started_at_ms = wall_clock_now_ms();
+        self.maybe_log_ws_worker_status(tick_started_at_ms);
         let windowed_market_data =
             matches!(self.config.runtime.mode, crate::config::RuntimeMode::Live)
                 && self.supports_windowed_market_data_control();
@@ -2182,6 +2194,69 @@ impl Engine {
             current_cycle.saturating_sub(state.last_emitted_cycle)
                 <= REPEATED_FAILURE_LOG_RETENTION_CYCLES
         });
+    }
+
+    fn maybe_log_ws_worker_status(&mut self, now_ms: i64) {
+        if !matches!(self.config.runtime.mode, RuntimeMode::Live) {
+            return;
+        }
+
+        let statuses = self.current_ws_worker_statuses();
+        if statuses.is_empty() {
+            return;
+        }
+
+        let suspicious = statuses
+            .iter()
+            .filter(|status| status.suspicious)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !suspicious.is_empty() {
+            self.log_repeated_failure_event(
+                "runtime.ws_worker_leak_suspected",
+                format!(
+                    "runtime.ws_worker_leak_suspected:{}",
+                    suspicious
+                        .iter()
+                        .map(|status| status.venue.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+                &json!({
+                    "venues": suspicious,
+                }),
+            );
+        }
+
+        let should_emit_snapshot = self
+            .last_ws_worker_snapshot_ms
+            .map(|last| now_ms.saturating_sub(last) >= WS_WORKER_SNAPSHOT_INTERVAL_MS)
+            .unwrap_or(true);
+        if should_emit_snapshot {
+            self.last_ws_worker_snapshot_ms = Some(now_ms);
+            self.log_event(
+                "runtime.ws_workers",
+                &json!({
+                    "venues": statuses,
+                }),
+            );
+        }
+    }
+
+    fn current_ws_worker_statuses(&self) -> Vec<VenueWsWorkerStatus> {
+        self.adapters
+            .iter()
+            .map(|(venue, adapter)| {
+                let market_worker_count = adapter.market_worker_count();
+                let private_worker_count = adapter.private_worker_count();
+                VenueWsWorkerStatus {
+                    venue: *venue,
+                    market_worker_count,
+                    private_worker_count,
+                    suspicious: market_worker_count > 1 || private_worker_count > 1,
+                }
+            })
+            .collect()
     }
 
     fn compact_reconciliation_payload(
@@ -6661,13 +6736,21 @@ fn checklist_item(key: &'static str, ok: bool, detail: String) -> OpportunityChe
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, VecDeque};
-
-    use crate::config::{AppConfig, PersistenceConfig, RuntimeConfig, StrategyConfig, VenueConfig};
-    use crate::models::{
-        AccountFeeSnapshot, CandidateOpportunity, FundingLeg, FundingOpportunityType,
+    use std::{
+        collections::{BTreeMap, VecDeque},
+        sync::Arc,
     };
-    use anyhow::anyhow;
+
+    use crate::config::{
+        AppConfig, PersistenceConfig, RuntimeConfig, RuntimeMode, StrategyConfig, VenueConfig,
+    };
+    use crate::models::{
+        AccountFeeSnapshot, CandidateOpportunity, FundingLeg, FundingOpportunityType, OrderFill,
+        OrderRequest, VenueMarketSnapshot,
+    };
+    use anyhow::{anyhow, Result};
+    use async_trait::async_trait;
+    use tempfile::TempDir;
 
     use super::{
         apply_cached_fee_snapshots_to_candidates, cached_flat_guard_reason,
@@ -7151,6 +7234,7 @@ mod tests {
             last_no_entry_diagnostics: None,
             repeated_failure_logs: BTreeMap::new(),
             cached_live_entry_venue_filter: None,
+            last_ws_worker_snapshot_ms: None,
         };
 
         assert_eq!(
@@ -7167,6 +7251,181 @@ mod tests {
                 1_000 + MARKET_DATA_DEGRADATION_COOLDOWN_MS + 1
             )
             .is_none());
+    }
+
+    #[derive(Debug)]
+    struct WorkerCountAdapter {
+        venue: Venue,
+        market_worker_count: usize,
+        private_worker_count: usize,
+    }
+
+    #[async_trait]
+    impl crate::venue::VenueAdapter for WorkerCountAdapter {
+        fn venue(&self) -> Venue {
+            self.venue
+        }
+
+        async fn fetch_market_snapshot(&self, _symbols: &[String]) -> Result<VenueMarketSnapshot> {
+            Err(anyhow!("unused"))
+        }
+
+        async fn place_order(&self, _request: OrderRequest) -> Result<OrderFill> {
+            Err(anyhow!("unused"))
+        }
+
+        async fn fetch_position(&self, symbol: &str) -> Result<PositionSnapshot> {
+            Ok(PositionSnapshot {
+                venue: self.venue,
+                symbol: symbol.to_string(),
+                size: 0.0,
+                updated_at_ms: 0,
+            })
+        }
+
+        fn market_worker_count(&self) -> usize {
+            self.market_worker_count
+        }
+
+        fn private_worker_count(&self) -> usize {
+            self.private_worker_count
+        }
+    }
+
+    #[test]
+    fn ws_worker_status_marks_suspicious_venues() {
+        let temp = TempDir::new().expect("tempdir");
+        let event_log_path = temp.path().join("events.jsonl");
+        let snapshot_path = temp.path().join("state.json");
+        let engine = Engine {
+            config: AppConfig {
+                runtime: RuntimeConfig::default(),
+                strategy: StrategyConfig::default(),
+                persistence: PersistenceConfig {
+                    event_log_path: event_log_path.to_string_lossy().into_owned(),
+                    snapshot_path: snapshot_path.to_string_lossy().into_owned(),
+                },
+                venues: vec![],
+                symbols: vec![],
+                directed_pairs: vec![],
+            },
+            adapters: BTreeMap::from([
+                (
+                    Venue::Binance,
+                    Arc::new(WorkerCountAdapter {
+                        venue: Venue::Binance,
+                        market_worker_count: 1,
+                        private_worker_count: 1,
+                    }) as Arc<dyn crate::venue::VenueAdapter>,
+                ),
+                (
+                    Venue::Hyperliquid,
+                    Arc::new(WorkerCountAdapter {
+                        venue: Venue::Hyperliquid,
+                        market_worker_count: 0,
+                        private_worker_count: 2,
+                    }) as Arc<dyn crate::venue::VenueAdapter>,
+                ),
+            ]),
+            opportunity_source: None,
+            transfer_status_source: None,
+            journal: crate::journal::JsonlJournal::with_capacity(
+                event_log_path.to_string_lossy().into_owned(),
+                32,
+            ),
+            store: crate::store::FileStateStore::new(snapshot_path.to_string_lossy().into_owned()),
+            state: EngineState::default(),
+            last_live_recovery_probe_ms: None,
+            last_running_slot_reconcile_probe_ms: None,
+            last_persisted_state: None,
+            recent_submit_ack_ms: BTreeMap::new(),
+            venue_entry_cooldowns: BTreeMap::new(),
+            venue_market_data_degradations: BTreeMap::new(),
+            recent_order_health: BTreeMap::new(),
+            venue_health_updated_at_ms: BTreeMap::new(),
+            cached_transfer_status_view: None,
+            scan_symbols: vec![],
+            market_data_active: false,
+            market_data_activated_at_ms: None,
+            last_no_entry_diagnostics: None,
+            repeated_failure_logs: BTreeMap::new(),
+            cached_live_entry_venue_filter: None,
+            last_ws_worker_snapshot_ms: None,
+        };
+
+        let statuses = engine.current_ws_worker_statuses();
+
+        assert_eq!(statuses.len(), 2);
+        assert_eq!(statuses[0].venue, Venue::Binance);
+        assert!(!statuses[0].suspicious);
+        assert_eq!(statuses[1].venue, Venue::Hyperliquid);
+        assert!(statuses[1].suspicious);
+        assert_eq!(statuses[1].private_worker_count, 2);
+    }
+
+    #[test]
+    fn ws_worker_status_logging_emits_snapshot_and_suspicion_event() {
+        let temp = TempDir::new().expect("tempdir");
+        let event_log_path = temp.path().join("events.jsonl");
+        let snapshot_path = temp.path().join("state.json");
+        let mut engine = Engine {
+            config: AppConfig {
+                runtime: RuntimeConfig {
+                    mode: RuntimeMode::Live,
+                    ..RuntimeConfig::default()
+                },
+                strategy: StrategyConfig::default(),
+                persistence: PersistenceConfig {
+                    event_log_path: event_log_path.to_string_lossy().into_owned(),
+                    snapshot_path: snapshot_path.to_string_lossy().into_owned(),
+                },
+                venues: vec![],
+                symbols: vec![],
+                directed_pairs: vec![],
+            },
+            adapters: BTreeMap::from([(
+                Venue::Hyperliquid,
+                Arc::new(WorkerCountAdapter {
+                    venue: Venue::Hyperliquid,
+                    market_worker_count: 0,
+                    private_worker_count: 2,
+                }) as Arc<dyn crate::venue::VenueAdapter>,
+            )]),
+            opportunity_source: None,
+            transfer_status_source: None,
+            journal: crate::journal::JsonlJournal::with_capacity(
+                event_log_path.to_string_lossy().into_owned(),
+                32,
+            ),
+            store: crate::store::FileStateStore::new(snapshot_path.to_string_lossy().into_owned()),
+            state: EngineState::default(),
+            last_live_recovery_probe_ms: None,
+            last_running_slot_reconcile_probe_ms: None,
+            last_persisted_state: None,
+            recent_submit_ack_ms: BTreeMap::new(),
+            venue_entry_cooldowns: BTreeMap::new(),
+            venue_market_data_degradations: BTreeMap::new(),
+            recent_order_health: BTreeMap::new(),
+            venue_health_updated_at_ms: BTreeMap::new(),
+            cached_transfer_status_view: None,
+            scan_symbols: vec![],
+            market_data_active: false,
+            market_data_activated_at_ms: None,
+            last_no_entry_diagnostics: None,
+            repeated_failure_logs: BTreeMap::new(),
+            cached_live_entry_venue_filter: None,
+            last_ws_worker_snapshot_ms: None,
+        };
+
+        engine.maybe_log_ws_worker_status(1_000);
+        let records = engine.journal.read_records().expect("records");
+
+        assert!(records
+            .iter()
+            .any(|record| record.kind == "runtime.ws_workers"));
+        assert!(records
+            .iter()
+            .any(|record| record.kind == "runtime.ws_worker_leak_suspected"));
     }
 
     #[test]

@@ -1428,6 +1428,14 @@ impl VenueAdapter for AsterLiveAdapter {
         Ok(())
     }
 
+    fn market_worker_count(&self) -> usize {
+        self.market_ws.worker_count()
+    }
+
+    fn private_worker_count(&self) -> usize {
+        self.private_ws.worker_count()
+    }
+
     async fn live_startup_prewarm(&self) -> Result<()> {
         let _ = self.server_timestamp_ms().await?;
         let _ = self.position_mode().await?;

@@ -124,7 +124,19 @@ impl WsMarketState {
     }
 
     pub(crate) fn has_worker(&self) -> bool {
-        self.worker.lock().expect("lock").is_some()
+        self.worker_count() > 0
+    }
+
+    pub(crate) fn worker_count(&self) -> usize {
+        let mut worker = self.worker.lock().expect("lock");
+        if worker.as_ref().is_some_and(|handle| handle.is_finished()) {
+            worker.take();
+            0
+        } else if worker.is_some() {
+            1
+        } else {
+            0
+        }
     }
 
     pub(crate) fn record_connection_success(&self, now_ms: i64) {

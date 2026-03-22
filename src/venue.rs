@@ -92,6 +92,14 @@ pub trait VenueAdapter: Send + Sync {
         Ok(())
     }
 
+    fn market_worker_count(&self) -> usize {
+        0
+    }
+
+    fn private_worker_count(&self) -> usize {
+        0
+    }
+
     async fn live_startup_prewarm(&self) -> Result<()> {
         Ok(())
     }

@@ -30,12 +30,13 @@ use hyperliquid_rust_sdk::{
     BaseUrl, ExchangeClient, ExchangeDataStatus, ExchangeResponseStatus, InfoClient,
     Message as HyperliquidMessage, Subscription, UserData,
 };
+use reqwest::Client;
 use serde_json::json;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::{
     net::TcpStream,
     sync::Mutex as AsyncMutex,
-    time::{interval, Duration, Instant as TokioInstant, MissedTickBehavior},
+    time::{Duration, Instant as TokioInstant},
 };
 use tokio_tungstenite::{
     connect_async, tungstenite::protocol::Message, MaybeTlsStream, WebSocketStream,
@@ -54,31 +55,31 @@ use crate::{
 };
 
 use super::{
-    cache_is_fresh, enrich_fill_from_private, estimate_fee_quote, hinted_fill,
+    build_http_client, cache_is_fresh, enrich_fill_from_private, estimate_fee_quote, hinted_fill,
     load_account_fee_snapshot_cache, load_json_cache, lookup_or_wait_private_order, now_ms,
     parse_f64, quote_fill, store_account_fee_snapshot_cache, store_json_cache, venue_symbol,
-    PrivateOrderUpdate, WsMarketState, WsPrivateState, SYMBOL_CACHE_TTL_MS,
+    PrivateOrderUpdate, WsPrivateState, SYMBOL_CACHE_TTL_MS,
 };
 
 const HYPERLIQUID_MIN_NOTIONAL_QUOTE: f64 = 10.0;
 const HYPERLIQUID_PERP_LIQUIDITY_CACHE_TTL_MS: i64 = 60 * 1_000;
-const HYPERLIQUID_MARKET_WS_IDLE_TIMEOUT_MS: i64 = 45 * 1_000;
+const HYPERLIQUID_BULK_MARKET_CACHE_TTL_MS: i64 = 2 * 1_000;
 #[cfg(test)]
 const HYPERLIQUID_PRIVATE_WS_IDLE_TIMEOUT_MS: i64 = 0;
-const HYPERLIQUID_WS_WATCHDOG_TICK_MS: u64 = 5 * 1_000;
 
 pub struct HyperliquidLiveAdapter {
     config: VenueConfig,
     runtime: RuntimeConfig,
+    client: Client,
+    info_url: String,
     info_client: InfoClient,
     exchange_client: ExchangeClient,
     account_address: H160,
     meta_cache: Mutex<HashMap<String, HyperliquidAssetMeta>>,
     supported_symbols: Mutex<HashSet<String>>,
-    market_ws: Arc<WsMarketState>,
-    market_subscription_symbols: Mutex<Vec<String>>,
     private_ws: Arc<WsPrivateState>,
     account_fee_snapshot: Mutex<Option<AccountFeeSnapshot>>,
+    bulk_market_cache: Mutex<Option<HyperliquidBulkMarketCache>>,
     perp_liquidity_cache: Arc<Mutex<HashMap<String, PerpLiquiditySnapshot>>>,
     configured_leverage: Mutex<HashMap<String, u32>>,
     order_ws: HyperliquidWsPostClient,
@@ -137,19 +138,19 @@ impl HyperliquidLiveAdapter {
             supported_symbols.extend(cache.supported_symbols);
         }
 
-        let market_ws = WsMarketState::new();
         let adapter = Self {
             config: config.clone(),
             runtime: runtime.clone(),
+            client: build_http_client(runtime.exchange_http_timeout_ms)?,
+            info_url: hyperliquid_info_url(base_url),
             info_client,
             exchange_client,
             account_address,
             meta_cache: Mutex::new(meta_cache),
             supported_symbols: Mutex::new(supported_symbols),
-            market_ws,
-            market_subscription_symbols: Mutex::new(Vec::new()),
             private_ws: WsPrivateState::new(),
             account_fee_snapshot: Mutex::new(account_fee_snapshot),
+            bulk_market_cache: Mutex::new(None),
             perp_liquidity_cache: Arc::new(Mutex::new(HashMap::new())),
             configured_leverage: Mutex::new(HashMap::new()),
             order_ws: HyperliquidWsPostClient::new(hyperliquid_ws_url(base_url)),
@@ -164,8 +165,6 @@ impl HyperliquidLiveAdapter {
             );
         }
         let tracked_symbols = adapter.tracked_symbols(symbols);
-        *adapter.market_subscription_symbols.lock().expect("lock") = tracked_symbols.clone();
-        adapter.start_market_ws(&tracked_symbols, base_url).await?;
         adapter.start_private_ws(&tracked_symbols, base_url).await?;
         Ok(adapter)
     }
@@ -278,239 +277,6 @@ impl HyperliquidLiveAdapter {
         );
         *self.meta_cache.lock().expect("lock") = metadata;
         *self.supported_symbols.lock().expect("lock") = supported_symbols;
-        Ok(())
-    }
-
-    async fn start_market_ws(&self, symbols: &[String], base_url: BaseUrl) -> Result<()> {
-        if symbols.is_empty() {
-            return Ok(());
-        }
-
-        let symbol_map = symbols
-            .iter()
-            .map(|symbol| (venue_symbol(&self.config, symbol), symbol.clone()))
-            .collect::<HashMap<_, _>>();
-        let cache = self.market_ws.clone();
-        let perp_liquidity_cache = self.perp_liquidity_cache.clone();
-        let unhealthy_after_failures = self.runtime.ws_unhealthy_after_failures;
-        let reconnect_initial_ms = self.runtime.ws_reconnect_initial_ms;
-        let reconnect_max_ms = self.runtime.ws_reconnect_max_ms;
-        let task = tokio::spawn(async move {
-            let mut reconnect_backoff = FailureBackoff::new(
-                reconnect_initial_ms,
-                reconnect_max_ms,
-                Venue::Hyperliquid as u64 + 11,
-            );
-            loop {
-                let (sender, mut receiver) = unbounded_channel();
-                let mut info_client = match InfoClient::with_reconnect(None, Some(base_url)).await {
-                    Ok(client) => client,
-                    Err(error) => {
-                        cache.record_connection_failure(
-                            now_ms(),
-                            unhealthy_after_failures,
-                            error.to_string(),
-                        );
-                        warn!(
-                            ?error,
-                            "failed to build hyperliquid market websocket client"
-                        );
-                        tokio::time::sleep(Duration::from_millis(
-                            reconnect_backoff.on_failure_with_jitter(),
-                        ))
-                        .await;
-                        continue;
-                    }
-                };
-                let mut subscribe_failed = false;
-                for asset in symbol_map.keys() {
-                    if let Err(error) = info_client
-                        .subscribe(
-                            Subscription::L2Book {
-                                coin: asset.clone(),
-                            },
-                            sender.clone(),
-                        )
-                        .await
-                    {
-                        cache.record_connection_failure(
-                            now_ms(),
-                            unhealthy_after_failures,
-                            error.to_string(),
-                        );
-                        warn!(asset, ?error, "failed to subscribe hyperliquid l2Book");
-                        subscribe_failed = true;
-                        break;
-                    }
-                    if let Err(error) = info_client
-                        .subscribe(
-                            Subscription::ActiveAssetCtx {
-                                coin: asset.clone(),
-                            },
-                            sender.clone(),
-                        )
-                        .await
-                    {
-                        cache.record_connection_failure(
-                            now_ms(),
-                            unhealthy_after_failures,
-                            error.to_string(),
-                        );
-                        warn!(
-                            asset,
-                            ?error,
-                            "failed to subscribe hyperliquid activeAssetCtx"
-                        );
-                        subscribe_failed = true;
-                        break;
-                    }
-                }
-                if subscribe_failed {
-                    tokio::time::sleep(Duration::from_millis(
-                        reconnect_backoff.on_failure_with_jitter(),
-                    ))
-                    .await;
-                    continue;
-                }
-
-                reconnect_backoff.on_success();
-                cache.record_connection_success(now_ms());
-                let _info_client = info_client;
-                let mut last_message_ms = now_ms();
-                let mut watchdog = interval(Duration::from_millis(HYPERLIQUID_WS_WATCHDOG_TICK_MS));
-                watchdog.set_missed_tick_behavior(MissedTickBehavior::Skip);
-                let mut should_rebuild = false;
-                while !should_rebuild {
-                    tokio::select! {
-                        _ = watchdog.tick() => {
-                            let current_now_ms = now_ms();
-                            if hyperliquid_ws_watchdog_timed_out(
-                                last_message_ms,
-                                current_now_ms,
-                                HYPERLIQUID_MARKET_WS_IDLE_TIMEOUT_MS,
-                            ) {
-                                cache.record_connection_failure(
-                                    current_now_ms,
-                                    unhealthy_after_failures,
-                                    "hyperliquid market websocket idle timeout".to_string(),
-                                );
-                                warn!(
-                                    idle_ms = current_now_ms.saturating_sub(last_message_ms),
-                                    "hyperliquid market websocket idle watchdog timed out"
-                                );
-                                should_rebuild = true;
-                            }
-                        }
-                        message = receiver.recv() => {
-                            match message {
-                                Some(HyperliquidMessage::L2Book(book)) => {
-                                    last_message_ms = now_ms();
-                                    cache.record_connection_success(last_message_ms);
-                                    let Some(symbol) = symbol_map.get(&book.data.coin) else {
-                                        continue;
-                                    };
-                                    let Some(best_bid) =
-                                        book.data.levels.first().and_then(|levels| levels.first())
-                                    else {
-                                        continue;
-                                    };
-                                    let Some(best_ask) =
-                                        book.data.levels.get(1).and_then(|levels| levels.first())
-                                    else {
-                                        continue;
-                                    };
-                                    let best_bid_px = parse_f64(&best_bid.px).ok();
-                                    let best_ask_px = parse_f64(&best_ask.px).ok();
-                                    let bid_sz = parse_f64(&best_bid.sz).ok();
-                                    let ask_sz = parse_f64(&best_ask.sz).ok();
-                                    if let (Some(best_bid_px), Some(best_ask_px), Some(bid_sz), Some(ask_sz)) =
-                                        (best_bid_px, best_ask_px, bid_sz, ask_sz)
-                                    {
-                                        cache.update_quote(
-                                            symbol,
-                                            best_bid_px,
-                                            best_ask_px,
-                                            bid_sz,
-                                            ask_sz,
-                                            book.data.time as i64,
-                                        );
-                                    }
-                                }
-                                Some(HyperliquidMessage::ActiveAssetCtx(ctx)) => {
-                                    last_message_ms = now_ms();
-                                    cache.record_connection_success(last_message_ms);
-                                    let Some(symbol) = symbol_map.get(&ctx.data.coin) else {
-                                        continue;
-                                    };
-                                    let funding_rate = match ctx.data.ctx {
-                                        hyperliquid_rust_sdk::AssetCtx::Perps(ref perps) => {
-                                            if let (Ok(volume_24h_quote), Ok(open_interest), Ok(mark_price)) = (
-                                                parse_f64(&perps.shared.day_ntl_vlm),
-                                                parse_f64(&perps.open_interest),
-                                                parse_f64(&perps.shared.mark_px),
-                                            ) {
-                                                perp_liquidity_cache.lock().expect("lock").insert(
-                                                    symbol.clone(),
-                                                    PerpLiquiditySnapshot {
-                                                        venue: Venue::Hyperliquid,
-                                                        symbol: symbol.clone(),
-                                                        volume_24h_quote,
-                                                        open_interest_quote: open_interest * mark_price,
-                                                        observed_at_ms: last_message_ms,
-                                                    },
-                                                );
-                                            }
-                                            parse_f64(&perps.funding).ok()
-                                        }
-                                        hyperliquid_rust_sdk::AssetCtx::Spot(_) => None,
-                                    };
-                                    if let Some(funding_rate) = funding_rate {
-                                        cache.update_funding(
-                                            symbol,
-                                            funding_rate,
-                                            next_hour_boundary(last_message_ms),
-                                        );
-                                    }
-                                }
-                                Some(HyperliquidMessage::HyperliquidError(error)) => {
-                                    cache.record_connection_failure(
-                                        now_ms(),
-                                        unhealthy_after_failures,
-                                        error.clone(),
-                                    );
-                                    warn!(?error, "hyperliquid market websocket reported error");
-                                }
-                                Some(HyperliquidMessage::NoData) => {
-                                    cache.record_connection_failure(
-                                        now_ms(),
-                                        unhealthy_after_failures,
-                                        "hyperliquid market websocket disconnected".to_string(),
-                                    );
-                                    debug!("hyperliquid market websocket disconnected");
-                                    should_rebuild = true;
-                                }
-                                Some(_) => {}
-                                None => {
-                                    cache.record_connection_failure(
-                                        now_ms(),
-                                        unhealthy_after_failures,
-                                        "hyperliquid market websocket receiver closed".to_string(),
-                                    );
-                                    debug!("hyperliquid market websocket receiver closed");
-                                    should_rebuild = true;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                tokio::time::sleep(Duration::from_millis(
-                    reconnect_backoff.on_failure_with_jitter(),
-                ))
-                .await;
-            }
-        });
-        self.market_ws.set_worker(task);
         Ok(())
     }
 
@@ -710,10 +476,90 @@ impl HyperliquidLiveAdapter {
         Ok(())
     }
 
-    fn cached_snapshot(&self, symbol: &str) -> Option<(SymbolMarketSnapshot, i64)> {
-        let snapshot = self.market_ws.snapshot(symbol)?;
-        let observed_at_ms = self.market_ws.quote(symbol)?.observed_at_ms;
-        Some((snapshot, observed_at_ms))
+    fn cached_bulk_market_cache(
+        &self,
+        symbols: &[String],
+        observed_at_ms: i64,
+    ) -> Option<HyperliquidBulkMarketCache> {
+        let cache = self.bulk_market_cache.lock().expect("lock").clone()?;
+        if !cache_is_fresh(
+            cache.observed_at_ms,
+            observed_at_ms,
+            HYPERLIQUID_BULK_MARKET_CACHE_TTL_MS,
+        ) {
+            return None;
+        }
+        if symbols
+            .iter()
+            .any(|symbol| !cache.snapshots.contains_key(symbol))
+        {
+            return None;
+        }
+        Some(cache)
+    }
+
+    async fn refresh_bulk_market_cache(
+        &self,
+        symbols: &[String],
+    ) -> Result<HyperliquidBulkMarketCache> {
+        let response = self
+            .client
+            .post(self.info_url.as_str())
+            .json(&json!({ "type": "metaAndAssetCtxs" }))
+            .send()
+            .await
+            .context("failed to request hyperliquid metaAndAssetCtxs")?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .context("failed to read hyperliquid metaAndAssetCtxs response body")?;
+        if !status.is_success() {
+            return Err(format_hyperliquid_http_error(status, &body));
+        }
+
+        let payload: HyperliquidMetaAndAssetCtxsResponse = serde_json::from_str(&body)
+            .context("failed to decode hyperliquid metaAndAssetCtxs response")?;
+        let observed_at_ms = now_ms();
+        let requested_assets = symbols
+            .iter()
+            .map(|symbol| (venue_symbol(&self.config, symbol), symbol.clone()))
+            .collect::<HashMap<_, _>>();
+        let mut snapshots = HashMap::new();
+        let mut liquidity = HashMap::new();
+
+        for (meta, ctx) in payload.0.universe.iter().zip(payload.1.iter()) {
+            let Some(symbol) = requested_assets.get(&meta.name) else {
+                continue;
+            };
+            if let Some(snapshot) = hyperliquid_bulk_asset_ctx_to_snapshot(
+                symbol,
+                &meta.name,
+                ctx,
+                next_hour_boundary(observed_at_ms),
+            ) {
+                snapshots.insert(symbol.clone(), snapshot);
+            }
+            if let Some(item) = hyperliquid_bulk_asset_ctx_to_liquidity(symbol, ctx, observed_at_ms)
+            {
+                liquidity.insert(symbol.clone(), item.clone());
+                self.perp_liquidity_cache
+                    .lock()
+                    .expect("lock")
+                    .insert(symbol.clone(), item);
+            }
+        }
+
+        let cache = HyperliquidBulkMarketCache {
+            observed_at_ms,
+            snapshots,
+            liquidity,
+        };
+        self.bulk_market_cache
+            .lock()
+            .expect("lock")
+            .replace(cache.clone());
+        Ok(cache)
     }
 
     async fn fetch_symbol_snapshot(&self, symbol: &str) -> Result<SymbolMarketSnapshot> {
@@ -972,17 +818,35 @@ impl VenueAdapter for HyperliquidLiveAdapter {
     }
 
     async fn fetch_market_snapshot(&self, symbols: &[String]) -> Result<VenueMarketSnapshot> {
+        let supported_symbols = symbols
+            .iter()
+            .filter(|symbol| self.supports_symbol(symbol))
+            .cloned()
+            .collect::<Vec<_>>();
+        if supported_symbols.is_empty() {
+            return Err(anyhow!(
+                "hyperliquid market snapshot unavailable for requested symbols"
+            ));
+        }
+
+        if supported_symbols.len() == 1 {
+            let quote = self.fetch_symbol_snapshot(&supported_symbols[0]).await?;
+            return Ok(VenueMarketSnapshot {
+                venue: Venue::Hyperliquid,
+                observed_at_ms: now_ms(),
+                symbols: vec![quote],
+            });
+        }
+
+        let observed_at_ms = now_ms();
+        let cache = match self.cached_bulk_market_cache(&supported_symbols, observed_at_ms) {
+            Some(cache) => cache,
+            None => self.refresh_bulk_market_cache(&supported_symbols).await?,
+        };
         let mut quotes = Vec::new();
-        let mut observed_at_ms = 0_i64;
-        let allow_direct_fallback = symbols.len() == 1;
-        for symbol in symbols.iter().filter(|symbol| self.supports_symbol(symbol)) {
-            if let Some((snapshot, snapshot_observed_at_ms)) = self.cached_snapshot(symbol) {
-                observed_at_ms = observed_at_ms.max(snapshot_observed_at_ms);
+        for symbol in &supported_symbols {
+            if let Some(snapshot) = cache.snapshots.get(symbol).cloned() {
                 quotes.push(snapshot);
-            } else if allow_direct_fallback {
-                let quote = self.fetch_symbol_snapshot(symbol).await?;
-                observed_at_ms = observed_at_ms.max(quote.funding_timestamp_ms.min(now_ms()));
-                quotes.push(quote);
             }
         }
         if quotes.is_empty() {
@@ -993,7 +857,7 @@ impl VenueAdapter for HyperliquidLiveAdapter {
 
         Ok(VenueMarketSnapshot {
             venue: Venue::Hyperliquid,
-            observed_at_ms: now_ms().max(observed_at_ms),
+            observed_at_ms: cache.observed_at_ms,
             symbols: quotes,
         })
     }
@@ -1299,14 +1163,13 @@ impl VenueAdapter for HyperliquidLiveAdapter {
             return Ok(None);
         }
         let observed_at_ms = now_ms();
-        self.cached_perp_liquidity_snapshot(symbol, observed_at_ms)
-            .map(Some)
-            .ok_or_else(|| {
-                anyhow!(
-                    "hyperliquid active asset ctx unavailable for {}",
-                    venue_symbol(&self.config, symbol)
-                )
-            })
+        if let Some(snapshot) = self.cached_perp_liquidity_snapshot(symbol, observed_at_ms) {
+            return Ok(Some(snapshot));
+        }
+        let cache = self
+            .refresh_bulk_market_cache(&[symbol.to_string()])
+            .await?;
+        Ok(cache.liquidity.get(symbol).cloned())
     }
 
     fn min_entry_notional_quote_hint(
@@ -1331,39 +1194,18 @@ impl VenueAdapter for HyperliquidLiveAdapter {
 
     async fn set_market_data_active(&self, active: bool, symbols: &[String]) -> Result<()> {
         let tracked_symbols = self.tracked_symbols(symbols);
-        let current_symbols = self
-            .market_subscription_symbols
-            .lock()
-            .expect("lock")
-            .clone();
         if !active || tracked_symbols.is_empty() {
-            if self.market_ws.has_worker() || !current_symbols.is_empty() {
-                self.market_ws.abort_worker();
-                self.market_ws.clear();
-                self.market_subscription_symbols
-                    .lock()
-                    .expect("lock")
-                    .clear();
-            }
+            self.bulk_market_cache.lock().expect("lock").take();
             return Ok(());
         }
-        if self.market_ws.has_worker() && current_symbols == tracked_symbols {
-            return Ok(());
-        }
-        self.market_ws.abort_worker();
-        self.market_ws.clear();
-        let base_url = if self.config.live.is_testnet {
-            BaseUrl::Testnet
-        } else {
-            BaseUrl::Mainnet
-        };
-        self.start_market_ws(&tracked_symbols, base_url).await?;
-        *self.market_subscription_symbols.lock().expect("lock") = tracked_symbols;
         Ok(())
     }
 
+    fn private_worker_count(&self) -> usize {
+        self.private_ws.worker_count()
+    }
+
     async fn shutdown(&self) -> Result<()> {
-        self.market_ws.abort_worker();
         self.private_ws.abort_workers();
         self.order_ws.shutdown().await;
         Ok(())
@@ -1377,6 +1219,43 @@ impl VenueAdapter for HyperliquidLiveAdapter {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct HyperliquidAssetMeta {
     sz_decimals: u32,
+}
+
+#[derive(Clone, Debug, Default)]
+struct HyperliquidBulkMarketCache {
+    observed_at_ms: i64,
+    snapshots: HashMap<String, SymbolMarketSnapshot>,
+    liquidity: HashMap<String, PerpLiquiditySnapshot>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct HyperliquidMetaAndAssetCtxsResponse(
+    HyperliquidMetaAndAssetCtxsMeta,
+    Vec<HyperliquidPerpAssetCtx>,
+);
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct HyperliquidMetaAndAssetCtxsMeta {
+    universe: Vec<HyperliquidMetaAndAssetCtxAsset>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HyperliquidMetaAndAssetCtxAsset {
+    name: String,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HyperliquidPerpAssetCtx {
+    day_ntl_vlm: String,
+    funding: String,
+    #[serde(default)]
+    impact_pxs: Option<Vec<String>>,
+    mark_px: String,
+    #[serde(default)]
+    mid_px: Option<String>,
+    open_interest: String,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -1396,8 +1275,94 @@ fn prune_hyperliquid_symbol_catalog_entry(
     removed_meta || removed_supported
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn hyperliquid_ws_watchdog_timed_out(last_message_ms: i64, now_ms: i64, timeout_ms: i64) -> bool {
     timeout_ms > 0 && now_ms.saturating_sub(last_message_ms) > timeout_ms
+}
+
+fn hyperliquid_info_url(base_url: BaseUrl) -> String {
+    match base_url {
+        BaseUrl::Mainnet => "https://api.hyperliquid.xyz/info".to_string(),
+        BaseUrl::Testnet => "https://api.hyperliquid-testnet.xyz/info".to_string(),
+        BaseUrl::Localhost => "http://localhost:3001/info".to_string(),
+    }
+}
+
+fn format_hyperliquid_http_error(status: reqwest::StatusCode, body: &str) -> anyhow::Error {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        anyhow!("hyperliquid info endpoint returned non-success status: {status}")
+    } else {
+        anyhow!("hyperliquid info endpoint returned non-success status: {status} body={trimmed}")
+    }
+}
+
+fn hyperliquid_impact_notional_quote(asset: &str) -> f64 {
+    match asset {
+        "BTC" | "ETH" => 20_000.0,
+        _ => 6_000.0,
+    }
+}
+
+fn hyperliquid_bulk_asset_ctx_to_snapshot(
+    symbol: &str,
+    asset: &str,
+    ctx: &HyperliquidPerpAssetCtx,
+    funding_timestamp_ms: i64,
+) -> Option<SymbolMarketSnapshot> {
+    let mid_price = ctx
+        .mid_px
+        .as_deref()
+        .and_then(|value| parse_f64(value).ok())
+        .or_else(|| parse_f64(&ctx.mark_px).ok())?;
+    if !mid_price.is_finite() || mid_price <= 0.0 {
+        return None;
+    }
+    let mut impact_prices = ctx
+        .impact_pxs
+        .as_ref()
+        .into_iter()
+        .flatten()
+        .filter_map(|value| parse_f64(value).ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .collect::<Vec<_>>();
+    impact_prices.sort_by(f64::total_cmp);
+    let (best_bid, best_ask) = match impact_prices.as_slice() {
+        [single] => (*single, *single),
+        [lower, upper, ..] => (*lower, *upper),
+        _ => (mid_price, mid_price),
+    };
+    let impact_notional_quote = hyperliquid_impact_notional_quote(asset);
+    let bid_size = (impact_notional_quote / best_bid.max(1e-9)).max(0.0);
+    let ask_size = (impact_notional_quote / best_ask.max(1e-9)).max(0.0);
+
+    Some(SymbolMarketSnapshot {
+        symbol: symbol.to_string(),
+        best_bid,
+        best_ask,
+        bid_size,
+        ask_size,
+        mark_price: parse_f64(&ctx.mark_px).ok(),
+        funding_rate: parse_f64(&ctx.funding).ok()?,
+        funding_timestamp_ms,
+    })
+}
+
+fn hyperliquid_bulk_asset_ctx_to_liquidity(
+    symbol: &str,
+    ctx: &HyperliquidPerpAssetCtx,
+    observed_at_ms: i64,
+) -> Option<PerpLiquiditySnapshot> {
+    let volume_24h_quote = parse_f64(&ctx.day_ntl_vlm).ok()?;
+    let open_interest = parse_f64(&ctx.open_interest).ok()?;
+    let mark_price = parse_f64(&ctx.mark_px).ok()?;
+    Some(PerpLiquiditySnapshot {
+        venue: Venue::Hyperliquid,
+        symbol: symbol.to_string(),
+        volume_24h_quote,
+        open_interest_quote: open_interest * mark_price,
+        observed_at_ms,
+    })
 }
 
 enum HyperliquidOrderOutcome {
@@ -1936,11 +1901,12 @@ mod tests {
 
     use super::{
         decode_ws_post_action_response, encode_ws_post_order_request,
+        hyperliquid_bulk_asset_ctx_to_liquidity, hyperliquid_bulk_asset_ctx_to_snapshot,
         hyperliquid_cloid_for_client_order, hyperliquid_private_fill_wait_ms,
         hyperliquid_ws_watchdog_timed_out, ioc_order_params_from_reference_price,
         prune_hyperliquid_symbol_catalog_entry, should_retry_hyperliquid_duplicate_nonce,
         sign_hyperliquid_l1_action, HyperliquidAssetMeta, HyperliquidOrderOutcome,
-        HYPERLIQUID_PRIVATE_WS_IDLE_TIMEOUT_MS,
+        HyperliquidPerpAssetCtx, HYPERLIQUID_PRIVATE_WS_IDLE_TIMEOUT_MS,
     };
 
     #[test]
@@ -2165,5 +2131,54 @@ mod tests {
         assert!(!metadata.contains_key("FET"));
         assert!(!supported_symbols.contains("FET"));
         assert!(supported_symbols.contains("BTC"));
+    }
+
+    #[test]
+    fn bulk_asset_ctx_uses_impact_prices_for_quote_and_depth() {
+        let ctx = HyperliquidPerpAssetCtx {
+            day_ntl_vlm: "123456.7".to_string(),
+            funding: "0.0001".to_string(),
+            impact_pxs: Some(vec!["1990.0".to_string(), "2010.0".to_string()]),
+            mark_px: "2001.0".to_string(),
+            mid_px: Some("2000.0".to_string()),
+            open_interest: "100.0".to_string(),
+        };
+
+        let snapshot = hyperliquid_bulk_asset_ctx_to_snapshot("ETHUSDT", "ETH", &ctx, 3_600_000)
+            .expect("snapshot");
+        let liquidity =
+            hyperliquid_bulk_asset_ctx_to_liquidity("ETHUSDT", &ctx, 3_600_000).expect("liquidity");
+
+        assert_eq!(snapshot.symbol, "ETHUSDT");
+        assert!((snapshot.best_bid - 1990.0).abs() < 1e-9);
+        assert!((snapshot.best_ask - 2010.0).abs() < 1e-9);
+        assert!(snapshot.bid_size > 9.9);
+        assert!(snapshot.ask_size > 9.9);
+        assert_eq!(snapshot.mark_price, Some(2001.0));
+        assert!((snapshot.funding_rate - 0.0001).abs() < 1e-12);
+        assert_eq!(snapshot.funding_timestamp_ms, 3_600_000);
+
+        assert!((liquidity.volume_24h_quote - 123456.7).abs() < 1e-9);
+        assert!((liquidity.open_interest_quote - 200100.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn bulk_asset_ctx_falls_back_to_mid_price_when_impact_prices_missing() {
+        let ctx = HyperliquidPerpAssetCtx {
+            day_ntl_vlm: "42.0".to_string(),
+            funding: "0.0002".to_string(),
+            impact_pxs: None,
+            mark_px: "10.5".to_string(),
+            mid_px: Some("10.25".to_string()),
+            open_interest: "50".to_string(),
+        };
+
+        let snapshot = hyperliquid_bulk_asset_ctx_to_snapshot("FETUSDT", "FET", &ctx, 7_200_000)
+            .expect("snapshot");
+
+        assert!((snapshot.best_bid - 10.25).abs() < 1e-9);
+        assert!((snapshot.best_ask - 10.25).abs() < 1e-9);
+        assert!(snapshot.bid_size > 500.0);
+        assert!(snapshot.ask_size > 500.0);
     }
 }

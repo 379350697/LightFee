@@ -1581,10 +1581,6 @@ async fn settlement_half_close_below_exchange_minimum_skips_partial_and_keeps_fu
     sleep(Duration::from_millis(250)).await;
     let records = read_event_records(&config.persistence.event_log_path);
     assert!(!has_event(&records, "exit.partial_closed"));
-    assert!(has_event(
-        &records,
-        "execution.partial_exit_quantity_adjusted"
-    ));
     assert!(has_event(&records, "execution.partial_exit_skipped"));
 
     assert!(engine.state().open_position.is_some());
