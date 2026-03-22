@@ -32,10 +32,11 @@ use crate::{
 use super::{
     base_asset, build_http_client, build_query, cache_is_fresh, enrich_fill_from_private,
     estimate_fee_quote, filter_transfer_statuses, floor_to_step, format_decimal,
-    is_benign_ws_disconnect_error, load_json_cache, lookup_or_wait_private_order, now_ms,
-    parse_f64, parse_i64, parse_text_message, spawn_ws_loop, store_json_cache,
-    transfer_cache_ttl_ms, venue_symbol, PrivateOrderUpdate, VenueTransferStatusCache,
-    WsMarketState, WsPrivateState, SYMBOL_CACHE_TTL_MS,
+    is_benign_ws_disconnect_error, load_account_fee_snapshot_cache, load_json_cache,
+    lookup_or_wait_private_order, now_ms, parse_f64, parse_i64, parse_text_message, spawn_ws_loop,
+    store_account_fee_snapshot_cache, store_json_cache, transfer_cache_ttl_ms, venue_symbol,
+    PrivateOrderUpdate, VenueTransferStatusCache, WsMarketState, WsPrivateState,
+    SYMBOL_CACHE_TTL_MS,
 };
 use crate::resilience::FailureBackoff;
 
@@ -76,7 +77,7 @@ impl GateLiveAdapter {
         let persisted_catalog = load_json_cache::<GateSymbolCatalogCache>("gate-symbols.json");
         let persisted_transfer_cache =
             load_json_cache::<VenueTransferStatusCache>("gate-transfer-status.json");
-        let account_fee_snapshot = load_json_cache::<AccountFeeSnapshot>("gate-fees.json");
+        let account_fee_snapshot = load_account_fee_snapshot_cache(Venue::Gate, "gate-fees.json");
         let mut metadata = HashMap::new();
         let mut supported_symbols = HashSet::new();
         if let Some(cache) = persisted_catalog {
@@ -154,12 +155,28 @@ impl GateLiveAdapter {
             .contains(symbol)
     }
 
+    fn fee_reference_symbol(&self) -> Option<String> {
+        self.market_subscription_symbols
+            .lock()
+            .expect("lock")
+            .first()
+            .cloned()
+            .or_else(|| {
+                self.supported_symbols
+                    .lock()
+                    .expect("lock")
+                    .iter()
+                    .next()
+                    .cloned()
+            })
+    }
+
     fn store_account_fee_snapshot(&self, snapshot: &AccountFeeSnapshot) {
         self.account_fee_snapshot
             .lock()
             .expect("lock")
             .replace(snapshot.clone());
-        store_json_cache("gate-fees.json", snapshot);
+        store_account_fee_snapshot_cache("gate-fees.json", snapshot);
     }
 
     async fn refresh_account_fee_snapshot(&self) -> Result<Option<AccountFeeSnapshot>> {
@@ -167,26 +184,35 @@ impl GateLiveAdapter {
             .signed_request_json(
                 &self.base_url,
                 Method::GET,
-                &format!("/api/v4/futures/{GATE_SETTLE}/fee"),
+                "/api/v4/wallet/fee",
+                Some(build_query(&[("settle", GATE_SETTLE.to_string())])),
                 None,
-                None,
-                "failed to request gate futures fee",
+                "failed to request gate wallet fee",
             )
             .await?;
-        let snapshot = AccountFeeSnapshot {
-            venue: Venue::Gate,
-            taker_fee_bps: json_required_f64(
-                &payload,
-                &["taker_fee_rate", "taker_fee", "takerFeeRate", "takerFee"],
-                "gate taker fee",
-            )? * 10_000.0,
-            maker_fee_bps: json_required_f64(
-                &payload,
-                &["maker_fee_rate", "maker_fee", "makerFeeRate", "makerFee"],
-                "gate maker fee",
-            )? * 10_000.0,
-            observed_at_ms: now_ms(),
-            source: "gate_futures_fee".to_string(),
+        let snapshot = match parse_gate_fee_snapshot(&payload) {
+            Ok(snapshot) => snapshot,
+            Err(wallet_error) => {
+                debug!(?wallet_error, "gate wallet fee missing futures fee fields; trying contract catalog rate");
+                let Some(symbol) = self.fee_reference_symbol() else {
+                    return Ok(self.cached_account_fee_snapshot());
+                };
+                let Some(meta) = self.metadata.lock().expect("lock").get(&symbol).cloned() else {
+                    return Ok(self.cached_account_fee_snapshot());
+                };
+                let (Some(taker_fee_bps), Some(maker_fee_bps)) =
+                    (meta.taker_fee_rate_bps, meta.maker_fee_rate_bps)
+                else {
+                    return Ok(self.cached_account_fee_snapshot());
+                };
+                AccountFeeSnapshot {
+                    venue: Venue::Gate,
+                    taker_fee_bps,
+                    maker_fee_bps,
+                    observed_at_ms: now_ms(),
+                    source: format!("gate_contract_fee:{}", venue_symbol(&self.config, &symbol)),
+                }
+            }
         };
         self.store_account_fee_snapshot(&snapshot);
         Ok(Some(snapshot))
@@ -1312,6 +1338,8 @@ struct GateContractMeta {
     min_contracts: f64,
     contract_step: f64,
     max_contracts: Option<f64>,
+    maker_fee_rate_bps: Option<f64>,
+    taker_fee_rate_bps: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1357,8 +1385,54 @@ fn parse_gate_contract_meta(row: &Value) -> Result<(String, GateContractMeta)> {
                     "max_order_size",
                 ],
             ),
+            maker_fee_rate_bps: json_f64(
+                row,
+                &["maker_fee_rate", "makerFeeRate"],
+            )
+            .map(|value| value * 10_000.0),
+            taker_fee_rate_bps: json_f64(
+                row,
+                &["taker_fee_rate", "takerFeeRate"],
+            )
+            .map(|value| value * 10_000.0),
         },
     ))
+}
+
+fn parse_gate_fee_snapshot(payload: &Value) -> Result<AccountFeeSnapshot> {
+    let taker_fee_bps = json_f64(
+        payload,
+        &[
+            "futures_taker_fee",
+            "futuresTakerFee",
+            "taker_fee_rate",
+            "taker_fee",
+            "takerFeeRate",
+            "takerFee",
+        ],
+    )
+    .ok_or_else(|| anyhow!("gate taker fee missing"))?
+        * 10_000.0;
+    let maker_fee_bps = json_f64(
+        payload,
+        &[
+            "futures_maker_fee",
+            "futuresMakerFee",
+            "maker_fee_rate",
+            "maker_fee",
+            "makerFeeRate",
+            "makerFee",
+        ],
+    )
+    .ok_or_else(|| anyhow!("gate maker fee missing"))?
+        * 10_000.0;
+    Ok(AccountFeeSnapshot {
+        venue: Venue::Gate,
+        taker_fee_bps,
+        maker_fee_bps,
+        observed_at_ms: now_ms(),
+        source: "gate_wallet_fee".to_string(),
+    })
 }
 
 fn parse_gate_liquidity_snapshot(symbol: &str, row: &Value) -> Result<PerpLiquiditySnapshot> {
@@ -1657,7 +1731,8 @@ mod tests {
 
     use super::{
         ensure_gate_client_order_id, gate_client_text, gate_ws_auth, gate_ws_url,
-        handle_gate_private_message, parse_gate_contract_meta, parse_gate_liquidity_snapshot,
+        handle_gate_private_message, parse_gate_contract_meta, parse_gate_fee_snapshot,
+        parse_gate_liquidity_snapshot,
     };
     use crate::live::WsPrivateState;
     use std::collections::HashMap;
@@ -1668,7 +1743,9 @@ mod tests {
             "name": "BTC_USDT",
             "order_size_min": 1,
             "order_size_round": 1,
-            "quanto_multiplier": "0.001"
+            "quanto_multiplier": "0.001",
+            "maker_fee_rate": "-0.00005",
+            "taker_fee_rate": "0.0005"
         });
 
         let (symbol, meta) = parse_gate_contract_meta(&row).expect("parse contract");
@@ -1677,6 +1754,22 @@ mod tests {
         assert!((meta.contract_step - 1.0).abs() < 1e-9);
         assert!((meta.contract_multiplier - 0.001).abs() < 1e-9);
         assert_eq!(meta.max_contracts, None);
+        assert_eq!(meta.maker_fee_rate_bps, Some(-0.5));
+        assert_eq!(meta.taker_fee_rate_bps, Some(5.0));
+    }
+
+    #[test]
+    fn parses_gate_wallet_fee_snapshot() {
+        let row = json!({
+            "futures_taker_fee": "0.0005",
+            "futures_maker_fee": "-0.00005"
+        });
+
+        let snapshot = parse_gate_fee_snapshot(&row).expect("parse gate wallet fee");
+        assert_eq!(snapshot.venue, crate::models::Venue::Gate);
+        assert_eq!(snapshot.taker_fee_bps, 5.0);
+        assert_eq!(snapshot.maker_fee_bps, -0.5);
+        assert_eq!(snapshot.source, "gate_wallet_fee");
     }
 
     #[test]

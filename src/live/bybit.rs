@@ -30,8 +30,9 @@ use crate::{
 use super::{
     base_asset, build_http_client, build_query, cache_is_fresh, enrich_fill_from_private,
     estimate_fee_quote, floor_to_step, format_decimal, hinted_fill, hmac_sha256_hex,
-    is_benign_ws_disconnect_error, load_json_cache, lookup_or_wait_private_order, now_ms,
-    parse_bool_flag, parse_f64, parse_i64, parse_text_message, quote_fill, spawn_ws_loop,
+    is_benign_ws_disconnect_error, load_account_fee_snapshot_cache, load_json_cache,
+    lookup_or_wait_private_order, now_ms, parse_bool_flag, parse_f64, parse_i64,
+    parse_text_message, quote_fill, spawn_ws_loop, store_account_fee_snapshot_cache,
     store_json_cache, venue_symbol, PrivateOrderUpdate, WsMarketState, WsPrivateState,
     SYMBOL_CACHE_TTL_MS, TRANSFER_CACHE_TTL_MS,
 };
@@ -71,7 +72,7 @@ impl BybitLiveAdapter {
         let persisted_catalog = load_json_cache::<BybitSymbolCatalogCache>("bybit-symbols.json");
         let persisted_transfer_cache =
             load_json_cache::<BybitTransferStatusCache>("bybit-transfer-status.json");
-        let account_fee_snapshot = load_json_cache::<AccountFeeSnapshot>("bybit-fees.json");
+        let account_fee_snapshot = load_account_fee_snapshot_cache(Venue::Bybit, "bybit-fees.json");
         let mut metadata = HashMap::new();
         let mut supported_symbols = HashSet::new();
         if let Some(cache) = persisted_catalog {
@@ -169,7 +170,7 @@ impl BybitLiveAdapter {
             .lock()
             .expect("lock")
             .replace(snapshot.clone());
-        store_json_cache("bybit-fees.json", snapshot);
+        store_account_fee_snapshot_cache("bybit-fees.json", snapshot);
     }
 
     async fn refresh_account_fee_snapshot(&self) -> Result<Option<AccountFeeSnapshot>> {
@@ -1748,10 +1749,20 @@ fn extract_bybit_quote_fee(value: Option<&serde_json::Value>) -> Option<f64> {
 }
 
 fn parse_optional_f64_field(raw: Option<&str>) -> Result<Option<f64>> {
-    raw.map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(parse_f64)
-        .transpose()
+    let Some(trimmed) = raw.map(str::trim) else {
+        return Ok(None);
+    };
+    if trimmed.is_empty()
+        || trimmed == "--"
+        || trimmed.eq_ignore_ascii_case("null")
+        || trimmed.eq_ignore_ascii_case("n/a")
+        || trimmed.eq_ignore_ascii_case("nan")
+    {
+        return Ok(None);
+    }
+    parse_f64(trimmed)
+        .map(Some)
+        .with_context(|| format!("failed to parse optional bybit float field: {trimmed}"))
 }
 
 fn bybit_account_balance_snapshot_from_row(
@@ -2471,6 +2482,20 @@ mod tests {
         )
         .expect("parse empty row");
         assert!(empty_snapshot.is_none());
+    }
+
+    #[test]
+    fn wallet_balance_snapshot_tolerates_placeholder_total_fields() {
+        let snapshot = bybit_account_balance_snapshot_from_row(
+            &BybitWalletBalance {
+                total_equity: "--".to_string(),
+                total_wallet_balance: "null".to_string(),
+                total_available_balance: Some("N/A".to_string()),
+            },
+            999,
+        )
+        .expect("parse placeholder row");
+        assert!(snapshot.is_none());
     }
 
     #[test]

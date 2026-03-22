@@ -30,10 +30,11 @@ use crate::{
 use super::{
     base_asset, build_http_client, build_query, cache_is_fresh, enrich_fill_from_private,
     estimate_fee_quote, filter_transfer_statuses, floor_to_step, format_decimal, hinted_fill,
-    hmac_sha256_hex, is_benign_ws_disconnect_error, load_json_cache, lookup_or_wait_private_order,
-    now_ms, parse_f64, parse_i64, parse_text_message, quote_fill, spawn_ws_loop, store_json_cache,
-    transfer_cache_ttl_ms, venue_symbol, PrivateOrderUpdate, VenueTransferStatusCache,
-    WsMarketState, WsPrivateState, SYMBOL_CACHE_TTL_MS,
+    hmac_sha256_hex, is_benign_ws_disconnect_error, load_account_fee_snapshot_cache,
+    load_json_cache, lookup_or_wait_private_order, now_ms, parse_f64, parse_i64,
+    parse_text_message, quote_fill, spawn_ws_loop, store_account_fee_snapshot_cache,
+    store_json_cache, transfer_cache_ttl_ms, venue_symbol, PrivateOrderUpdate,
+    VenueTransferStatusCache, WsMarketState, WsPrivateState, SYMBOL_CACHE_TTL_MS,
 };
 
 const BINANCE_MAX_SUBSCRIBE_STREAMS_PER_MESSAGE: usize = 150;
@@ -85,7 +86,8 @@ impl BinanceLiveAdapter {
             load_json_cache::<BinanceSymbolCatalogCache>("binance-symbols.json");
         let persisted_transfer_cache =
             load_json_cache::<VenueTransferStatusCache>("binance-transfer-status.json");
-        let account_fee_snapshot = load_json_cache::<AccountFeeSnapshot>("binance-fees.json");
+        let account_fee_snapshot =
+            load_account_fee_snapshot_cache(Venue::Binance, "binance-fees.json");
         let mut metadata = HashMap::new();
         let mut supported_symbols = HashSet::new();
         if let Some(cache) = persisted_catalog {
@@ -195,7 +197,7 @@ impl BinanceLiveAdapter {
             .lock()
             .expect("lock")
             .replace(snapshot.clone());
-        store_json_cache("binance-fees.json", snapshot);
+        store_account_fee_snapshot_cache("binance-fees.json", snapshot);
     }
 
     async fn refresh_account_fee_snapshot(&self) -> Result<Option<AccountFeeSnapshot>> {

@@ -54,8 +54,9 @@ use crate::{
 };
 
 use super::{
-    cache_is_fresh, enrich_fill_from_private, estimate_fee_quote, hinted_fill, load_json_cache,
-    lookup_or_wait_private_order, now_ms, parse_f64, quote_fill, store_json_cache, venue_symbol,
+    cache_is_fresh, enrich_fill_from_private, estimate_fee_quote, hinted_fill,
+    load_account_fee_snapshot_cache, load_json_cache, lookup_or_wait_private_order, now_ms,
+    parse_f64, quote_fill, store_account_fee_snapshot_cache, store_json_cache, venue_symbol,
     PrivateOrderUpdate, WsMarketState, WsPrivateState, SYMBOL_CACHE_TTL_MS,
 };
 
@@ -121,7 +122,8 @@ impl HyperliquidLiveAdapter {
 
         let persisted_catalog =
             load_json_cache::<HyperliquidSymbolCatalogCache>("hyperliquid-symbols.json");
-        let account_fee_snapshot = load_json_cache::<AccountFeeSnapshot>("hyperliquid-fees.json");
+        let account_fee_snapshot =
+            load_account_fee_snapshot_cache(Venue::Hyperliquid, "hyperliquid-fees.json");
         let mut meta_cache = HashMap::new();
         let mut supported_symbols = HashSet::new();
         if let Some(cache) = persisted_catalog {
@@ -228,7 +230,7 @@ impl HyperliquidLiveAdapter {
             .lock()
             .expect("lock")
             .replace(snapshot.clone());
-        store_json_cache("hyperliquid-fees.json", snapshot);
+        store_account_fee_snapshot_cache("hyperliquid-fees.json", snapshot);
     }
 
     async fn refresh_account_fee_snapshot(&self) -> Result<Option<AccountFeeSnapshot>> {

@@ -30,9 +30,10 @@ use crate::{
 use super::{
     base_asset, build_http_client, build_query, cache_is_fresh, enrich_fill_from_private,
     estimate_fee_quote, filter_transfer_statuses, floor_to_step, format_decimal, hinted_fill,
-    hmac_sha256_base64, is_benign_ws_disconnect_error, load_json_cache,
-    lookup_or_wait_private_order, now_ms, parse_f64, parse_i64, parse_text_message, quote_fill,
-    spawn_ws_loop, store_json_cache, transfer_cache_ttl_ms, venue_symbol, PrivateOrderUpdate,
+    hmac_sha256_base64, is_benign_ws_disconnect_error, load_account_fee_snapshot_cache,
+    load_json_cache, lookup_or_wait_private_order, now_ms, parse_f64, parse_i64,
+    parse_text_message, quote_fill, spawn_ws_loop, store_account_fee_snapshot_cache,
+    store_json_cache, transfer_cache_ttl_ms, venue_symbol, PrivateOrderUpdate,
     VenueTransferStatusCache, WsMarketState, WsPrivateState, SYMBOL_CACHE_TTL_MS,
 };
 use crate::resilience::FailureBackoff;
@@ -73,7 +74,8 @@ impl BitgetLiveAdapter {
         let persisted_catalog = load_json_cache::<BitgetSymbolCatalogCache>("bitget-symbols.json");
         let persisted_transfer_cache =
             load_json_cache::<VenueTransferStatusCache>("bitget-transfer-status.json");
-        let account_fee_snapshot = load_json_cache::<AccountFeeSnapshot>("bitget-fees.json");
+        let account_fee_snapshot =
+            load_account_fee_snapshot_cache(Venue::Bitget, "bitget-fees.json");
         let mut metadata = HashMap::new();
         let mut supported_symbols = HashSet::new();
         if let Some(cache) = persisted_catalog {
@@ -166,18 +168,19 @@ impl BitgetLiveAdapter {
             .lock()
             .expect("lock")
             .replace(snapshot.clone());
-        store_json_cache("bitget-fees.json", snapshot);
+        store_account_fee_snapshot_cache("bitget-fees.json", snapshot);
     }
 
     async fn refresh_account_fee_snapshot(&self) -> Result<Option<AccountFeeSnapshot>> {
         let Some(symbol) = self.fee_reference_symbol() else {
             return Ok(self.cached_account_fee_snapshot());
         };
+        let venue_symbol = venue_symbol(&self.config, &symbol);
         let query = build_query(&[
-            ("symbol", venue_symbol(&self.config, &symbol)),
+            ("symbol", venue_symbol.clone()),
             ("category", BITGET_PRODUCT_TYPE.to_string()),
         ]);
-        let payload = self
+        let payload = match self
             .signed_request_json(
                 &self.base_url,
                 Method::GET,
@@ -186,8 +189,23 @@ impl BitgetLiveAdapter {
                 None,
                 "failed to request bitget fee rate",
             )
-            .await?;
-        let row = bitget_data("bitget fee rate failed", &payload)?;
+            .await
+        {
+            Ok(payload) => payload,
+            Err(error) if is_bitget_classic_account_fee_error(&error) => {
+                debug!(?error, "bitget unified fee endpoint unsupported; trying classic trade rate");
+                return self.refresh_classic_account_fee_snapshot(&symbol, &venue_symbol).await;
+            }
+            Err(error) => return Err(error),
+        };
+        let row = match bitget_data("bitget fee rate failed", &payload) {
+            Ok(row) => row,
+            Err(error) if is_bitget_classic_account_fee_error(&error) => {
+                debug!(?error, "bitget unified fee payload reported classic account; trying classic trade rate");
+                return self.refresh_classic_account_fee_snapshot(&symbol, &venue_symbol).await;
+            }
+            Err(error) => return Err(error),
+        };
         let snapshot = AccountFeeSnapshot {
             venue: Venue::Bitget,
             taker_fee_bps: json_required_f64(row, &["takerFeeRate"], "bitget taker fee")?
@@ -197,6 +215,31 @@ impl BitgetLiveAdapter {
             observed_at_ms: now_ms(),
             source: format!("bitget_fee_rate:{}", symbol),
         };
+        self.store_account_fee_snapshot(&snapshot);
+        Ok(Some(snapshot))
+    }
+
+    async fn refresh_classic_account_fee_snapshot(
+        &self,
+        symbol: &str,
+        venue_symbol_name: &str,
+    ) -> Result<Option<AccountFeeSnapshot>> {
+        let query = build_query(&[
+            ("symbol", venue_symbol_name.to_string()),
+            ("businessType", "mix".to_string()),
+        ]);
+        let payload = self
+            .signed_request_json(
+                &self.base_url,
+                Method::GET,
+                "/api/v2/common/trade-rate",
+                Some(query),
+                None,
+                "failed to request bitget classic trade rate",
+            )
+            .await?;
+        let row = bitget_data("bitget classic trade rate failed", &payload)?;
+        let snapshot = parse_bitget_trade_rate_snapshot(symbol, row)?;
         self.store_account_fee_snapshot(&snapshot);
         Ok(Some(snapshot))
     }
@@ -1348,6 +1391,8 @@ struct BitgetSymbolMeta {
     step_size: f64,
     min_notional: Option<f64>,
     max_qty: Option<f64>,
+    maker_fee_rate_bps: Option<f64>,
+    taker_fee_rate_bps: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1398,8 +1443,20 @@ fn parse_bitget_contract_meta(row: &Value) -> Result<(String, BitgetSymbolMeta)>
             step_size,
             min_notional,
             max_qty,
+            maker_fee_rate_bps: json_f64(row, &["makerFeeRate"]).map(|value| value * 10_000.0),
+            taker_fee_rate_bps: json_f64(row, &["takerFeeRate"]).map(|value| value * 10_000.0),
         },
     ))
+}
+
+fn parse_bitget_trade_rate_snapshot(symbol: &str, row: &Value) -> Result<AccountFeeSnapshot> {
+    Ok(AccountFeeSnapshot {
+        venue: Venue::Bitget,
+        taker_fee_bps: json_required_f64(row, &["takerFeeRate"], "bitget taker fee")? * 10_000.0,
+        maker_fee_bps: json_required_f64(row, &["makerFeeRate"], "bitget maker fee")? * 10_000.0,
+        observed_at_ms: now_ms(),
+        source: format!("bitget_trade_rate_classic:{symbol}"),
+    })
 }
 
 fn parse_bitget_position_mode(raw: &str) -> BitgetPositionMode {
@@ -1648,6 +1705,16 @@ fn bitget_data_array<'a>(context: &str, payload: &'a Value) -> Result<&'a Vec<Va
         .ok_or_else(|| anyhow!("{context}: response data is not an array"))
 }
 
+fn is_bitget_classic_account_fee_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let message = cause.to_string().to_ascii_lowercase();
+        message.contains("code=40084")
+            || (message.contains("classic account mode")
+                && message.contains("unified account api")
+                && message.contains("not supported"))
+    })
+}
+
 fn format_bitget_http_error(status: StatusCode, body: &str) -> anyhow::Error {
     let payload = serde_json::from_str::<Value>(body).ok();
     let code = payload
@@ -1737,8 +1804,9 @@ mod tests {
 
     use super::{
         bitget_order_side, bitget_private_ws_url, bitget_public_ws_url, bitget_trade_side,
-        ensure_bitget_client_oid, handle_bitget_private_message, parse_bitget_contract_meta,
-        parse_bitget_liquidity_snapshot, BitgetPositionMode,
+        ensure_bitget_client_oid, handle_bitget_private_message,
+        is_bitget_classic_account_fee_error, parse_bitget_contract_meta,
+        parse_bitget_liquidity_snapshot, parse_bitget_trade_rate_snapshot, BitgetPositionMode,
     };
     use crate::live::WsPrivateState;
     use std::collections::HashMap;
@@ -1751,7 +1819,9 @@ mod tests {
             "sizeMultiplier": "0.001",
             "minTradeNum": "0.001",
             "minTradeUSDT": "5",
-            "maxMarketOrderQty": "1000"
+            "maxMarketOrderQty": "1000",
+            "makerFeeRate": "0.0002",
+            "takerFeeRate": "0.0006"
         });
 
         let (symbol, meta) = parse_bitget_contract_meta(&row).expect("parse contract row");
@@ -1760,6 +1830,40 @@ mod tests {
         assert!((meta.min_qty - 0.001).abs() < 1e-9);
         assert_eq!(meta.min_notional, Some(5.0));
         assert_eq!(meta.max_qty, Some(1000.0));
+        assert_eq!(meta.maker_fee_rate_bps, Some(2.0));
+        assert!(
+            meta.taker_fee_rate_bps
+                .map(|value| (value - 6.0).abs() < 1e-9)
+                .unwrap_or(false)
+        );
+    }
+
+    #[test]
+    fn parses_bitget_classic_trade_rate_snapshot() {
+        let row = json!({
+            "makerFeeRate": "0.0002",
+            "takerFeeRate": "0.0006"
+        });
+
+        let snapshot = parse_bitget_trade_rate_snapshot("BTCUSDT", &row)
+            .expect("parse classic trade rate");
+        assert_eq!(snapshot.venue, crate::models::Venue::Bitget);
+        assert_eq!(snapshot.maker_fee_bps, 2.0);
+        assert!((snapshot.taker_fee_bps - 6.0).abs() < 1e-9);
+        assert!(snapshot.source.contains("bitget_trade_rate_classic"));
+    }
+
+    #[test]
+    fn classic_account_fee_errors_are_downgraded_to_fallback() {
+        assert!(is_bitget_classic_account_fee_error(&anyhow::anyhow!(
+            "bitget fee rate failed: code=40019 msg=Classic Account mode, Unified Account API not supported"
+        )));
+        assert!(is_bitget_classic_account_fee_error(&anyhow::anyhow!(
+            "bitget private/public endpoint returned non-success status: status=400 Bad Request code=40084 msg=You are in Classic Account mode, and the Unified Account API is not supported at this time"
+        )));
+        assert!(!is_bitget_classic_account_fee_error(&anyhow::anyhow!(
+            "bitget fee rate failed: code=40017 msg=parameter error"
+        )));
     }
 
     #[test]

@@ -33,9 +33,10 @@ use crate::{
 use super::{
     base_asset, build_http_client, build_query, cache_is_fresh, enrich_fill_from_private,
     estimate_fee_quote, filter_transfer_statuses, floor_to_step, format_decimal, hinted_fill,
-    hmac_sha256_base64, iso8601_from_ms, load_json_cache, lookup_or_wait_private_order,
-    merged_quote_snapshot, now_ms, parse_f64, parse_i64, parse_text_message, quote_fill,
-    spawn_ws_loop, store_json_cache, transfer_cache_ttl_ms, venue_symbol, PrivateOrderUpdate,
+    hmac_sha256_base64, iso8601_from_ms, load_account_fee_snapshot_cache, load_json_cache,
+    lookup_or_wait_private_order, merged_quote_snapshot, now_ms, parse_f64, parse_i64,
+    parse_text_message, quote_fill, spawn_ws_loop, store_account_fee_snapshot_cache,
+    store_json_cache, transfer_cache_ttl_ms, venue_symbol, PrivateOrderUpdate,
     VenueTransferStatusCache, WsMarketState, WsPrivateState, SYMBOL_CACHE_TTL_MS,
 };
 
@@ -74,7 +75,7 @@ impl OkxLiveAdapter {
         let persisted_catalog = load_json_cache::<OkxSymbolCatalogCache>("okx-symbols.json");
         let persisted_transfer_cache =
             load_json_cache::<VenueTransferStatusCache>("okx-transfer-status.json");
-        let account_fee_snapshot = load_json_cache::<AccountFeeSnapshot>("okx-fees.json");
+        let account_fee_snapshot = load_account_fee_snapshot_cache(Venue::Okx, "okx-fees.json");
         let mut metadata = HashMap::new();
         let mut supported_symbols = HashSet::new();
         if let Some(cache) = persisted_catalog {
@@ -162,7 +163,7 @@ impl OkxLiveAdapter {
             .lock()
             .expect("lock")
             .replace(snapshot.clone());
-        store_json_cache("okx-fees.json", snapshot);
+        store_account_fee_snapshot_cache("okx-fees.json", snapshot);
     }
 
     async fn refresh_account_fee_snapshot(&self) -> Result<Option<AccountFeeSnapshot>> {
@@ -1095,15 +1096,32 @@ fn parse_optional_okx_trade_fee_bps(raw: &str) -> Result<Option<f64>> {
     Ok(Some(parse_f64(trimmed)? * 10_000.0))
 }
 
+fn parse_first_okx_trade_fee_bps(raw_values: &[&str]) -> Result<Option<f64>> {
+    for raw in raw_values {
+        if let Some(value) = parse_optional_okx_trade_fee_bps(raw)? {
+            return Ok(Some(value));
+        }
+    }
+    Ok(None)
+}
+
 fn okx_trade_fee_snapshot_from_row(
     row: &OkxTradeFeeRow,
     inst_family: &str,
     observed_at_ms: i64,
 ) -> Result<Option<AccountFeeSnapshot>> {
-    let Some(taker_fee_bps) = parse_optional_okx_trade_fee_bps(&row.taker)? else {
+    let Some(taker_fee_bps) = parse_first_okx_trade_fee_bps(&[
+        row.taker.as_str(),
+        row.taker_u.as_str(),
+        row.taker_usdc.as_str(),
+    ])? else {
         return Ok(None);
     };
-    let Some(maker_fee_bps) = parse_optional_okx_trade_fee_bps(&row.maker)? else {
+    let Some(maker_fee_bps) = parse_first_okx_trade_fee_bps(&[
+        row.maker.as_str(),
+        row.maker_u.as_str(),
+        row.maker_usdc.as_str(),
+    ])? else {
         return Ok(None);
     };
     Ok(Some(AccountFeeSnapshot {
@@ -2317,15 +2335,35 @@ struct OkxAccountBalance {
 
 #[derive(Debug, Deserialize)]
 struct OkxTradeFeeRow {
+    #[serde(default)]
     maker: String,
+    #[serde(default)]
     taker: String,
+    #[serde(default, rename = "makerU")]
+    maker_u: String,
+    #[serde(default, rename = "takerU")]
+    taker_u: String,
+    #[serde(default, rename = "makerUSDC")]
+    maker_usdc: String,
+    #[serde(default, rename = "takerUSDC")]
+    taker_usdc: String,
 }
 
 fn parse_optional_okx_balance_quote(raw: Option<&str>) -> Result<Option<f64>> {
-    raw.map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(parse_f64)
-        .transpose()
+    let Some(trimmed) = raw.map(str::trim) else {
+        return Ok(None);
+    };
+    if trimmed.is_empty()
+        || trimmed == "--"
+        || trimmed.eq_ignore_ascii_case("null")
+        || trimmed.eq_ignore_ascii_case("n/a")
+        || trimmed.eq_ignore_ascii_case("nan")
+    {
+        return Ok(None);
+    }
+    parse_f64(trimmed)
+        .map(Some)
+        .with_context(|| format!("failed to parse optional okx balance field: {trimmed}"))
 }
 
 fn okx_account_balance_snapshot_from_row(
@@ -2607,6 +2645,10 @@ mod tests {
             &OkxTradeFeeRow {
                 maker: "".to_string(),
                 taker: "".to_string(),
+                maker_u: "".to_string(),
+                taker_u: "".to_string(),
+                maker_usdc: "".to_string(),
+                taker_usdc: "".to_string(),
             },
             "ETH-USDT",
             123,
@@ -2618,6 +2660,10 @@ mod tests {
             &OkxTradeFeeRow {
                 maker: "-0.0002".to_string(),
                 taker: "-0.0005".to_string(),
+                maker_u: "".to_string(),
+                taker_u: "".to_string(),
+                maker_usdc: "".to_string(),
+                taker_usdc: "".to_string(),
             },
             "ETH-USDT",
             123,
@@ -2629,6 +2675,24 @@ mod tests {
         assert_eq!(snapshot.maker_fee_bps, -2.0);
         assert_eq!(snapshot.taker_fee_bps, -5.0);
         assert_eq!(snapshot.source, "okx_trade_fee:ETH-USDT");
+
+        let snapshot = okx_trade_fee_snapshot_from_row(
+            &OkxTradeFeeRow {
+                maker: "".to_string(),
+                taker: "".to_string(),
+                maker_u: "-0.0002".to_string(),
+                taker_u: "-0.0005".to_string(),
+                maker_usdc: "".to_string(),
+                taker_usdc: "".to_string(),
+            },
+            "ETH-USDT",
+            456,
+        )
+        .expect("parse fee row with U fields")
+        .expect("snapshot");
+        assert_eq!(snapshot.maker_fee_bps, -2.0);
+        assert_eq!(snapshot.taker_fee_bps, -5.0);
+        assert_eq!(snapshot.observed_at_ms, 456);
     }
 
     #[test]
@@ -2659,6 +2723,20 @@ mod tests {
         )
         .expect("parse empty row");
         assert!(empty_snapshot.is_none());
+    }
+
+    #[test]
+    fn account_balance_snapshot_tolerates_placeholder_total_eq() {
+        let snapshot = okx_account_balance_snapshot_from_row(
+            &OkxAccountBalance {
+                total_eq: "--".to_string(),
+                adj_eq: Some("null".to_string()),
+                avail_eq: Some("N/A".to_string()),
+            },
+            321,
+        )
+        .expect("parse placeholder row");
+        assert!(snapshot.is_none());
     }
 
     #[test]
